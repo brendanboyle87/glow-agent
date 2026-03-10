@@ -353,6 +353,8 @@ class LocalExplorer:
         total_reward = 0.0
         first_durable_gain_action_index: int | None = None
         first_durable_gain_action = ""
+        last_durable_progress_action_index: int | None = None
+        last_durable_progress_action = ""
         last_meaningful_progress_action_index: int | None = None
         last_meaningful_progress_action = ""
         max_persistent_inventory_gain_count = 0
@@ -579,6 +581,25 @@ class LocalExplorer:
                 max_persistent_affordance_gain=max_persistent_affordance_gain,
                 max_persistent_exit_gain_count=max_persistent_exit_gain_count,
             )
+            durable_progress_this_step = self._action_is_durable_branch_progress(
+                action=action,
+                movement_only_action=movement_only_action,
+                discard_like_action=discard_like_action,
+                aggressive_action=aggressive_action,
+                speculative_tool_use_action=speculative_tool_use_action,
+                score_delta=current_state.score - pre_step_states[-1].score,
+                persistent_inventory_gain_count=persistent_inventory_gain_count,
+                persistent_affordance_gain=persistent_affordance_gain,
+                persistent_exit_gain_count=persistent_exit_gain,
+                persistent_revealed_new_object=persistent_revealed_new_object,
+                max_persistent_inventory_gain_count=max_persistent_inventory_gain_count,
+                max_persistent_affordance_gain=max_persistent_affordance_gain,
+                max_persistent_exit_gain_count=max_persistent_exit_gain_count,
+                score_progress_established=base_state.score > 0 or current_state.score > base_state.score,
+            )
+            if durable_progress_this_step:
+                last_durable_progress_action_index = len(actions_taken) - 1
+                last_durable_progress_action = action
             if meaningful_progress_this_step:
                 last_meaningful_progress_action_index = len(actions_taken) - 1
                 last_meaningful_progress_action = action
@@ -609,6 +630,7 @@ class LocalExplorer:
                     "loop_penalty": loop_result.total_penalty,
                     "movement_penalty": movement_result.total_penalty,
                     "state_cluster_id": current_state.state_cluster_id,
+                    "durable_progress": durable_progress_this_step,
                     "meaningful_progress": meaningful_progress_this_step,
                 }
             )
@@ -911,6 +933,8 @@ class LocalExplorer:
             loop_event_count=sum(1 for loop_result in loop_results if loop_result.loop_detected),
             first_durable_gain_action_index=first_durable_gain_action_index,
             first_durable_gain_action=first_durable_gain_action,
+            last_durable_progress_action_index=last_durable_progress_action_index,
+            last_durable_progress_action=last_durable_progress_action,
             last_meaningful_progress_action_index=last_meaningful_progress_action_index,
             last_meaningful_progress_action=last_meaningful_progress_action,
             notable_observation_changes=notable_changes,
@@ -1369,6 +1393,57 @@ class LocalExplorer:
             return not movement_only_action
         if aggressive_action or discard_like_action or speculative_tool_use_action:
             return False
+        action_text = self._normalize_text(action)
+        if action_text.startswith(("take ", "get ", "read ", "examine ", "look at ", "open ")):
+            return persistent_inventory_gain_count > max_persistent_inventory_gain_count
+        return False
+
+    def _action_is_durable_branch_progress(
+        self,
+        *,
+        action: str,
+        movement_only_action: bool,
+        discard_like_action: bool,
+        aggressive_action: bool,
+        speculative_tool_use_action: bool,
+        score_delta: int,
+        persistent_inventory_gain_count: int,
+        persistent_affordance_gain: int,
+        persistent_exit_gain_count: int,
+        persistent_revealed_new_object: bool,
+        max_persistent_inventory_gain_count: int,
+        max_persistent_affordance_gain: int,
+        max_persistent_exit_gain_count: int,
+        score_progress_established: bool,
+    ) -> bool:
+        """Return whether a step adds durable progress worth committing through.
+
+        This is stricter than `meaningful_progress`: once a branch has already secured
+        score progress, later local object churn does not extend the commit boundary
+        unless it adds more score or a materially new route/structure.
+        """
+
+        if score_delta > 0:
+            return True
+
+        if score_progress_established:
+            if persistent_exit_gain_count > max_persistent_exit_gain_count and not movement_only_action:
+                return True
+            return False
+
+        if persistent_inventory_gain_count > max_persistent_inventory_gain_count and not (
+            discard_like_action or aggressive_action
+        ):
+            return True
+        if persistent_revealed_new_object and not (
+            movement_only_action or discard_like_action or aggressive_action or speculative_tool_use_action
+        ):
+            return True
+        if persistent_affordance_gain > max_persistent_affordance_gain:
+            return not (movement_only_action or speculative_tool_use_action)
+        if persistent_exit_gain_count > max_persistent_exit_gain_count:
+            return True
+
         action_text = self._normalize_text(action)
         if action_text.startswith(("take ", "get ", "read ", "examine ", "look at ", "open ")):
             return persistent_inventory_gain_count > max_persistent_inventory_gain_count

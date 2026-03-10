@@ -26,6 +26,7 @@ from zork_agent.types import (
     LLMChatRequest,
     LLMResponse,
     LoopHeuristicResult,
+    StrategicMode,
 )
 
 
@@ -256,6 +257,74 @@ def test_action_generator_does_not_penalize_inverse_candidate_after_real_gain(tm
     assert result.reranked_by_loop_penalty is False
     drop_egg = next(candidate for candidate in result.candidates if candidate.action == "drop egg")
     assert drop_egg.loop_penalty == 0.0
+
+
+def test_action_generator_prefers_structural_access_in_explore_mode(tmp_path: Path) -> None:
+    """Explore mode should boost grounded structural actions over generic movement."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient(
+            "1. west | generic exploration\n"
+            "2. open window | likely access\n"
+            "3. enter window | likely access"
+        ),
+    )
+
+    result = generator.generate(
+        observation="You are outside a white house. A window is slightly ajar.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["west", "south", "open window", "enter window"],
+        score=0,
+        moves=3,
+        strategic_mode=StrategicMode.EXPLORE,
+        strategic_reason="Current region still has unexplored structural access.",
+        strategic_try_actions=["open window", "enter window"],
+        strategic_objects=["window", "house"],
+    )
+
+    assert result.strategic_mode == StrategicMode.EXPLORE.value
+    assert result.candidates[0].action in {"open window", "enter window"}
+    assert result.candidates[0].features is not None
+    assert result.candidates[0].features.matches_strategic_try_action is True
+    west = next(candidate for candidate in result.candidates if candidate.action == "west")
+    assert west.selection_score < result.candidates[0].selection_score
+
+
+def test_action_generator_prefers_object_followup_in_exploit_mode(tmp_path: Path) -> None:
+    """Exploit mode should keep a grounded object follow-up ahead of unguided movement."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient(
+            "1. west | maybe explore more\n"
+            "2. take egg | collect the object\n"
+            "3. examine egg | inspect it"
+        ),
+    )
+
+    result = generator.generate(
+        observation="A jeweled egg rests in a nest.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["west", "take egg", "examine egg"],
+        score=0,
+        moves=8,
+        strategic_mode=StrategicMode.EXPLOIT,
+        strategic_reason="Current region still has grounded unresolved opportunities.",
+        strategic_try_actions=["take egg", "examine egg"],
+        strategic_objects=["egg", "nest"],
+    )
+
+    assert result.strategic_mode == StrategicMode.EXPLOIT.value
+    assert result.candidates[0].action in {"take egg", "examine egg"}
+    west = next(candidate for candidate in result.candidates if candidate.action == "west")
+    assert west.selection_score < result.candidates[0].selection_score
 
 
 def test_action_generator_prefers_take_leaflet_over_repeated_close_mailbox_with_directions_present(
@@ -1313,3 +1382,67 @@ def test_action_generator_keeps_speculative_tool_use_available_but_low_ranked_wi
     assert speculative.features.verb_family == "use"
     assert speculative.features.action_shape_is_complex_transitive is True
     assert "speculative_tool_use" in speculative.ranking_reason
+
+
+def test_action_generator_demotes_stale_leaflet_retake_after_local_inventory_churn(tmp_path: Path) -> None:
+    """Reacquiring a recently dropped local object should not outrank an exit in a stale cluster."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. take leaflet\n2. east"),
+    )
+    history = ActionClusterHistory(cluster_label="window-cluster")
+    history.observe_state_nouns(
+        observation="Behind House. An open window is here.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["open window", "take leaflet", "east"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_state_cluster(cluster_id="region:window", observation="Behind House.")
+    history.record_state_cluster(cluster_id="region:window", observation="Behind House.")
+    history.record_state_cluster(cluster_id="region:window", observation="Behind House.")
+    history.record_attempt(
+        action="take leaflet",
+        score_changed=False,
+        inventory_changed=True,
+        inventory_gained=True,
+        observation_changed=False,
+        valid_actions_changed=False,
+        target_tokens={"leaflet"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="put down leaflet",
+        score_changed=False,
+        inventory_changed=True,
+        inventory_lost=True,
+        observation_changed=False,
+        valid_actions_changed=False,
+        target_tokens={"leaflet"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+        discard_like_action=True,
+    )
+
+    result = generator.generate(
+        observation="Behind House. The window is open and the leaflet lies here.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["take leaflet", "east", "west"],
+        score=0,
+        moves=12,
+        candidate_count=3,
+        state_action_history=history,
+        strategic_mode=StrategicMode.EXPLORE,
+        strategic_try_actions=["east", "west"],
+        strategic_avoid_actions=["take leaflet"],
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] in {"east", "west"}
+    retake = next(candidate for candidate in result.candidates if candidate.action == "take leaflet")
+    assert retake.features is not None
+    assert retake.features.prior_inventory_gain_for_object_family > 0
+    assert retake.features.prior_inventory_loss_for_object_family > 0
+    assert "stale_reacquire_churn" in retake.ranking_reason

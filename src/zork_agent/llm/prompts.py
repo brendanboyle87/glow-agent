@@ -67,6 +67,11 @@ class PromptManager:
         salient_objects: list[str] | None = None,
         supported_try_actions: list[str] | None = None,
         supported_avoid_actions: list[str] | None = None,
+        strategic_mode: str = "",
+        strategic_reason: str = "",
+        strategic_try_actions: list[str] | None = None,
+        strategic_avoid_actions: list[str] | None = None,
+        strategic_objects: list[str] | None = None,
     ) -> str:
         """Render the action proposal prompt."""
 
@@ -74,6 +79,9 @@ class PromptManager:
         salient_objects = salient_objects or []
         supported_try_actions = supported_try_actions or []
         supported_avoid_actions = supported_avoid_actions or []
+        strategic_try_actions = strategic_try_actions or []
+        strategic_avoid_actions = strategic_avoid_actions or []
+        strategic_objects = strategic_objects or []
         valid_actions_block = (
             "Valid actions:\n" + "\n".join(f"- {action}" for action in valid_actions)
             if valid_actions
@@ -84,6 +92,13 @@ class PromptManager:
         evidence_block = (
             f"Prefer if supported: {', '.join(supported_try_actions) or '(none)'}\n"
             f"Avoid if repeated low-value: {', '.join(supported_avoid_actions) or '(none)'}"
+        )
+        strategic_guidance_block = (
+            f"Strategic mode: {strategic_mode or 'unknown'}\n"
+            f"Strategic focus: {strategic_reason.strip() or '(none)'}\n"
+            f"Strategic try actions: {', '.join(strategic_try_actions) or '(none)'}\n"
+            f"Strategic avoid actions: {', '.join(strategic_avoid_actions) or '(none)'}\n"
+            f"Strategic objects: {', '.join(strategic_objects) or '(none)'}"
         )
         canonical_guidance_block = (
             "Canonical preference:\n"
@@ -105,6 +120,7 @@ class PromptManager:
             valid_actions_block=valid_actions_block,
             salient_objects_block=salient_objects_block,
             evidence_block=evidence_block,
+            strategic_guidance_block=strategic_guidance_block,
             canonical_guidance_block=canonical_guidance_block,
         )
 

@@ -189,6 +189,10 @@ class PolicyConfig(StrictModel):
     post_score_local_churn_penalty: float = 1.75
     stale_reflection_try_penalty: float = 0.75
     escape_mode_exit_bonus: float = 1.5
+    explore_mode_exit_bonus: float = 1.0
+    strategic_try_bonus: float = 1.25
+    strategic_object_bonus: float = 1.0
+    strategic_avoid_penalty: float = 1.0
     landmark_movement_bonus: float = 1.25
     fresh_affordance_followup_bonus: float = 1.5
     discard_inventory_penalty: float = 2.0
@@ -232,6 +236,8 @@ class PolicyConfig(StrictModel):
     frontier_base_reversible_state_penalty: float = 0.75
     frontier_oscillating_pair_penalty: float = 1.0
     frontier_trivial_reversible_penalty: float = 0.5
+    frontier_strategic_score_weight: float = 1.0
+    region_visit_exhaustion_threshold: int = 4
 
     @field_validator(
         "rollout_count",
@@ -286,6 +292,7 @@ class PolicyConfig(StrictModel):
         "branch_fail_fast_post_gain_churn_actions",
         "branch_fail_fast_post_score_no_progress_steps",
         "post_score_scene_branch_patience",
+        "region_visit_exhaustion_threshold",
     )
     @classmethod
     def validate_positive_branch_policy_counts(cls, value: int, info) -> int:
@@ -334,6 +341,10 @@ class PolicyConfig(StrictModel):
         "post_score_scene_exhaustion_penalty",
         "stale_reflection_try_penalty",
         "escape_mode_exit_bonus",
+        "explore_mode_exit_bonus",
+        "strategic_try_bonus",
+        "strategic_object_bonus",
+        "strategic_avoid_penalty",
         "discard_inventory_penalty",
         "bulk_inventory_action_penalty",
         "branch_progress_score_weight",
@@ -367,6 +378,7 @@ class PolicyConfig(StrictModel):
         "frontier_base_reversible_state_penalty",
         "frontier_oscillating_pair_penalty",
         "frontier_trivial_reversible_penalty",
+        "frontier_strategic_score_weight",
     )
     @classmethod
     def validate_nonnegative_penalties(cls, value: float, info) -> float:

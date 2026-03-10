@@ -26,11 +26,14 @@ from zork_agent.policy.reflection import ReflectionPolicy
 from zork_agent.policy.state_selector import StateSelector
 from zork_agent.types import (
     ActionClusterHistory,
+    EpisodeMapMemory,
     EpisodeResult,
     LocalBranchOutcome,
     LoopHeuristicResult,
     MovementHeuristicResult,
     ReflectionGuidance,
+    StrategicGuidance,
+    StrategicMode,
     StateSelectionResult,
     TextGameState,
     Trajectory,
@@ -113,6 +116,7 @@ class EpisodeRunner:
         episode_loop_results: list[LoopHeuristicResult] = []
         episode_movement_results: list[MovementHeuristicResult] = []
         action_cluster_history = ActionClusterHistory(cluster_label="episode")
+        episode_map_memory = EpisodeMapMemory()
         loop_detected_count = 0
         oscillation_penalty_total = 0.0
         movement_loop_detected_count = 0
@@ -125,6 +129,8 @@ class EpisodeRunner:
         local_exploration_cooldown_steps = 0
         last_selection_result: StateSelectionResult | None = None
         last_local_exploration = None
+        latest_strategic_guidance = StrategicGuidance(mode=StrategicMode.EXPLORE, reason="initial mapping")
+        episode_mode_counts: Counter[str] = Counter()
 
         try:
             current_state = self._annotate_state(
@@ -138,6 +144,11 @@ class EpisodeRunner:
                 novel_object_count=0,
                 movement_only_action=False,
                 materially_new_actions=False,
+            )
+            self._annotate_strategic_state(
+                current_state,
+                episode_map_memory=episode_map_memory,
+                step_index=0,
             )
             action_cluster_history.observe_state_nouns(
                 observation=current_state.observation,
@@ -176,6 +187,17 @@ class EpisodeRunner:
                 branch_progress_score = 0.0
                 branch_commit_allowed = False
                 commit_rejection_reason = ""
+                latest_strategic_guidance = episode_map_memory.recommend_guidance(
+                    current_state=current_state,
+                    frontier_entries=self.frontier.top_k(6),
+                    cluster_visit_exhaustion_threshold=self.config.policy.region_visit_exhaustion_threshold,
+                )
+                latest_strategic_guidance = self._apply_stall_recovery_guidance_override(
+                    strategic_guidance=latest_strategic_guidance,
+                    current_state=current_state,
+                    consecutive_no_durable_gain_steps=consecutive_no_durable_gain_steps,
+                )
+                episode_mode_counts[latest_strategic_guidance.mode.value] += 1
 
                 # Revisit a saved frontier node periodically, then probe it locally before committing.
                 if (
@@ -184,11 +206,17 @@ class EpisodeRunner:
                         episode_step_index,
                         replay_attempt_count,
                         local_exploration_cooldown_steps,
+                        strategic_guidance=latest_strategic_guidance,
+                        current_cluster_id=current_state.state_cluster_id,
                     )
                 ):
                     last_selection_result = self.state_selector.select_with_details(
                         self.frontier,
                         mode=self.config.policy.state_selection_mode,
+                    )
+                    last_selection_result = self._apply_strategic_selection_override(
+                        last_selection_result,
+                        strategic_guidance=latest_strategic_guidance,
                     )
                     selected_entry = last_selection_result.selected
                     selection_mode_counts[last_selection_result.selection_mode.value] += 1
@@ -204,12 +232,12 @@ class EpisodeRunner:
                         restore_mode_counts[restore_result.restore_mode.value] += 1
                         if restore_result.success:
                             replay_success_count += 1
-                            action_cluster_history = ActionClusterHistory(cluster_label="revisit")
-                            current_state = self._annotate_state(
+                            planning_action_cluster_history = ActionClusterHistory(cluster_label="revisit")
+                            planning_state = self._annotate_state(
                                 restore_result.final_state,
                                 episode_id=generated_episode_id,
                                 recent_gain=0.0,
-                                action_cluster_history=action_cluster_history,
+                                action_cluster_history=planning_action_cluster_history,
                                 previous_state=None,
                                 inventory_changed=False,
                                 affordance_gain=0,
@@ -217,18 +245,14 @@ class EpisodeRunner:
                                 movement_only_action=False,
                                 materially_new_actions=False,
                             )
-                            action_cluster_history.observe_state_nouns(
-                                observation=current_state.observation,
-                                inventory_text=current_state.inventory_text,
-                                valid_actions=current_state.valid_actions,
+                            planning_action_cluster_history.observe_state_nouns(
+                                observation=planning_state.observation,
+                                inventory_text=planning_state.inventory_text,
+                                valid_actions=planning_state.valid_actions,
                                 inverse_pairs=self.config.policy.inverse_action_pairs,
                             )
-                            episode_action_history = []
-                            episode_state_history = [current_state]
-                            episode_loop_results = []
-                            episode_movement_results = []
                             last_local_exploration = self.local_explorer.explore_from_state(
-                                current_state,
+                                planning_state,
                                 env=self.env,
                                 branch_count=self.config.policy.rollout_count,
                                 branch_horizon=self.config.policy.rollout_depth,
@@ -250,6 +274,15 @@ class EpisodeRunner:
                             branch_progress_score = last_local_exploration.best_branch_progress_score
                             branch_commit_allowed = last_local_exploration.branch_commit_allowed
                             commit_rejection_reason = last_local_exploration.commit_rejection_reason
+                            timeline_commit_allowed, timeline_commit_reason = self._validate_branch_commit_origin(
+                                origin_state=current_state,
+                                selected_entry=selected_entry,
+                            )
+                            if branch_commit_allowed and not timeline_commit_allowed:
+                                branch_commit_allowed = False
+                                commit_rejection_reason = timeline_commit_reason
+                                last_local_exploration.branch_commit_allowed = False
+                                last_local_exploration.commit_rejection_reason = timeline_commit_reason
                             if not branch_commit_allowed:
                                 branch_commit_rejection_count += 1
                                 self.logger.info(
@@ -259,86 +292,32 @@ class EpisodeRunner:
                                     branch_progress_score,
                                     commit_rejection_reason or "none",
                                 )
+                            self._restore_episode_state(current_state)
                             if (
                                 best_branch is not None
                                 and best_branch.actions_taken
                                 and selected_entry.saved_node is not None
                                 and branch_commit_allowed
                             ):
-                                branch_restore = restore_saved_node(
-                                    self.env,
-                                    selected_entry.saved_node,
-                                    target_step_index=selected_entry.step_index,
-                                    logger=self.logger,
+                                pending_branch_actions = self._branch_commit_actions(best_branch)
+                                self.logger.info(
+                                    "Committing branch %s with actions=%s first_durable_gain_index=%s "
+                                    "first_durable_gain_action=%s last_durable_progress_index=%s "
+                                    "last_durable_progress_action=%s last_meaningful_progress_index=%s "
+                                    "last_meaningful_progress_action=%s",
+                                    best_branch.branch_index,
+                                    pending_branch_actions,
+                                    best_branch.first_durable_gain_action_index,
+                                    best_branch.first_durable_gain_action or "none",
+                                    best_branch.last_durable_progress_action_index,
+                                    best_branch.last_durable_progress_action or "none",
+                                    best_branch.last_meaningful_progress_action_index,
+                                    best_branch.last_meaningful_progress_action or "none",
                                 )
-                                if branch_restore.success:
-                                    action_cluster_history = ActionClusterHistory(cluster_label="branch-commit")
-                                    current_state = self._annotate_state(
-                                        branch_restore.final_state,
-                                        episode_id=generated_episode_id,
-                                        recent_gain=0.0,
-                                        action_cluster_history=action_cluster_history,
-                                        previous_state=None,
-                                        inventory_changed=False,
-                                        affordance_gain=0,
-                                        novel_object_count=0,
-                                        movement_only_action=False,
-                                        materially_new_actions=False,
-                                    )
-                                    action_cluster_history.observe_state_nouns(
-                                        observation=current_state.observation,
-                                        inventory_text=current_state.inventory_text,
-                                        valid_actions=current_state.valid_actions,
-                                        inverse_pairs=self.config.policy.inverse_action_pairs,
-                                    )
-                                    episode_action_history = []
-                                    episode_state_history = [current_state]
-                                    episode_loop_results = []
-                                    episode_movement_results = []
-                                    pending_branch_actions = self._branch_commit_actions(best_branch)
-                                    self.logger.info(
-                                        "Committing branch %s with actions=%s first_durable_gain_index=%s "
-                                        "first_durable_gain_action=%s last_meaningful_progress_index=%s "
-                                        "last_meaningful_progress_action=%s",
-                                        best_branch.branch_index,
-                                        pending_branch_actions,
-                                        best_branch.first_durable_gain_action_index,
-                                        best_branch.first_durable_gain_action or "none",
-                                        best_branch.last_meaningful_progress_action_index,
-                                        best_branch.last_meaningful_progress_action or "none",
-                                    )
-                                    loaded_branch_plan_this_step = bool(pending_branch_actions)
-                                else:
-                                    self.logger.warning(
-                                        "Could not restore selected node %s after local exploration; "
-                                        "falling back to action generation.",
-                                        selected_entry.state_id,
-                                    )
-                                    action_cluster_history = ActionClusterHistory(cluster_label="branch-fallback")
-                                    current_state = self._annotate_state(
-                                        branch_restore.final_state,
-                                        episode_id=generated_episode_id,
-                                        recent_gain=0.0,
-                                        action_cluster_history=action_cluster_history,
-                                        previous_state=None,
-                                        inventory_changed=False,
-                                        affordance_gain=0,
-                                        novel_object_count=0,
-                                        movement_only_action=False,
-                                        materially_new_actions=False,
-                                    )
-                                    action_cluster_history.observe_state_nouns(
-                                        observation=current_state.observation,
-                                        inventory_text=current_state.inventory_text,
-                                        valid_actions=current_state.valid_actions,
-                                        inverse_pairs=self.config.policy.inverse_action_pairs,
-                                    )
-                                    episode_action_history = []
-                                    episode_state_history = [current_state]
-                                    episode_loop_results = []
-                                    episode_movement_results = []
-                                    pending_branch_actions = []
-                            revisit_made_progress = bool(branch_commit_allowed)
+                                loaded_branch_plan_this_step = bool(pending_branch_actions)
+                            revisit_made_progress = bool(
+                                best_branch is not None and best_branch.branch_progress_score > 0.0
+                            )
                         else:
                             revisit_made_progress = False
 
@@ -360,9 +339,23 @@ class EpisodeRunner:
                             recent_actions=episode_action_history,
                             recent_loop_results=episode_loop_results,
                             state_action_history=action_cluster_history,
-                            supported_try_actions=latest_reflection_guidance.supported_try_actions,
-                            supported_avoid_actions=latest_reflection_guidance.supported_avoid_actions,
-                            supported_reflection_objects=latest_reflection_guidance.salient_objects,
+                            supported_try_actions=self._merge_action_lists(
+                                latest_reflection_guidance.supported_try_actions,
+                                latest_strategic_guidance.try_actions,
+                            ),
+                            supported_avoid_actions=self._merge_action_lists(
+                                latest_reflection_guidance.supported_avoid_actions,
+                                latest_strategic_guidance.avoid_actions,
+                            ),
+                            supported_reflection_objects=self._merge_action_lists(
+                                latest_reflection_guidance.salient_objects,
+                                latest_strategic_guidance.salient_objects,
+                            ),
+                            strategic_mode=latest_strategic_guidance.mode,
+                            strategic_reason=latest_strategic_guidance.reason,
+                            strategic_try_actions=latest_strategic_guidance.try_actions,
+                            strategic_avoid_actions=latest_strategic_guidance.avoid_actions,
+                            strategic_objects=latest_strategic_guidance.salient_objects,
                         )
                         action_generation_result = self.action_generator.last_result
                         if action_generation_result is not None:
@@ -438,6 +431,25 @@ class EpisodeRunner:
                     novel_object_count=len(novel_object_tokens) if revealed_new_object else 0,
                     movement_only_action=movement_only_action,
                     materially_new_actions=materially_new_actions,
+                )
+                episode_map_memory.record_transition(
+                    previous_state=pre_step_state,
+                    action=chosen_action,
+                    current_state=next_state,
+                    step_index=episode_step_index,
+                    score_gain=next_state.score - pre_step_state.score,
+                    inventory_gain_count=self._count_inventory_gain(
+                        base_state=pre_step_state,
+                        final_state=next_state,
+                    ),
+                    affordance_gain=affordance_gain,
+                    novel_object_count=len(novel_object_tokens) if revealed_new_object else 0,
+                    materially_new_actions=materially_new_actions,
+                )
+                self._annotate_strategic_state(
+                    next_state,
+                    episode_map_memory=episode_map_memory,
+                    step_index=episode_step_index + 1,
                 )
                 action_cluster_history.record_attempt(
                     action=chosen_action,
@@ -727,6 +739,7 @@ class EpisodeRunner:
             "action_generation_mode_counts": dict(action_generation_mode_counts),
             "restore_mode_counts": dict(restore_mode_counts),
             "action_source_counts": dict(action_source_counts),
+            "episode_mode_counts": dict(episode_mode_counts),
             "loop_detected_count": loop_detected_count,
             "oscillation_penalty_total": oscillation_penalty_total,
             "movement_loop_detected_count": movement_loop_detected_count,
@@ -809,7 +822,10 @@ class EpisodeRunner:
             return []
 
         commit_length = min(len(branch.actions_taken), self.config.experiment.branch_commit_steps)
-        if branch.last_meaningful_progress_action_index is not None:
+        if branch.last_durable_progress_action_index is not None:
+            commit_length = max(commit_length, branch.last_durable_progress_action_index + 1)
+            commit_length = min(commit_length, branch.last_durable_progress_action_index + 1)
+        elif branch.last_meaningful_progress_action_index is not None:
             commit_length = max(commit_length, branch.last_meaningful_progress_action_index + 1)
             commit_length = min(commit_length, branch.last_meaningful_progress_action_index + 1)
         elif branch.first_durable_gain_action_index is not None:
@@ -839,6 +855,7 @@ class EpisodeRunner:
                 base_reversible_state_penalty=self.config.policy.frontier_base_reversible_state_penalty,
                 oscillating_pair_penalty=self.config.policy.frontier_oscillating_pair_penalty,
                 trivial_reversible_penalty=self.config.policy.frontier_trivial_reversible_penalty,
+                strategic_score_weight=self.config.policy.frontier_strategic_score_weight,
             ),
         )
 
@@ -900,6 +917,30 @@ class EpisodeRunner:
         state.metadata["region_novelty_score"] = state.region_novelty_score
         if previous_state is not None:
             state.metadata["previous_state_cluster_id"] = previous_state.state_cluster_id
+        return state
+
+    def _annotate_strategic_state(
+        self,
+        state: TextGameState,
+        *,
+        episode_map_memory: EpisodeMapMemory,
+        step_index: int,
+    ) -> TextGameState:
+        """Attach region/opportunity memory signals to one state."""
+
+        episode_map_memory.record_state(state, step_index=step_index)
+        state.strategic_cluster_score = episode_map_memory.cluster_strategic_score(state.state_cluster_id)
+        state.unresolved_opportunity_count = episode_map_memory.unresolved_opportunity_count(state.state_cluster_id)
+        state.metadata["strategic_cluster_score"] = state.strategic_cluster_score
+        state.metadata["unresolved_opportunity_count"] = state.unresolved_opportunity_count
+        state.metadata["strategic_objects"] = episode_map_memory.suggested_objects_for_cluster(
+            state.state_cluster_id,
+            limit=6,
+        )
+        state.metadata["strategic_actions"] = episode_map_memory.suggested_actions_for_cluster(
+            state.state_cluster_id,
+            limit=6,
+        )
         return state
 
     def _record_frontier_state(
@@ -974,6 +1015,8 @@ class EpisodeRunner:
                 "state_family_key": state_family_key,
                 "state_cluster_id": state.state_cluster_id,
                 "region_novelty_score": state.region_novelty_score,
+                "strategic_value": state.strategic_cluster_score,
+                "unresolved_opportunity_count": state.unresolved_opportunity_count,
                 "movement_penalty": movement_penalty,
                 "affordance_gain": affordance_gain,
                 "room_text_only_gain": room_text_only_gain,
@@ -995,6 +1038,8 @@ class EpisodeRunner:
                 state_cluster_id=state.state_cluster_id,
                 cluster_visit_count=state.cluster_visit_count,
                 region_novelty_score=state.region_novelty_score,
+                strategic_value=state.strategic_cluster_score,
+                unresolved_opportunity_count=state.unresolved_opportunity_count,
                 oscillating_pair_member=loop_penalty > 0.0 or movement_penalty > 0.0,
                 trivial_reversible_change=bool(metadata and metadata.get("loop_no_progress", False))
                 or (movement_penalty > 0.0 and affordance_gain <= 0 and recent_gain <= 0.0),
@@ -1019,6 +1064,9 @@ class EpisodeRunner:
         episode_step_index: int,
         replay_attempt_count: int,
         local_exploration_cooldown_steps: int,
+        *,
+        strategic_guidance: StrategicGuidance,
+        current_cluster_id: str,
     ) -> bool:
         """Return whether the loop should revisit a saved node before the next real step."""
 
@@ -1029,7 +1077,162 @@ class EpisodeRunner:
             return False
         if local_exploration_cooldown_steps > 0:
             return False
+        if strategic_guidance.mode is StrategicMode.EXPLORE and strategic_guidance.try_actions:
+            return False
+        if (
+            strategic_guidance.mode is StrategicMode.EXPLOIT
+            and strategic_guidance.preferred_cluster_id
+            and self._normalize_text(strategic_guidance.preferred_cluster_id)
+            != self._normalize_text(current_cluster_id)
+            and len(self.frontier) > 0
+        ):
+            return True
         return episode_step_index % cadence == 0 and len(self.frontier) > 0
+
+    def _apply_strategic_selection_override(
+        self,
+        selection_result: StateSelectionResult,
+        *,
+        strategic_guidance: StrategicGuidance,
+    ) -> StateSelectionResult:
+        """Prefer a frontier entry from the strategically preferred cluster when available."""
+
+        preferred_cluster_id = self._normalize_text(strategic_guidance.preferred_cluster_id)
+        if (
+            not preferred_cluster_id
+            or strategic_guidance.mode is not StrategicMode.EXPLOIT
+            or selection_result.selected is None
+        ):
+            return selection_result
+
+        for entry in self.frontier.top_k(8):
+            entry_cluster_id = self._normalize_text(entry.state_cluster_id or entry.world_state_hash)
+            if entry_cluster_id != preferred_cluster_id:
+                continue
+            if selection_result.selected.state_id == entry.state_id:
+                return selection_result
+            return StateSelectionResult(
+                selected=entry,
+                reason=(
+                    f"Strategic override selected {entry.state_id} to follow preferred cluster "
+                    f"{preferred_cluster_id}. Baseline selector reason: {selection_result.reason}"
+                ),
+                selection_mode=selection_result.selection_mode,
+                candidate_summaries=selection_result.candidate_summaries,
+                raw_output=selection_result.raw_output,
+                prompt_snapshot=selection_result.prompt_snapshot,
+                model_name=selection_result.model_name,
+                fallback_reason=selection_result.fallback_reason,
+            )
+        return selection_result
+
+    def _apply_stall_recovery_guidance_override(
+        self,
+        *,
+        strategic_guidance: StrategicGuidance,
+        current_state: TextGameState,
+        consecutive_no_durable_gain_steps: int,
+    ) -> StrategicGuidance:
+        """Force a temporary explore bias when a local cluster has gone stale.
+
+        This is deliberately simple: after several no-progress steps in the same live
+        episode cluster, prefer exits over more local object churn even if the broader
+        strategic layer still thinks the region is exploitable.
+        """
+
+        recovery_threshold = max(4, self.config.experiment.fail_fast_no_durable_gain_steps // 2)
+        if consecutive_no_durable_gain_steps < recovery_threshold:
+            return strategic_guidance
+
+        exit_actions = [
+            action
+            for action in current_state.valid_actions
+            if is_movement_action(action, self.config.policy.inverse_action_pairs)
+        ]
+        if not exit_actions:
+            return strategic_guidance
+
+        avoid_actions = [
+            action
+            for action in current_state.valid_actions
+            if not is_movement_action(action, self.config.policy.inverse_action_pairs)
+        ][:6]
+        return StrategicGuidance(
+            mode=StrategicMode.EXPLORE,
+            reason=(
+                f"Stall recovery after {consecutive_no_durable_gain_steps} no-progress steps; "
+                "prefer exits over local object churn."
+            ),
+            preferred_cluster_id=current_state.state_cluster_id,
+            try_actions=exit_actions[:4],
+            avoid_actions=avoid_actions,
+            salient_objects=list(strategic_guidance.salient_objects),
+            opportunity_labels=list(strategic_guidance.opportunity_labels),
+        )
+
+    def _validate_branch_commit_origin(
+        self,
+        *,
+        origin_state: TextGameState,
+        selected_entry: FrontierEntry,
+    ) -> tuple[bool, str]:
+        """Return whether a replay-planned branch may be committed into the real episode.
+
+        Replay restores are used as a planning tool. To keep the episode trajectory
+        comparable to a normal playthrough, we only commit a replay-derived branch when
+        it is local to the current episode state rather than a teleport back to a
+        different cluster or a lower-value inventory/score basin.
+        """
+
+        origin_cluster = self._normalize_text(origin_state.state_cluster_id or origin_state.world_state_hash)
+        target_cluster = self._normalize_text(selected_entry.state_cluster_id or selected_entry.world_state_hash)
+        if origin_cluster and target_cluster and origin_cluster != target_cluster:
+            return (
+                False,
+                (
+                    "planning-only off-cluster restore: local branch came from "
+                    f"{selected_entry.state_cluster_id or selected_entry.world_state_hash}, "
+                    f"current cluster is {origin_state.state_cluster_id or origin_state.world_state_hash}"
+                ),
+            )
+
+        if selected_entry.score < float(origin_state.score):
+            return (
+                False,
+                (
+                    "planning-only lower-score restore: selected node score "
+                    f"{selected_entry.score:.2f} is below current score {origin_state.score:.2f}"
+                ),
+            )
+
+        selected_inventory = self._normalize_text(selected_entry.inventory_text)
+        current_inventory = self._normalize_text(origin_state.inventory_text)
+        if (
+            selected_inventory
+            and current_inventory
+            and selected_inventory != current_inventory
+            and selected_entry.score <= float(origin_state.score)
+        ):
+            return (
+                False,
+                "planning-only inventory mismatch: replay node would discard current durable inventory context",
+            )
+
+        return True, ""
+
+    def _restore_episode_state(self, state: TextGameState) -> None:
+        """Restore the live environment to the current committed episode state after planning."""
+
+        snapshot = state.world_state_snapshot
+        if snapshot is None:
+            return
+        restored_state = self.env.restore_snapshot(snapshot)
+        self.logger.debug(
+            "Restored committed episode state after planning: cluster=%s score=%s inventory=%s",
+            state.state_cluster_id or restored_state.state_cluster_id,
+            restored_state.score,
+            restored_state.inventory_text,
+        )
 
     def _should_refresh_frontier(
         self,
@@ -1059,6 +1262,20 @@ class EpisodeRunner:
         if reflection_context:
             parts.append("guidance=" + reflection_context)
         return " | ".join(parts)
+
+    def _merge_action_lists(self, *lists: list[str]) -> list[str]:
+        """Merge action/object guidance lists while preserving order."""
+
+        merged: list[str] = []
+        seen: set[str] = set()
+        for values in lists:
+            for value in values:
+                normalized = self._normalize_text(value)
+                if not normalized or normalized in seen:
+                    continue
+                merged.append(value)
+                seen.add(normalized)
+        return merged
 
     def _merge_guidance(self, existing: str, new_guidance: str) -> str:
         """Keep reflection guidance compact enough for reuse in later prompts."""

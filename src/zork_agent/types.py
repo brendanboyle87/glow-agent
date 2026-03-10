@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 import re
-from typing import Any, Literal, Mapping, TypedDict
+from typing import Any, Literal, Mapping, Sequence, TypedDict
 
 
 class ChatMessage(TypedDict):
@@ -361,13 +361,10 @@ _ROOM_TEXT_ONLY_TOKENS = {
     "trees",
 }
 _STATE_CLUSTER_PRIORITY_TOKENS = (
-    "mailbox",
-    "leaflet",
-    "forest",
-    "field",
     "house",
-    "window",
-    "door",
+    "field",
+    "forest",
+    "tree",
     "path",
     "stream",
     "room",
@@ -377,6 +374,15 @@ _STATE_CLUSTER_PRIORITY_TOKENS = (
     "cellar",
     "canyon",
     "valley",
+)
+
+_SECONDARY_STATE_CLUSTER_TOKENS = (
+    "window",
+    "door",
+    "mailbox",
+    "leaflet",
+    "egg",
+    "nest",
 )
 
 
@@ -1210,14 +1216,18 @@ def derive_state_cluster_id(
     if "west of a white house" in normalized_observation or "west of house" in normalized_observation:
         return "region:house-field"
 
-    observation_tokens = extract_salient_nouns(
-        observation=observation,
-        inventory_text="",
-        valid_actions=[],
-        inverse_pairs=inverse_pairs,
-    )
+    title_cluster = _cluster_id_from_room_title(observation)
+    if title_cluster:
+        return title_cluster
+
+    observation_tokens = _observation_cluster_tokens(observation)
     for token in _STATE_CLUSTER_PRIORITY_TOKENS:
         if token in observation_tokens:
+            return f"region:{token}"
+
+    summary_tokens = _observation_cluster_tokens(summary_text)
+    for token in _STATE_CLUSTER_PRIORITY_TOKENS:
+        if token in summary_tokens:
             return f"region:{token}"
 
     valid_action_targets = {
@@ -1226,21 +1236,118 @@ def derive_state_cluster_id(
         if not is_movement_action(action, inverse_pairs)
         for token in action_target_tokens(action, inverse_pairs)
     }
-    for token in _STATE_CLUSTER_PRIORITY_TOKENS:
+    for token in _SECONDARY_STATE_CLUSTER_TOKENS:
         if token in valid_action_targets:
             return f"region:{token}"
 
     inventory_tokens = inventory_item_tokens(inventory_text, inverse_pairs)
-    for token in _STATE_CLUSTER_PRIORITY_TOKENS:
+    for token in _SECONDARY_STATE_CLUSTER_TOKENS:
         if token in inventory_tokens and token not in {"leaflet", "lamp"}:
             return f"region:{token}"
 
-    stable_tokens = sorted((observation_tokens | valid_action_targets | inventory_tokens) - _ROOM_TEXT_ONLY_TOKENS)
+    stable_tokens = sorted((observation_tokens | summary_tokens) - _ROOM_TEXT_ONLY_TOKENS)
     if stable_tokens:
         return "region:" + "|".join(stable_tokens[:3])
     if summary_text.strip():
         return "region:summary:" + normalize_parser_action(summary_text)[:48]
     return "region:observation:" + normalize_parser_action(observation)[:48]
+
+
+def _cluster_id_from_room_title(observation: str) -> str:
+    """Extract a stable cluster id from a likely room-title line when present."""
+
+    lines = [line.strip() for line in observation.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    raw_title = lines[0]
+    title = normalize_parser_action(raw_title)
+    if not title:
+        return ""
+    title_words = title.split()
+    if len(title_words) > 4:
+        return ""
+    if raw_title.endswith((".", "!", "?")):
+        return ""
+    if any(
+        title.startswith(prefix)
+        for prefix in (
+            "you are",
+            "there is",
+            "this is",
+            "it is",
+            "from here",
+            "a path",
+            "the path",
+        )
+    ):
+        return ""
+    if any(
+        token in title_words
+        for token in ("prevents", "blocked", "blocks", "cannot", "can't", "impassable", "undergrowth")
+    ):
+        return ""
+    if "|" in title or ":" in title:
+        return ""
+    return "region:title:" + title.replace(" ", "-")[:48]
+
+
+def _observation_cluster_tokens(text: str) -> set[str]:
+    """Extract location-oriented tokens for region clustering.
+
+    This intentionally biases toward room/region landmarks rather than local object nouns,
+    so map memory stays anchored to places instead of transient affordances.
+    """
+
+    normalized = normalize_parser_action(text)
+    if not normalized:
+        return set()
+
+    tokens: set[str] = set()
+    if "white house" in normalized or "house" in normalized:
+        tokens.add("house")
+    if "forest" in normalized:
+        tokens.add("forest")
+    if "field" in normalized:
+        tokens.add("field")
+    if "path" in normalized or "trail" in normalized:
+        tokens.add("path")
+    if "stream" in normalized or "river" in normalized:
+        tokens.add("stream")
+    if "tree" in normalized:
+        tokens.add("tree")
+    if "kitchen" in normalized:
+        tokens.add("kitchen")
+    if "living room" in normalized or "living-room" in normalized:
+        tokens.add("living")
+    if "attic" in normalized:
+        tokens.add("attic")
+    if "cellar" in normalized or "basement" in normalized:
+        tokens.add("cellar")
+    if "canyon" in normalized:
+        tokens.add("canyon")
+    if "valley" in normalized:
+        tokens.add("valley")
+    if "grating" in normalized:
+        tokens.add("grating")
+    if "clearing" in normalized:
+        tokens.add("clearing")
+    if "gallery" in normalized:
+        tokens.add("gallery")
+    if "studio" in normalized:
+        tokens.add("studio")
+
+    if tokens:
+        return tokens
+
+    return {
+        token
+        for token in extract_salient_nouns(
+            observation=text,
+            inventory_text="",
+            valid_actions=[],
+        )
+        if token in _STATE_CLUSTER_PRIORITY_TOKENS
+    }
 
 
 def region_observation_similarity(left: str, right: str) -> float:
@@ -1683,6 +1790,740 @@ class ActionClusterHistory:
             for noun in nouns
         )
 
+    def prior_inventory_gain_for_object_nouns(self, nouns: set[str]) -> int:
+        """Return the highest inventory-gain count among the provided object nouns."""
+
+        if not nouns:
+            return 0
+        return max(
+            self.object_noun_stats.get(normalize_parser_action(noun), ActionAttemptStats(action="")).inventory_gain_count
+            for noun in nouns
+        )
+
+    def prior_inventory_loss_for_object_nouns(self, nouns: set[str]) -> int:
+        """Return the highest inventory-loss count among the provided object nouns."""
+
+        if not nouns:
+            return 0
+        return max(
+            self.object_noun_stats.get(normalize_parser_action(noun), ActionAttemptStats(action="")).inventory_loss_count
+            for noun in nouns
+        )
+
+    def prior_affordance_gain_for_object_nouns(self, nouns: set[str]) -> int:
+        """Return the highest affordance-gain count among the provided object nouns."""
+
+        if not nouns:
+            return 0
+        return max(
+            (
+                self.object_noun_stats.get(normalize_parser_action(noun), ActionAttemptStats(action="")).valid_actions_improvement_count
+                + self.object_noun_stats.get(normalize_parser_action(noun), ActionAttemptStats(action="")).revealed_object_count
+            )
+            for noun in nouns
+        )
+
+
+class StrategicMode(str, Enum):
+    """High-level episode mode for balancing mapping and known opportunity exploitation."""
+
+    EXPLORE = "explore"
+    EXPLOIT = "exploit"
+
+
+class RegionOpportunityKind(str, Enum):
+    """Lightweight unresolved opportunity types attached to one region cluster."""
+
+    STRUCTURAL_ACCESS = "structural_access"
+    OBJECT_FOLLOWUP = "object_followup"
+    UNEXPLORED_EXIT = "unexplored_exit"
+
+
+@dataclass(slots=True)
+class RegionOpportunity:
+    """One unresolved region-level opportunity that can bias replay and action ranking."""
+
+    opportunity_id: str
+    cluster_id: str
+    kind: RegionOpportunityKind
+    token: str
+    action_hints: list[str] = field(default_factory=list)
+    discovered_step: int = 0
+    last_seen_step: int = 0
+    base_priority: float = 0.0
+    attempt_count: int = 0
+    no_progress_attempt_count: int = 0
+    durable_progress_count: int = 0
+    resolved: bool = False
+    resolution_reason: str = ""
+
+    def current_priority(self) -> float:
+        """Return the current strategic value of this opportunity."""
+
+        if self.resolved:
+            return 0.0
+        return max(
+            0.0,
+            self.base_priority
+            + 0.4 * float(self.durable_progress_count)
+            - 0.75 * float(self.no_progress_attempt_count),
+        )
+
+
+@dataclass(slots=True)
+class RegionNodeMemory:
+    """Aggregated map memory for one coarse region/state cluster."""
+
+    cluster_id: str
+    summary_text: str = ""
+    first_seen_step: int = 0
+    last_seen_step: int = 0
+    visit_count: int = 0
+    durable_progress_count: int = 0
+    seen_objects: set[str] = field(default_factory=set)
+    exit_actions: set[str] = field(default_factory=set)
+    explored_exit_actions: set[str] = field(default_factory=set)
+    opportunity_ids: set[str] = field(default_factory=set)
+
+    def unresolved_opportunity_ids(
+        self,
+        opportunities: Mapping[str, "RegionOpportunity"],
+    ) -> list[str]:
+        """Return unresolved opportunity ids linked to this region."""
+
+        return [
+            opportunity_id
+            for opportunity_id in self.opportunity_ids
+            if opportunity_id in opportunities and not opportunities[opportunity_id].resolved
+        ]
+
+
+@dataclass(slots=True)
+class StrategicGuidance:
+    """Compact high-level guidance for the current episode step."""
+
+    mode: StrategicMode
+    reason: str
+    preferred_cluster_id: str = ""
+    try_actions: list[str] = field(default_factory=list)
+    avoid_actions: list[str] = field(default_factory=list)
+    salient_objects: list[str] = field(default_factory=list)
+    opportunity_labels: list[str] = field(default_factory=list)
+
+
+_STRUCTURAL_ACCESS_TOKENS = {
+    "door",
+    "gate",
+    "grating",
+    "house",
+    "ladder",
+    "stairs",
+    "trapdoor",
+    "window",
+}
+
+_OBJECT_FOLLOWUP_VERBS = ("examine", "look at", "look in", "open", "read", "take", "get", "enter")
+
+
+@dataclass(slots=True)
+class EpisodeMapMemory:
+    """Lightweight region graph and unresolved-opportunity memory for one episode."""
+
+    nodes: dict[str, RegionNodeMemory] = field(default_factory=dict)
+    opportunities: dict[str, RegionOpportunity] = field(default_factory=dict)
+    recent_cluster_sequence: list[str] = field(default_factory=list)
+
+    def record_state(self, state: "TextGameState", *, step_index: int) -> RegionNodeMemory:
+        """Record one visited state and infer/update region-level opportunities."""
+
+        cluster_id = normalize_parser_action(state.state_cluster_id or state.world_state_hash) or "region:unknown"
+        node = self.nodes.get(cluster_id)
+        if node is None:
+            node = RegionNodeMemory(
+                cluster_id=cluster_id,
+                summary_text=str(state.metadata.get("summary_text", "")),
+                first_seen_step=step_index,
+            )
+            self.nodes[cluster_id] = node
+        node.visit_count += 1
+        node.last_seen_step = step_index
+        if state.metadata.get("summary_text"):
+            node.summary_text = str(state.metadata["summary_text"])
+        node.seen_objects.update(
+            extract_salient_nouns(
+                observation=state.observation,
+                inventory_text=state.inventory_text,
+                valid_actions=[],
+            )
+        )
+        node.exit_actions.update(
+            normalize_parser_action(action)
+            for action in state.valid_actions
+            if is_movement_action(action)
+        )
+        self.recent_cluster_sequence.append(cluster_id)
+        self.recent_cluster_sequence = self.recent_cluster_sequence[-32:]
+        self._infer_opportunities(node=node, state=state, step_index=step_index)
+        return node
+
+    def record_transition(
+        self,
+        *,
+        previous_state: "TextGameState",
+        action: str,
+        current_state: "TextGameState",
+        step_index: int,
+        score_gain: int,
+        inventory_gain_count: int,
+        affordance_gain: int,
+        novel_object_count: int,
+        materially_new_actions: bool,
+    ) -> None:
+        """Update opportunity success/failure counts after one real episode transition."""
+
+        previous_cluster_id = normalize_parser_action(previous_state.state_cluster_id or previous_state.world_state_hash)
+        if not previous_cluster_id:
+            return
+        node = self.nodes.setdefault(previous_cluster_id, RegionNodeMemory(cluster_id=previous_cluster_id))
+        normalized_action = normalize_parser_action(action)
+        durable_progress = any(
+            (
+                score_gain > 0,
+                inventory_gain_count > 0,
+                affordance_gain > 0,
+                novel_object_count > 0 and not is_movement_action(action),
+                materially_new_actions and not is_movement_action(action),
+            )
+        )
+        if durable_progress:
+            node.durable_progress_count += 1
+
+        if is_movement_action(action):
+            node.explored_exit_actions.add(normalized_action)
+
+        action_targets = action_target_tokens(action)
+        verb, _obj = split_action_command(action)
+        current_cluster_id = normalize_parser_action(current_state.state_cluster_id or current_state.world_state_hash)
+
+        for opportunity_id in node.unresolved_opportunity_ids(self.opportunities):
+            opportunity = self.opportunities[opportunity_id]
+            if not self._opportunity_matches_action(
+                opportunity=opportunity,
+                action=normalized_action,
+                verb=verb,
+                action_targets=action_targets,
+            ):
+                continue
+            opportunity.attempt_count += 1
+            opportunity.last_seen_step = step_index
+            if durable_progress:
+                opportunity.durable_progress_count += 1
+                if self._opportunity_is_resolved(
+                    opportunity=opportunity,
+                    previous_state=previous_state,
+                    current_state=current_state,
+                    action=normalized_action,
+                    score_gain=score_gain,
+                    inventory_gain_count=inventory_gain_count,
+                    affordance_gain=affordance_gain,
+                ):
+                    opportunity.resolved = True
+                    opportunity.resolution_reason = "durable progress observed"
+            else:
+                opportunity.no_progress_attempt_count += 1
+                if (
+                    opportunity.kind is RegionOpportunityKind.OBJECT_FOLLOWUP
+                    and (
+                        opportunity.no_progress_attempt_count >= 3
+                        or (
+                            node.durable_progress_count > 0
+                            and opportunity.no_progress_attempt_count >= 1
+                        )
+                    )
+                ):
+                    opportunity.resolved = True
+                    opportunity.resolution_reason = "repeated no-progress follow-up"
+
+        if is_movement_action(action) and current_cluster_id and current_cluster_id != previous_cluster_id:
+            opportunity_id = f"exit:{previous_cluster_id}:{normalized_action}"
+            if opportunity_id in self.opportunities:
+                self.opportunities[opportunity_id].resolved = True
+                self.opportunities[opportunity_id].resolution_reason = "exit traversed"
+
+    def recommend_guidance(
+        self,
+        *,
+        current_state: "TextGameState",
+        frontier_entries: Sequence["FrontierEntry"] | None = None,
+        cluster_visit_exhaustion_threshold: int = 4,
+    ) -> StrategicGuidance:
+        """Return high-level explore/exploit guidance for the current episode step."""
+
+        current_cluster_id = normalize_parser_action(current_state.state_cluster_id or current_state.world_state_hash)
+        current_node = self.nodes.get(current_cluster_id)
+        current_opportunities = self.opportunities_for_cluster(current_cluster_id, active_only=True)
+        current_structural_opportunities = [
+            opportunity
+            for opportunity in current_opportunities
+            if opportunity.kind is RegionOpportunityKind.STRUCTURAL_ACCESS
+        ]
+        current_object_opportunities = [
+            opportunity
+            for opportunity in current_opportunities
+            if opportunity.kind is RegionOpportunityKind.OBJECT_FOLLOWUP
+        ]
+        current_exit_actions = self._unexplored_exit_actions(current_cluster_id)
+        current_cluster_score = self.cluster_strategic_score(current_cluster_id)
+        current_region_harvested = bool(current_node is not None and current_node.durable_progress_count > 0)
+        current_object_actions = self._cluster_object_action_hints(current_cluster_id)
+        current_region_exhausted = bool(
+            current_region_harvested
+            and not current_structural_opportunities
+            and (
+                not current_object_opportunities
+                or all(opportunity.no_progress_attempt_count > 0 for opportunity in current_object_opportunities)
+                or (current_node is not None and current_node.visit_count > cluster_visit_exhaustion_threshold)
+            )
+        )
+
+        best_frontier_cluster = ""
+        best_frontier_score = float("-inf")
+        best_frontier_has_structural_access = False
+        for entry in frontier_entries or []:
+            cluster_id = normalize_parser_action(entry.state_cluster_id or entry.world_state_hash)
+            score = self.cluster_strategic_score(cluster_id)
+            if score > best_frontier_score:
+                best_frontier_score = score
+                best_frontier_cluster = cluster_id
+                best_frontier_has_structural_access = any(
+                    opportunity.kind is RegionOpportunityKind.STRUCTURAL_ACCESS
+                    for opportunity in self.opportunities_for_cluster(cluster_id, active_only=True)
+                )
+
+        if current_structural_opportunities and current_cluster_score > 0.0 and (
+            current_node is None or current_node.visit_count <= cluster_visit_exhaustion_threshold
+        ):
+            return StrategicGuidance(
+                mode=StrategicMode.EXPLOIT,
+                reason="Current region still has grounded structural access opportunities.",
+                preferred_cluster_id=current_cluster_id,
+                try_actions=self.suggested_actions_for_cluster(current_cluster_id),
+                salient_objects=self.suggested_objects_for_cluster(current_cluster_id),
+                opportunity_labels=[opportunity.token for opportunity in current_structural_opportunities[:4]],
+            )
+
+        if (
+            best_frontier_cluster
+            and best_frontier_cluster != current_cluster_id
+            and (
+                best_frontier_has_structural_access
+                or current_region_exhausted
+                or best_frontier_score >= max(current_cluster_score + 0.25, 0.8)
+            )
+        ):
+            return StrategicGuidance(
+                mode=StrategicMode.EXPLOIT,
+                reason=(
+                    "Current region looks harvested; shift to the strongest known structural or route opportunity."
+                    if current_region_exhausted
+                    else "A known region now offers a stronger structural or unresolved route opportunity."
+                ),
+                preferred_cluster_id=best_frontier_cluster,
+                try_actions=[],
+                avoid_actions=current_object_actions[:6],
+                salient_objects=self.suggested_objects_for_cluster(best_frontier_cluster),
+                opportunity_labels=[
+                    opportunity.token
+                    for opportunity in self.opportunities_for_cluster(best_frontier_cluster)[:4]
+                ],
+            )
+
+        if (
+            current_object_opportunities
+            and not current_region_exhausted
+            and not current_region_harvested
+            and current_cluster_score > 0.8
+            and (current_node is None or current_node.visit_count <= cluster_visit_exhaustion_threshold)
+        ):
+            return StrategicGuidance(
+                mode=StrategicMode.EXPLOIT,
+                reason="Current region still has unresolved object interactions worth probing.",
+                preferred_cluster_id=current_cluster_id,
+                try_actions=self.suggested_actions_for_cluster(current_cluster_id),
+                salient_objects=self.suggested_objects_for_cluster(current_cluster_id),
+                opportunity_labels=[opportunity.token for opportunity in current_object_opportunities[:4]],
+            )
+
+        if current_exit_actions:
+            return StrategicGuidance(
+                mode=StrategicMode.EXPLORE,
+                reason=(
+                    "Current region looks harvested; prefer unexplored exits over more local object churn."
+                    if current_region_exhausted
+                    else "Current region still has unexplored exits or routes worth mapping."
+                ),
+                preferred_cluster_id=current_cluster_id,
+                try_actions=current_exit_actions[:4],
+                avoid_actions=current_object_actions[:6] if current_region_exhausted else [],
+                salient_objects=self.suggested_objects_for_cluster(current_cluster_id),
+                opportunity_labels=["route:" + action for action in current_exit_actions[:4]],
+            )
+
+        if best_frontier_cluster and best_frontier_cluster != current_cluster_id and best_frontier_score > 0.75:
+            return StrategicGuidance(
+                mode=StrategicMode.EXPLOIT,
+                reason="Known frontier route has a stronger unresolved opportunity than the current region.",
+                preferred_cluster_id=best_frontier_cluster,
+                try_actions=[],
+                avoid_actions=current_object_actions[:6] if current_region_exhausted else [],
+                salient_objects=self.suggested_objects_for_cluster(best_frontier_cluster),
+                opportunity_labels=[opportunity.token for opportunity in self.opportunities_for_cluster(best_frontier_cluster)[:4]],
+            )
+
+        return StrategicGuidance(
+            mode=StrategicMode.EXPLORE,
+            reason="No strong current exploit target; continue broad mapping.",
+            preferred_cluster_id=current_cluster_id,
+            try_actions=current_exit_actions[:4],
+            salient_objects=self.suggested_objects_for_cluster(current_cluster_id),
+            opportunity_labels=[],
+        )
+
+    def cluster_strategic_score(self, cluster_id: str | None) -> float:
+        """Return the current strategic value of a region cluster."""
+
+        normalized_cluster = normalize_parser_action(cluster_id or "")
+        if not normalized_cluster or normalized_cluster not in self.nodes:
+            return 0.0
+        node = self.nodes[normalized_cluster]
+        active_opportunities = self.opportunities_for_cluster(normalized_cluster, active_only=True)
+        structural = sum(1 for opportunity in active_opportunities if opportunity.kind is RegionOpportunityKind.STRUCTURAL_ACCESS)
+        object_followups = sum(1 for opportunity in active_opportunities if opportunity.kind is RegionOpportunityKind.OBJECT_FOLLOWUP)
+        unexplored_exits = sum(1 for opportunity in active_opportunities if opportunity.kind is RegionOpportunityKind.UNEXPLORED_EXIT)
+        harvested_region = node.durable_progress_count > 0
+        object_weight = 0.1 if harvested_region and structural == 0 else 0.9
+        exit_weight = 1.05 if harvested_region else 0.6
+        revisit_penalty = max(node.visit_count - 1, 0) * (0.9 if harvested_region else 0.45)
+        no_progress_penalty = sum(opportunity.no_progress_attempt_count for opportunity in active_opportunities) * 0.25
+        exhausted_object_penalty = (
+            sum(
+                1
+                for opportunity in active_opportunities
+                if opportunity.kind is RegionOpportunityKind.OBJECT_FOLLOWUP and opportunity.no_progress_attempt_count > 0
+            )
+            * (0.45 if harvested_region else 0.15)
+        )
+        return max(
+            0.0,
+            1.9 * structural
+            + object_weight * object_followups
+            + exit_weight * unexplored_exits
+            + 0.15 * float(node.durable_progress_count)
+            - revisit_penalty
+            - no_progress_penalty,
+            - exhausted_object_penalty,
+        )
+
+    def unresolved_opportunity_count(self, cluster_id: str | None) -> int:
+        """Return the number of unresolved opportunities in a region cluster."""
+
+        return len(self.opportunities_for_cluster(cluster_id, active_only=True))
+
+    def suggested_actions_for_cluster(self, cluster_id: str | None, *, limit: int = 6) -> list[str]:
+        """Return compact action hints for the strongest unresolved opportunities in one cluster."""
+
+        suggestions: list[str] = []
+        seen: set[str] = set()
+        for opportunity in self.opportunities_for_cluster(cluster_id, active_only=True):
+            for action in opportunity.action_hints:
+                normalized = normalize_parser_action(action)
+                if not normalized or normalized in seen:
+                    continue
+                suggestions.append(action)
+                seen.add(normalized)
+                if len(suggestions) >= limit:
+                    return suggestions
+        return suggestions
+
+    def _cluster_object_action_hints(self, cluster_id: str | None, *, limit: int = 6) -> list[str]:
+        """Return object-followup action hints for one cluster."""
+
+        suggestions: list[str] = []
+        seen: set[str] = set()
+        for opportunity in self.opportunities_for_cluster(cluster_id, active_only=True):
+            if opportunity.kind is not RegionOpportunityKind.OBJECT_FOLLOWUP:
+                continue
+            for action in opportunity.action_hints:
+                normalized = normalize_parser_action(action)
+                if not normalized or normalized in seen:
+                    continue
+                suggestions.append(action)
+                seen.add(normalized)
+                if len(suggestions) >= limit:
+                    return suggestions
+        return suggestions
+
+    def suggested_objects_for_cluster(self, cluster_id: str | None, *, limit: int = 6) -> list[str]:
+        """Return the top unresolved object tokens for one cluster."""
+
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for opportunity in self.opportunities_for_cluster(cluster_id, active_only=True):
+            token = normalize_parser_action(opportunity.token)
+            if not token or token in seen:
+                continue
+            tokens.append(token)
+            seen.add(token)
+            if len(tokens) >= limit:
+                break
+        return tokens
+
+    def opportunities_for_cluster(
+        self,
+        cluster_id: str | None,
+        *,
+        active_only: bool = True,
+    ) -> list[RegionOpportunity]:
+        """Return opportunities linked to a cluster, ordered by current priority."""
+
+        normalized_cluster = normalize_parser_action(cluster_id or "")
+        if not normalized_cluster or normalized_cluster not in self.nodes:
+            return []
+        node = self.nodes[normalized_cluster]
+        opportunities = [
+            self.opportunities[opportunity_id]
+            for opportunity_id in node.opportunity_ids
+            if opportunity_id in self.opportunities and (not active_only or not self.opportunities[opportunity_id].resolved)
+        ]
+        opportunities.sort(
+            key=lambda opportunity: (
+                -opportunity.current_priority(),
+                opportunity.kind.value,
+                opportunity.token,
+            )
+        )
+        return opportunities
+
+    def _infer_opportunities(
+        self,
+        *,
+        node: RegionNodeMemory,
+        state: "TextGameState",
+        step_index: int,
+    ) -> None:
+        """Infer unresolved opportunities from the current state description and valid actions."""
+
+        visible_tokens = extract_salient_nouns(
+            observation=state.observation,
+            inventory_text=state.inventory_text,
+            valid_actions=[],
+        )
+        inventory_tokens = inventory_item_tokens(state.inventory_text)
+        valid_actions = [normalize_parser_action(action) for action in state.valid_actions if normalize_parser_action(action)]
+
+        for token in sorted(visible_tokens):
+            if token in _STRUCTURAL_ACCESS_TOKENS:
+                action_hints = self._structural_action_hints(token=token, valid_actions=valid_actions)
+                self._upsert_opportunity(
+                    node=node,
+                    opportunity_id=f"structural:{node.cluster_id}:{token}",
+                    kind=RegionOpportunityKind.STRUCTURAL_ACCESS,
+                    token=token,
+                    action_hints=action_hints,
+                    step_index=step_index,
+                    base_priority=2.0,
+                )
+
+        for action in valid_actions:
+            if not is_movement_action(action):
+                continue
+            self._upsert_opportunity(
+                node=node,
+                opportunity_id=f"exit:{node.cluster_id}:{action}",
+                kind=RegionOpportunityKind.UNEXPLORED_EXIT,
+                token=action,
+                action_hints=[action],
+                step_index=step_index,
+                base_priority=1.0,
+            )
+
+        for action in valid_actions:
+            if is_movement_action(action):
+                continue
+            verb, _obj = split_action_command(action)
+            if verb not in _OBJECT_FOLLOWUP_VERBS:
+                continue
+            targets = action_target_tokens(action)
+            if not targets:
+                continue
+            token = sorted(targets)[0]
+            if token in inventory_tokens and verb in {"take", "get"}:
+                continue
+            self._upsert_opportunity(
+                node=node,
+                opportunity_id=f"object:{node.cluster_id}:{token}",
+                kind=RegionOpportunityKind.OBJECT_FOLLOWUP,
+                token=token,
+                action_hints=self._canonical_object_action_hints(
+                    token=token,
+                    valid_actions=valid_actions,
+                    inventory_tokens=inventory_tokens,
+                ),
+                step_index=step_index,
+                base_priority=1.35 if token not in inventory_tokens else 0.9,
+            )
+
+    def _upsert_opportunity(
+        self,
+        *,
+        node: RegionNodeMemory,
+        opportunity_id: str,
+        kind: RegionOpportunityKind,
+        token: str,
+        action_hints: list[str],
+        step_index: int,
+        base_priority: float,
+    ) -> None:
+        """Create or refresh one unresolved opportunity record."""
+
+        opportunity = self.opportunities.get(opportunity_id)
+        if opportunity is None:
+            opportunity = RegionOpportunity(
+                opportunity_id=opportunity_id,
+                cluster_id=node.cluster_id,
+                kind=kind,
+                token=token,
+                action_hints=list(action_hints),
+                discovered_step=step_index,
+                last_seen_step=step_index,
+                base_priority=base_priority,
+            )
+            self.opportunities[opportunity_id] = opportunity
+        else:
+            opportunity.last_seen_step = step_index
+            opportunity.base_priority = max(opportunity.base_priority, base_priority)
+            if action_hints:
+                existing = {normalize_parser_action(action) for action in opportunity.action_hints}
+                for action in action_hints:
+                    normalized = normalize_parser_action(action)
+                    if normalized and normalized not in existing:
+                        opportunity.action_hints.append(action)
+                        existing.add(normalized)
+        node.opportunity_ids.add(opportunity_id)
+
+    def _canonical_object_action_hints(
+        self,
+        *,
+        token: str,
+        valid_actions: list[str],
+        inventory_tokens: set[str],
+    ) -> list[str]:
+        """Return canonical object-centric action hints for one token."""
+
+        canonical_prefixes = (
+            f"examine {token}",
+            f"look at {token}",
+            f"read {token}",
+            f"take {token}",
+            f"get {token}",
+            f"open {token}",
+            f"look in {token}",
+            f"enter {token}",
+        )
+        ranked: list[str] = []
+        for candidate in canonical_prefixes:
+            normalized_candidate = normalize_parser_action(candidate)
+            if normalized_candidate in valid_actions:
+                if token in inventory_tokens and normalized_candidate.startswith(("take ", "get ")):
+                    continue
+                ranked.append(normalized_candidate)
+        if ranked:
+            return ranked[:4]
+        return [f"examine {token}", f"take {token}", f"open {token}"]
+
+    def _structural_action_hints(self, *, token: str, valid_actions: list[str]) -> list[str]:
+        """Return canonical structure/entry action hints for one structural token."""
+
+        canonical_candidates = [
+            f"open {token}",
+            f"look in {token}",
+            f"enter {token}",
+            f"examine {token}",
+        ]
+        if token == "house":
+            canonical_candidates = [
+                "open window",
+                "look in window",
+                "enter window",
+                "open door",
+                "enter house",
+                "examine house",
+            ] + canonical_candidates
+        ranked = [
+            normalize_parser_action(candidate)
+            for candidate in canonical_candidates
+            if normalize_parser_action(candidate) in valid_actions
+        ]
+        if ranked:
+            return ranked[:5]
+        return canonical_candidates[:5]
+
+    def _unexplored_exit_actions(self, cluster_id: str | None) -> list[str]:
+        """Return currently known but not yet traversed exit actions for a cluster."""
+
+        normalized_cluster = normalize_parser_action(cluster_id or "")
+        if not normalized_cluster or normalized_cluster not in self.nodes:
+            return []
+        node = self.nodes[normalized_cluster]
+        return [
+            exit_action
+            for exit_action in sorted(node.exit_actions)
+            if exit_action not in node.explored_exit_actions
+        ]
+
+    def _opportunity_matches_action(
+        self,
+        *,
+        opportunity: RegionOpportunity,
+        action: str,
+        verb: str,
+        action_targets: set[str],
+    ) -> bool:
+        """Return whether an action plausibly touched an unresolved opportunity."""
+
+        if opportunity.kind is RegionOpportunityKind.UNEXPLORED_EXIT:
+            return action == normalize_parser_action(opportunity.token)
+        if normalize_parser_action(opportunity.token) in action_targets:
+            return True
+        if opportunity.kind is RegionOpportunityKind.STRUCTURAL_ACCESS and verb in {"open", "enter", "look in", "examine"}:
+            return normalize_parser_action(opportunity.token) in action or opportunity.token == "house"
+        return False
+
+    def _opportunity_is_resolved(
+        self,
+        *,
+        opportunity: RegionOpportunity,
+        previous_state: "TextGameState",
+        current_state: "TextGameState",
+        action: str,
+        score_gain: int,
+        inventory_gain_count: int,
+        affordance_gain: int,
+    ) -> bool:
+        """Return whether an opportunity should be treated as resolved by this outcome."""
+
+        if opportunity.kind is RegionOpportunityKind.UNEXPLORED_EXIT:
+            return normalize_parser_action(current_state.state_cluster_id) != normalize_parser_action(previous_state.state_cluster_id)
+        if opportunity.kind is RegionOpportunityKind.STRUCTURAL_ACCESS:
+            return (
+                normalize_parser_action(current_state.state_cluster_id)
+                != normalize_parser_action(previous_state.state_cluster_id)
+                or action.startswith(("enter ", "climb ", "go in", "go into "))
+            )
+        if opportunity.kind is RegionOpportunityKind.OBJECT_FOLLOWUP:
+            return any((score_gain > 0, inventory_gain_count > 0, affordance_gain > 0))
+        return False
+
 
 class ReplayDivergenceReason(str, Enum):
     """Conservative reasons why restoration-via-replay may have diverged."""
@@ -1718,6 +2559,8 @@ class TextGameState:
     state_cluster_id: str = ""
     cluster_visit_count: int = 0
     region_novelty_score: float = 0.0
+    strategic_cluster_score: float = 0.0
+    unresolved_opportunity_count: int = 0
     world_state_snapshot: WorldStateSnapshot | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -1851,6 +2694,8 @@ class TextGameTransition:
             state_cluster_id=str(self.metadata.get("state_cluster_id", "")),
             cluster_visit_count=int(self.metadata.get("cluster_visit_count", 0)),
             region_novelty_score=float(self.metadata.get("region_novelty_score", 0.0)),
+            strategic_cluster_score=float(self.metadata.get("strategic_cluster_score", 0.0)),
+            unresolved_opportunity_count=int(self.metadata.get("unresolved_opportunity_count", 0)),
             world_state_snapshot=self.world_state_snapshot,
             metadata=dict(self.metadata),
         )
@@ -1890,6 +2735,8 @@ class TextGameTransition:
             state_cluster_id=str(merged_metadata.get("state_cluster_id", "")),
             cluster_visit_count=int(merged_metadata.get("cluster_visit_count", 0)),
             region_novelty_score=float(merged_metadata.get("region_novelty_score", 0.0)),
+            strategic_cluster_score=float(merged_metadata.get("strategic_cluster_score", 0.0)),
+            unresolved_opportunity_count=int(merged_metadata.get("unresolved_opportunity_count", 0)),
             room_text_only_gain=float(merged_metadata.get("room_text_only_gain", 0.0)),
             affordance_gain=int(merged_metadata.get("affordance_gain", 0)),
             world_state_snapshot=(
@@ -1956,9 +2803,13 @@ class ActionCandidateFeatures:
     prior_score_success_for_object_family: bool = False
     prior_success_for_object_family: bool = False
     prior_failure_for_object_family: bool = False
+    prior_inventory_gain_for_object_family: int = 0
+    prior_inventory_loss_for_object_family: int = 0
+    prior_affordance_gain_for_object_family: int = 0
     touches_newly_salient_object: bool = False
     touches_recent_affordance_object: bool = False
     touches_supported_reflection_object: bool = False
+    touches_strategic_object: bool = False
     inverse_of_previous_action: bool = False
     movement_repeat_count: int = 0
     cluster_repeat_count: int = 0
@@ -1971,9 +2822,13 @@ class ActionCandidateFeatures:
     local_scene_post_score_stale: bool = False
     matches_supported_try_action: bool = False
     matches_supported_avoid_action: bool = False
+    matches_strategic_try_action: bool = False
+    matches_strategic_avoid_action: bool = False
+    current_mode: str = ""
     plausibility_score: float = 0.0
     canonical_prior_contribution: float = 0.0
     object_family_evidence_contribution: float = 0.0
+    strategic_contribution: float = 0.0
 
     def to_record(self) -> dict[str, Any]:
         """Convert the feature vector into a JSON-serializable dictionary."""
@@ -2008,6 +2863,8 @@ class ActionGenerationResult:
     candidate_feature_records: list[dict[str, Any]] = field(default_factory=list)
     ranking_source: str = ""
     top_selection_reason: str = ""
+    strategic_mode: str = ""
+    strategic_reason: str = ""
 
     def top_actions(self) -> list[str]:
         """Return the candidate action texts in ranked order."""
@@ -2134,6 +2991,8 @@ class LocalBranchOutcome:
     loop_event_count: int = 0
     first_durable_gain_action_index: int | None = None
     first_durable_gain_action: str = ""
+    last_durable_progress_action_index: int | None = None
+    last_durable_progress_action: str = ""
     last_meaningful_progress_action_index: int | None = None
     last_meaningful_progress_action: str = ""
     notable_observation_changes: list[str] = field(default_factory=list)
@@ -2273,6 +3132,8 @@ class StateCandidate:
     state_cluster_id: str = ""
     cluster_visit_count: int = 0
     region_novelty_score: float = 0.0
+    strategic_value: float = 0.0
+    unresolved_opportunity_count: int = 0
     inventory_text: str = ""
     valid_actions: list[str] = field(default_factory=list)
     replay_actions: list[str] = field(default_factory=list)
@@ -2329,6 +3190,8 @@ class StateCandidate:
             state_cluster_id=step.state_cluster_id,
             cluster_visit_count=step.cluster_visit_count,
             region_novelty_score=step.region_novelty_score,
+            strategic_value=float(metadata.get("strategic_value", 0.0)) if metadata else 0.0,
+            unresolved_opportunity_count=int(metadata.get("unresolved_opportunity_count", 0)) if metadata else 0,
             inventory_text=step.inventory_text,
             valid_actions=list(step.valid_actions),
             replay_actions=list(replay_actions),
@@ -2380,6 +3243,8 @@ class FrontierEntry:
     state_cluster_id: str = ""
     cluster_visit_count: int = 0
     region_novelty_score: float = 0.0
+    strategic_value: float = 0.0
+    unresolved_opportunity_count: int = 0
     oscillating_pair_member: bool = False
     trivial_reversible_change: bool = False
     no_progress_revisit_count: int = 0
@@ -2431,6 +3296,8 @@ class FrontierEntry:
             state_cluster_id=candidate.state_cluster_id,
             cluster_visit_count=int(candidate.cluster_visit_count),
             region_novelty_score=float(candidate.region_novelty_score),
+            strategic_value=float(candidate.strategic_value),
+            unresolved_opportunity_count=int(candidate.unresolved_opportunity_count),
             oscillating_pair_member=bool(candidate.oscillating_pair_member),
             trivial_reversible_change=bool(candidate.trivial_reversible_change),
             no_progress_revisit_count=int(candidate.no_progress_revisit_count),
@@ -2466,6 +3333,8 @@ class FrontierEntry:
             state_cluster_id=self.state_cluster_id,
             cluster_visit_count=int(self.cluster_visit_count),
             region_novelty_score=float(self.region_novelty_score),
+            strategic_value=float(self.strategic_value),
+            unresolved_opportunity_count=int(self.unresolved_opportunity_count),
             inventory_text=self.inventory_text,
             valid_actions=list(self.valid_actions),
             replay_actions=list(self.replay_actions),
@@ -2513,6 +3382,8 @@ class TrajectoryStep:
     state_cluster_id: str = ""
     cluster_visit_count: int = 0
     region_novelty_score: float = 0.0
+    strategic_cluster_score: float = 0.0
+    unresolved_opportunity_count: int = 0
     room_text_only_gain: float = 0.0
     affordance_gain: int = 0
     world_state_snapshot: dict[str, Any] | None = None
@@ -2549,6 +3420,8 @@ class TrajectoryStep:
             state_cluster_id=str(record.get("state_cluster_id", "")),
             cluster_visit_count=int(record.get("cluster_visit_count", 0)),
             region_novelty_score=float(record.get("region_novelty_score", 0.0)),
+            strategic_cluster_score=float(record.get("strategic_cluster_score", 0.0)),
+            unresolved_opportunity_count=int(record.get("unresolved_opportunity_count", 0)),
             room_text_only_gain=float(record.get("room_text_only_gain", 0.0)),
             affordance_gain=int(record.get("affordance_gain", 0)),
             world_state_snapshot=normalize_world_state_snapshot_record(record["world_state_snapshot"])

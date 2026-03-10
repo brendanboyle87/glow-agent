@@ -15,12 +15,15 @@ Moves: {moves}
 Mode: {generation_mode}
 {valid_actions_block}
 {evidence_block}
+{strategic_guidance_block}
 {canonical_guidance_block}
 
 If valid actions are listed, rank only from that list.
 Prefer short canonical parser actions.
 Prefer examining, taking, reading, or opening newly revealed objects before speculative tool use.
 Prefer direct object interaction before movement unless movement already showed progress.
+If strategic mode is explore, prefer mapping actions that open new routes or landmarks.
+If strategic mode is exploit, prefer actions tied to the known opportunity or structural access point.
 If a local object family already produced a real gain, prefer leaving or trying a different object family before more churn on the same scene.
 Avoid repeated movement unless it previously changed score, inventory, or useful affordances.
 Avoid reversible toggles unless they previously unlocked something.

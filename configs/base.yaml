@@ -92,6 +92,11 @@ policy:
   post_score_local_churn_penalty: 1.75
   stale_reflection_try_penalty: 0.75
   escape_mode_exit_bonus: 2.0
+  strategic_try_bonus: 1.25
+  strategic_object_bonus: 1.0
+  strategic_avoid_penalty: 1.0
+  frontier_strategic_score_weight: 1.0
+  region_visit_exhaustion_threshold: 4
   landmark_movement_bonus: 1.25
   fresh_affordance_followup_bonus: 1.5
   discard_inventory_penalty: 2.0

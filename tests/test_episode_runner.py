@@ -20,12 +20,16 @@ from zork_agent.config import (
 )
 from zork_agent.experiment.episode_runner import EpisodeRunner
 from zork_agent.experiment.evaluator import Evaluator
+from zork_agent.memory.frontier import FrontierEntry
 from zork_agent.memory.trajectory_store import TrajectoryStore
 from zork_agent.types import (
     ActionProposal,
     BranchTerminationReason,
     LocalBranchOutcome,
     LocalExplorationResult,
+    StateSelectionResult,
+    StrategicGuidance,
+    StrategicMode,
     TextGameState,
     TextGameTransition,
 )
@@ -261,6 +265,8 @@ def test_episode_runner_commits_through_last_meaningful_progress_and_trims_churn
                     branch_commit_allowed=True,
                     first_durable_gain_action_index=3,
                     first_durable_gain_action="take egg",
+                    last_durable_progress_action_index=3,
+                    last_durable_progress_action="take egg",
                     last_meaningful_progress_action_index=5,
                     last_meaningful_progress_action="take canary",
                 )
@@ -284,10 +290,10 @@ def test_episode_runner_commits_through_last_meaningful_progress_and_trims_churn
         "up",
         "open egg",
         "take egg",
-        "take on egg",
-        "take canary",
+        "look",
+        "look",
     ]
-    assert stored_trajectory.steps[-1].metadata["action_source"] == "best_local_branch_plan"
+    assert stored_trajectory.steps[5].metadata["action_source"] == "best_local_branch_plan"
 
 
 def test_episode_runner_rejects_zero_value_local_branch_commit(tmp_path: Path) -> None:
@@ -510,3 +516,138 @@ def test_episode_runner_fails_fast_on_stalled_movement_basin(tmp_path: Path) -> 
     assert result.step_count < config.experiment.max_steps
     assert "movement wandering persisted" in result.metadata["episode_fail_fast_reason"]
     assert result.metadata["consecutive_same_cluster_movement_steps"] >= 3
+
+
+def test_episode_runner_allows_off_cadence_revisit_for_preferred_cluster(tmp_path: Path) -> None:
+    """Strategic exploit guidance for another cluster should bypass the normal cadence gate."""
+
+    runner = EpisodeRunner(config=_build_config(tmp_path), llm_client=None)
+    runner.frontier.add(
+        FrontierEntry(
+            state_id="house-node",
+            score=1.0,
+            depth=1,
+            state_cluster_id="house",
+            world_state_hash="house",
+            summary_text="Window branch",
+        )
+    )
+
+    should_run = runner._should_run_local_exploration(  # type: ignore[attr-defined]
+        1,
+        0,
+        0,
+        strategic_guidance=StrategicGuidance(
+            mode=StrategicMode.EXPLOIT,
+            reason="Known house window route is stronger.",
+            preferred_cluster_id="house",
+        ),
+        current_cluster_id="tree",
+    )
+
+    assert should_run is True
+
+
+def test_episode_runner_prefers_frontier_entry_from_strategic_cluster(tmp_path: Path) -> None:
+    """Strategic guidance should override selection toward the preferred replay cluster."""
+
+    runner = EpisodeRunner(config=_build_config(tmp_path), llm_client=None)
+    runner.frontier.add(
+        FrontierEntry(
+            state_id="tree-node",
+            score=2.0,
+            depth=1,
+            state_cluster_id="tree",
+            world_state_hash="tree",
+            summary_text="Tree branch",
+        )
+    )
+    runner.frontier.add(
+        FrontierEntry(
+            state_id="house-node",
+            score=1.0,
+            depth=1,
+            state_cluster_id="house",
+            world_state_hash="house",
+            summary_text="Window branch",
+        )
+    )
+    base_result = StateSelectionResult(
+        selected=runner.frontier.top_k(1)[0],
+        reason="Heuristic frontier ordering picked the current tree node.",
+        selection_mode=runner.state_selector.selection_mode,
+    )
+
+    overridden = runner._apply_strategic_selection_override(  # type: ignore[attr-defined]
+        base_result,
+        strategic_guidance=StrategicGuidance(
+            mode=StrategicMode.EXPLOIT,
+            reason="Route back to the house window.",
+            preferred_cluster_id="house",
+        ),
+    )
+
+    assert overridden.selected is not None
+    assert overridden.selected.state_id == "house-node"
+    assert "Strategic override selected" in overridden.reason
+
+
+def test_episode_runner_treats_off_cluster_replay_branch_as_planning_only(tmp_path: Path) -> None:
+    """Replay-derived branches from another cluster should not rewrite the live episode timeline."""
+
+    runner = EpisodeRunner(config=_build_config(tmp_path), llm_client=None)
+    origin_state = TextGameState(
+        observation="Up a Tree",
+        inventory_text="You are carrying a jewel-encrusted egg.",
+        valid_actions=["down", "take egg"],
+        score=5,
+        moves=10,
+        world_state_hash="tree-state",
+        state_cluster_id="region:title:up-a-tree",
+    )
+    selected_entry = FrontierEntry(
+        state_id="house-node",
+        score=0.0,
+        depth=1,
+        state_cluster_id="region:house-field",
+        world_state_hash="house-field",
+        inventory_text="Inventory empty.",
+        summary_text="House exterior with a promising window.",
+    )
+
+    allowed, reason = runner._validate_branch_commit_origin(  # type: ignore[attr-defined]
+        origin_state=origin_state,
+        selected_entry=selected_entry,
+    )
+
+    assert allowed is False
+    assert "planning-only off-cluster restore" in reason
+
+
+def test_episode_runner_switches_to_explore_after_same_cluster_stall(tmp_path: Path) -> None:
+    """Repeated no-progress steps in one cluster should temporarily override exploit mode."""
+
+    runner = EpisodeRunner(config=_build_config(tmp_path), llm_client=None)
+    stalled_state = TextGameState(
+        observation="Behind House. The window is open and a leaflet lies here.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["take leaflet", "close window", "east", "west"],
+        state_cluster_id="region:window",
+        world_state_hash="window",
+    )
+
+    overridden = runner._apply_stall_recovery_guidance_override(  # type: ignore[attr-defined]
+        strategic_guidance=StrategicGuidance(
+            mode=StrategicMode.EXPLOIT,
+            reason="Local object follow-ups still seem available.",
+            preferred_cluster_id="region:window",
+            try_actions=["take leaflet", "close window"],
+        ),
+        current_state=stalled_state,
+        consecutive_no_durable_gain_steps=5,
+    )
+
+    assert overridden.mode is StrategicMode.EXPLORE
+    assert overridden.try_actions == ["east", "west"]
+    assert "take leaflet" in overridden.avoid_actions
+    assert "stall recovery" in overridden.reason.lower()

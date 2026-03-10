@@ -23,6 +23,7 @@ class FrontierScoringConfig:
     novelty_weight: float = 0.75
     recent_gain_weight: float = 0.5
     depth_weight: float = 0.15
+    strategic_score_weight: float = 1.0
     loop_penalty_weight: float = 1.0
     movement_penalty_weight: float = 1.0
     room_text_only_penalty_weight: float = 0.75
@@ -53,6 +54,7 @@ class FrontierScoringConfig:
             "novelty_weight",
             "recent_gain_weight",
             "depth_weight",
+            "strategic_score_weight",
             "loop_penalty_weight",
             "movement_penalty_weight",
             "room_text_only_penalty_weight",
@@ -154,6 +156,7 @@ class FrontierQueue:
             self.scoring.score_weight * float(entry.score)
             + self.scoring.novelty_weight * float(entry.effective_novelty or entry.novelty)
             + self.scoring.recent_gain_weight * float(entry.recent_gain)
+            + self.scoring.strategic_score_weight * float(entry.strategic_value)
             - self.scoring.depth_weight * float(entry.depth)
             - self.scoring.loop_penalty_weight * float(entry.loop_penalty)
             - self.scoring.movement_penalty_weight * float(entry.movement_penalty)
@@ -304,6 +307,8 @@ class FrontierQueue:
         entry.cluster_no_progress_revisit_count = int(entry.cluster_no_progress_revisit_count)
         entry.cluster_visit_count = int(entry.cluster_visit_count)
         entry.region_novelty_score = float(entry.region_novelty_score or 1.0)
+        entry.strategic_value = float(entry.strategic_value)
+        entry.unresolved_opportunity_count = int(entry.unresolved_opportunity_count)
         entry.movement_penalty = float(entry.movement_penalty)
         entry.affordance_gain = int(entry.affordance_gain)
         entry.room_text_only_gain = float(entry.room_text_only_gain)

@@ -22,6 +22,7 @@ from zork_agent.types import (
     ActionClusterHistory,
     ActionGenerationMode,
     ActionGenerationResult,
+    StrategicMode,
     ActionProposal,
     LoopHeuristicResult,
     TextGameState,
@@ -94,6 +95,11 @@ class ActionGenerator:
         supported_try_actions: list[str] | None = None,
         supported_avoid_actions: list[str] | None = None,
         supported_reflection_objects: list[str] | None = None,
+        strategic_mode: StrategicMode | None = None,
+        strategic_reason: str = "",
+        strategic_try_actions: list[str] | None = None,
+        strategic_avoid_actions: list[str] | None = None,
+        strategic_objects: list[str] | None = None,
     ) -> list[ActionProposal]:
         """Return a ranked candidate list for the current state."""
 
@@ -112,6 +118,11 @@ class ActionGenerator:
             supported_try_actions=supported_try_actions,
             supported_avoid_actions=supported_avoid_actions,
             supported_reflection_objects=supported_reflection_objects,
+            strategic_mode=strategic_mode,
+            strategic_reason=strategic_reason,
+            strategic_try_actions=strategic_try_actions,
+            strategic_avoid_actions=strategic_avoid_actions,
+            strategic_objects=strategic_objects,
         )
         self.last_result = result
         return result.candidates
@@ -133,6 +144,11 @@ class ActionGenerator:
         supported_try_actions: list[str] | None = None,
         supported_avoid_actions: list[str] | None = None,
         supported_reflection_objects: list[str] | None = None,
+        strategic_mode: StrategicMode | None = None,
+        strategic_reason: str = "",
+        strategic_try_actions: list[str] | None = None,
+        strategic_avoid_actions: list[str] | None = None,
+        strategic_objects: list[str] | None = None,
     ) -> ActionGenerationResult:
         """Generate candidates in either constrained or open mode."""
 
@@ -144,6 +160,10 @@ class ActionGenerator:
         supported_try_actions = self._normalize_action_list(supported_try_actions or [])
         supported_avoid_actions = self._normalize_action_list(supported_avoid_actions or [])
         supported_reflection_objects = self._normalize_token_list(supported_reflection_objects or [])
+        strategic_try_actions = self._normalize_action_list(strategic_try_actions or [])
+        strategic_avoid_actions = self._normalize_action_list(strategic_avoid_actions or [])
+        strategic_objects = self._normalize_token_list(strategic_objects or [])
+        strategic_mode = strategic_mode or StrategicMode.EXPLORE
 
         if valid_actions:
             result = self._generate_constrained(
@@ -161,6 +181,11 @@ class ActionGenerator:
                 supported_try_actions=supported_try_actions,
                 supported_avoid_actions=supported_avoid_actions,
                 supported_reflection_objects=supported_reflection_objects,
+                strategic_mode=strategic_mode,
+                strategic_reason=strategic_reason,
+                strategic_try_actions=strategic_try_actions,
+                strategic_avoid_actions=strategic_avoid_actions,
+                strategic_objects=strategic_objects,
             )
         else:
             result = self._generate_open(
@@ -177,6 +202,11 @@ class ActionGenerator:
                 supported_try_actions=supported_try_actions,
                 supported_avoid_actions=supported_avoid_actions,
                 supported_reflection_objects=supported_reflection_objects,
+                strategic_mode=strategic_mode,
+                strategic_reason=strategic_reason,
+                strategic_try_actions=strategic_try_actions,
+                strategic_avoid_actions=strategic_avoid_actions,
+                strategic_objects=strategic_objects,
             )
 
         self.last_result = result
@@ -199,6 +229,11 @@ class ActionGenerator:
         supported_try_actions: list[str],
         supported_avoid_actions: list[str],
         supported_reflection_objects: list[str],
+        strategic_mode: StrategicMode,
+        strategic_reason: str,
+        strategic_try_actions: list[str],
+        strategic_avoid_actions: list[str],
+        strategic_objects: list[str],
     ) -> ActionGenerationResult:
         """Rank the Jericho valid-action pool with LLM ordering hints plus evidence features."""
 
@@ -222,6 +257,11 @@ class ActionGenerator:
                 supported_try_actions=supported_try_actions,
                 supported_avoid_actions=supported_avoid_actions,
                 supported_reflection_objects=supported_reflection_objects,
+                strategic_mode=strategic_mode,
+                strategic_reason=strategic_reason,
+                strategic_try_actions=strategic_try_actions,
+                strategic_avoid_actions=strategic_avoid_actions,
+                strategic_objects=strategic_objects,
             )
             if llm_ranked_candidates:
                 result_mode = ActionGenerationMode.CONSTRAINED
@@ -294,8 +334,15 @@ class ActionGenerator:
             supported_try_actions=supported_try_actions,
             supported_avoid_actions=supported_avoid_actions,
             supported_reflection_objects=supported_reflection_objects,
+            strategic_mode=strategic_mode,
+            strategic_reason=strategic_reason,
+            strategic_try_actions=strategic_try_actions,
+            strategic_avoid_actions=strategic_avoid_actions,
+            strategic_objects=strategic_objects,
             candidate_count=candidate_count,
         )
+        result.strategic_mode = strategic_mode.value
+        result.strategic_reason = strategic_reason
         return result
 
     def _generate_open(
@@ -314,6 +361,11 @@ class ActionGenerator:
         supported_try_actions: list[str],
         supported_avoid_actions: list[str],
         supported_reflection_objects: list[str],
+        strategic_mode: StrategicMode,
+        strategic_reason: str,
+        strategic_try_actions: list[str],
+        strategic_avoid_actions: list[str],
+        strategic_objects: list[str],
     ) -> ActionGenerationResult:
         """Generate free-form actions, then rerank them with the same evidence scorer."""
 
@@ -344,6 +396,11 @@ class ActionGenerator:
                     )[:6],
                     supported_try_actions=supported_try_actions,
                     supported_avoid_actions=supported_avoid_actions,
+                    strategic_mode=strategic_mode.value,
+                    strategic_reason=strategic_reason,
+                    strategic_try_actions=strategic_try_actions,
+                    strategic_avoid_actions=strategic_avoid_actions,
+                    strategic_objects=strategic_objects,
                 )
                 response = self.llm_client.chat(
                     [
@@ -404,8 +461,15 @@ class ActionGenerator:
             supported_try_actions=supported_try_actions,
             supported_avoid_actions=supported_avoid_actions,
             supported_reflection_objects=supported_reflection_objects,
+            strategic_mode=strategic_mode,
+            strategic_reason=strategic_reason,
+            strategic_try_actions=strategic_try_actions,
+            strategic_avoid_actions=strategic_avoid_actions,
+            strategic_objects=strategic_objects,
             candidate_count=candidate_count,
         )
+        result.strategic_mode = strategic_mode.value
+        result.strategic_reason = strategic_reason
         return result
 
     def _request_constrained_ranking(
@@ -422,6 +486,11 @@ class ActionGenerator:
         supported_try_actions: list[str],
         supported_avoid_actions: list[str],
         supported_reflection_objects: list[str],
+        strategic_mode: StrategicMode,
+        strategic_reason: str,
+        strategic_try_actions: list[str],
+        strategic_avoid_actions: list[str],
+        strategic_objects: list[str],
     ) -> tuple[str, str | None, list[ActionProposal]]:
         """Ask the model to rank the current valid-action list."""
 
@@ -450,6 +519,11 @@ class ActionGenerator:
             salient_objects=salient_objects[:8],
             supported_try_actions=supported_try_actions,
             supported_avoid_actions=supported_avoid_actions,
+            strategic_mode=strategic_mode.value,
+            strategic_reason=strategic_reason,
+            strategic_try_actions=strategic_try_actions,
+            strategic_avoid_actions=strategic_avoid_actions,
+            strategic_objects=strategic_objects,
         )
         try:
             response = self.llm_client.chat(
@@ -670,6 +744,11 @@ class ActionGenerator:
         supported_try_actions: list[str],
         supported_avoid_actions: list[str],
         supported_reflection_objects: list[str],
+        strategic_mode: StrategicMode,
+        strategic_reason: str,
+        strategic_try_actions: list[str],
+        strategic_avoid_actions: list[str],
+        strategic_objects: list[str],
         candidate_count: int,
     ) -> None:
         """Rerank candidates with explicit evidence features and diversity constraints."""
@@ -679,10 +758,15 @@ class ActionGenerator:
 
         normalized_try_actions = {normalize_parser_action(action) for action in supported_try_actions}
         normalized_avoid_actions = {normalize_parser_action(action) for action in supported_avoid_actions}
+        normalized_strategic_try_actions = {normalize_parser_action(action) for action in strategic_try_actions}
+        normalized_strategic_avoid_actions = {
+            normalize_parser_action(action) for action in strategic_avoid_actions
+        }
         supported_object_tokens = self._supported_object_tokens(
             supported_reflection_objects=supported_reflection_objects,
             supported_try_actions=supported_try_actions,
         )
+        strategic_object_tokens = self._normalize_token_list(strategic_objects)
         visible_nouns = extract_salient_nouns(
             observation=observation,
             inventory_text=inventory_text,
@@ -733,10 +817,14 @@ class ActionGenerator:
                 visible_nouns=visible_nouns,
                 new_visible_nouns=new_visible_nouns,
                 supported_object_tokens=supported_object_tokens,
+                strategic_object_tokens=set(strategic_object_tokens),
                 normalized_try_actions=normalized_try_actions,
                 normalized_avoid_actions=normalized_avoid_actions,
+                normalized_strategic_try_actions=normalized_strategic_try_actions,
+                normalized_strategic_avoid_actions=normalized_strategic_avoid_actions,
                 cluster_repeat_count=cluster_repeat_count,
                 scene_score_success_count=scene_score_success_count,
+                strategic_mode=strategic_mode,
             )
             candidate.features = features
             candidate.movement_only_action = features.is_movement_action
@@ -754,6 +842,7 @@ class ActionGenerator:
                 features=features,
                 exhausted_families=exhausted_families,
                 inventory_tokens=inventory_tokens,
+                strategic_mode=strategic_mode,
             )
             candidate.heuristic_bonus = positive_score
             candidate.heuristic_penalty = negative_score
@@ -841,6 +930,8 @@ class ActionGenerator:
             result.ranking_source = "heuristic_rerank"
         if result.candidates:
             result.top_selection_reason = result.candidates[0].ranking_reason or "highest evidence score"
+        result.strategic_mode = strategic_mode.value
+        result.strategic_reason = strategic_reason
 
     def _build_candidate_features(
         self,
@@ -855,10 +946,14 @@ class ActionGenerator:
         visible_nouns: set[str],
         new_visible_nouns: set[str],
         supported_object_tokens: set[str],
+        strategic_object_tokens: set[str],
         normalized_try_actions: set[str],
         normalized_avoid_actions: set[str],
+        normalized_strategic_try_actions: set[str],
+        normalized_strategic_avoid_actions: set[str],
         cluster_repeat_count: int,
         scene_score_success_count: int,
+        strategic_mode: StrategicMode,
     ) -> ActionCandidateFeatures:
         """Build the explicit feature vector for one candidate action."""
 
@@ -885,6 +980,21 @@ class ActionGenerator:
             state_action_history.prior_score_success_for_object_nouns(set(noun_targets)) > 0
             if state_action_history is not None
             else False
+        )
+        prior_inventory_gain_for_object_family = (
+            state_action_history.prior_inventory_gain_for_object_nouns(set(noun_targets))
+            if state_action_history is not None
+            else 0
+        )
+        prior_inventory_loss_for_object_family = (
+            state_action_history.prior_inventory_loss_for_object_nouns(set(noun_targets))
+            if state_action_history is not None
+            else 0
+        )
+        prior_affordance_gain_for_object_family = (
+            state_action_history.prior_affordance_gain_for_object_nouns(set(noun_targets))
+            if state_action_history is not None
+            else 0
         )
         prior_success_for_object_family = (
             state_action_history.prior_success_for_object_nouns(set(noun_targets)) > 0
@@ -945,6 +1055,9 @@ class ActionGenerator:
             prior_score_success_for_object_family=prior_score_success_for_object_family,
             prior_success_for_object_family=prior_success_for_object_family,
             prior_failure_for_object_family=prior_failure_for_object_family,
+            prior_inventory_gain_for_object_family=prior_inventory_gain_for_object_family,
+            prior_inventory_loss_for_object_family=prior_inventory_loss_for_object_family,
+            prior_affordance_gain_for_object_family=prior_affordance_gain_for_object_family,
             touches_newly_salient_object=bool(set(noun_targets) & new_visible_nouns),
             touches_recent_affordance_object=(
                 state_action_history.touches_recent_affordance_targets(set(noun_targets))
@@ -952,6 +1065,7 @@ class ActionGenerator:
                 else False
             ),
             touches_supported_reflection_object=bool(set(noun_targets) & supported_object_tokens),
+            touches_strategic_object=bool(set(noun_targets) & strategic_object_tokens),
             inverse_of_previous_action=bool(recent_actions)
             and actions_are_inverse(candidate.action, recent_actions[-1], self.config.policy.inverse_action_pairs),
             movement_repeat_count=count_repeated_movement_actions(
@@ -987,6 +1101,9 @@ class ActionGenerator:
             scene_score_success_count=scene_score_success_count,
             matches_supported_try_action=normalized_action in normalized_try_actions,
             matches_supported_avoid_action=normalized_action in normalized_avoid_actions,
+            matches_strategic_try_action=normalized_action in normalized_strategic_try_actions,
+            matches_strategic_avoid_action=normalized_action in normalized_strategic_avoid_actions,
+            current_mode=strategic_mode.value,
         )
         if not features.target_is_new_salient_object:
             features.target_is_new_salient_object = bool(set(noun_targets) & visible_nouns and set(noun_targets) & new_visible_nouns)
@@ -1003,6 +1120,7 @@ class ActionGenerator:
         features: ActionCandidateFeatures,
         exhausted_families: set[str],
         inventory_tokens: set[str],
+        strategic_mode: StrategicMode,
     ) -> tuple[float, float, list[str]]:
         """Compute the transparent evidence-based ranking formula for one candidate."""
 
@@ -1021,6 +1139,11 @@ class ActionGenerator:
         )
         stale_toggle_without_durable_gain = self._is_stale_toggle_without_durable_gain(
             features,
+            strong_prior_gain=strong_prior_gain,
+        )
+        stale_reacquire_inventory_churn = self._is_stale_reacquire_inventory_churn(
+            features,
+            inventory_tokens=inventory_tokens,
             strong_prior_gain=strong_prior_gain,
         )
         stale_reexpose_container = self._is_stale_reexpose_container_without_durable_gain(
@@ -1067,6 +1190,7 @@ class ActionGenerator:
                 inventory_tokens=inventory_tokens,
                 strong_prior_gain=strong_prior_gain,
             )
+            and not stale_reacquire_inventory_churn
             and not (
                 features.touches_exhausted_family
                 and (features.is_reversible_toggle or is_discard_action or not strong_prior_gain)
@@ -1116,6 +1240,7 @@ class ActionGenerator:
                 and
                 not features.touches_exhausted_family
                 and not stale_toggle_without_durable_gain
+                and not stale_reacquire_inventory_churn
                 and not stale_reexpose_container
                 and not scene_stale_after_score
             )
@@ -1126,6 +1251,7 @@ class ActionGenerator:
         elif features.produced_affordance_gain_before and (
             features.touches_exhausted_family
             or stale_toggle_without_durable_gain
+            or stale_reacquire_inventory_churn
             or stale_reexpose_container
         ):
             negative += self.config.policy.object_family_exhaustion_penalty
@@ -1141,6 +1267,7 @@ class ActionGenerator:
                 features.produced_affordance_gain_before
                 and not features.touches_exhausted_family
                 and not stale_toggle_without_durable_gain
+                and not stale_reacquire_inventory_churn
                 and not stale_reexpose_container
             )
             or (
@@ -1174,7 +1301,7 @@ class ActionGenerator:
             plausibility_score += self.config.policy.reflection_supported_try_bonus
             reasons.append("reflection_supported_try")
         elif (
-            scene_stale_after_score
+            (scene_stale_after_score or stale_reacquire_inventory_churn)
             and (features.matches_supported_try_action or features.touches_supported_reflection_object)
             and not strong_prior_gain
         ):
@@ -1186,6 +1313,45 @@ class ActionGenerator:
             negative += self.config.policy.reflection_supported_avoid_penalty
             plausibility_score -= self.config.policy.reflection_supported_avoid_penalty
             reasons.append("reflection_supported_avoid")
+
+        strategic_contribution = 0.0
+        if features.matches_strategic_try_action:
+            positive += self.config.policy.strategic_try_bonus
+            plausibility_score += self.config.policy.strategic_try_bonus
+            strategic_contribution += self.config.policy.strategic_try_bonus
+            reasons.append("strategic_try")
+        if (
+            features.touches_strategic_object
+            and self._is_object_centric_priority_action(candidate.action, features)
+        ):
+            positive += self.config.policy.strategic_object_bonus
+            plausibility_score += self.config.policy.strategic_object_bonus
+            strategic_contribution += self.config.policy.strategic_object_bonus
+            reasons.append("strategic_object")
+        if features.matches_strategic_avoid_action:
+            negative += self.config.policy.strategic_avoid_penalty
+            plausibility_score -= self.config.policy.strategic_avoid_penalty
+            strategic_contribution -= self.config.policy.strategic_avoid_penalty
+            reasons.append("strategic_avoid")
+        if (
+            strategic_mode is StrategicMode.EXPLORE
+            and features.is_movement_action
+            and features.matches_strategic_try_action
+            and not self._movement_has_prior_evidence(features)
+        ):
+            positive += self.config.policy.explore_mode_exit_bonus
+            plausibility_score += self.config.policy.explore_mode_exit_bonus
+            strategic_contribution += self.config.policy.explore_mode_exit_bonus
+            reasons.append("explore_mode_exit")
+        if (
+            strategic_mode is StrategicMode.EXPLOIT
+            and not features.is_movement_action
+            and (features.matches_strategic_try_action or features.touches_strategic_object)
+        ):
+            positive += 0.5 * self.config.policy.strategic_try_bonus
+            plausibility_score += 0.5 * self.config.policy.strategic_try_bonus
+            strategic_contribution += 0.5 * self.config.policy.strategic_try_bonus
+            reasons.append("exploit_mode_focus")
 
         if self._is_ungrounded_other_action(features):
             negative += self.config.policy.other_action_penalty
@@ -1332,6 +1498,15 @@ class ActionGenerator:
             plausibility_score -= stale_acquire_penalty
             reasons.append("stale_nonnew_acquire")
 
+        if stale_reacquire_inventory_churn:
+            reacquire_penalty = (
+                self.config.policy.object_family_exhaustion_penalty
+                + 0.5 * self.config.policy.discard_inventory_penalty
+            )
+            negative += reacquire_penalty
+            plausibility_score -= reacquire_penalty
+            reasons.append("stale_reacquire_churn")
+
         if (
             is_drop_action
             and target_tokens & inventory_tokens
@@ -1392,6 +1567,7 @@ class ActionGenerator:
             or (
                 not stale_movement_without_durable_gain
                 and not stale_toggle_without_durable_gain
+                and not stale_reacquire_inventory_churn
                 and not stale_reexpose_container
                 and not scene_stale_after_score
             )
@@ -1405,6 +1581,7 @@ class ActionGenerator:
             or (
                 not stale_movement_without_durable_gain
                 and not stale_toggle_without_durable_gain
+                and not stale_reacquire_inventory_churn
                 and not stale_reexpose_container
                 and not scene_stale_after_score
             )
@@ -1427,6 +1604,7 @@ class ActionGenerator:
                 stale_movement_without_durable_gain=stale_movement_without_durable_gain,
                 stale_toggle_without_durable_gain=stale_toggle_without_durable_gain,
                 stale_reexpose_container=stale_reexpose_container,
+                stale_reacquire_inventory_churn=stale_reacquire_inventory_churn,
             )
         ):
             positive += self.config.policy.object_family_success_bonus
@@ -1455,6 +1633,7 @@ class ActionGenerator:
         features.plausibility_score = plausibility_score
         features.canonical_prior_contribution = canonical_prior_contribution
         features.object_family_evidence_contribution = object_family_evidence_contribution
+        features.strategic_contribution = strategic_contribution
 
         return positive, negative, reasons
 
@@ -1592,14 +1771,21 @@ class ActionGenerator:
     def _has_strong_prior_gain(self, features: ActionCandidateFeatures) -> bool:
         """Return whether an action demonstrated durable value worth revisiting in an exhausted family."""
 
-        return (
-            features.produced_score_gain_before
-            or (
-                features.produced_inventory_gain_before
-                and not features.is_bulk_inventory_action
-                and not features.is_discard_like_action
-            )
-        )
+        if features.produced_score_gain_before:
+            return True
+        if (
+            features.produced_inventory_gain_before
+            and not features.is_bulk_inventory_action
+            and not features.is_discard_like_action
+        ):
+            if (
+                features.prior_inventory_loss_for_object_family > 0
+                and not features.prior_score_success_for_object_family
+                and features.prior_affordance_gain_for_object_family <= 0
+            ):
+                return False
+            return True
+        return False
 
     def _soft_support_is_trustworthy(
         self,
@@ -1622,6 +1808,11 @@ class ActionGenerator:
         return not (
             self._is_stale_toggle_without_durable_gain(
                 features,
+                strong_prior_gain=strong_prior_gain,
+            )
+            or self._is_stale_reacquire_inventory_churn(
+                features,
+                inventory_tokens=set(),
                 strong_prior_gain=strong_prior_gain,
             )
             or self._is_stale_movement_without_durable_gain(
@@ -1660,6 +1851,11 @@ class ActionGenerator:
                 stale_movement_without_durable_gain=False,
                 stale_toggle_without_durable_gain=False,
                 stale_reexpose_container=False,
+                stale_reacquire_inventory_churn=self._is_stale_reacquire_inventory_churn(
+                    features,
+                    inventory_tokens=set(),
+                    strong_prior_gain=strong_prior_gain,
+                ),
             )
         ):
             return True
@@ -1734,6 +1930,42 @@ class ActionGenerator:
             or features.matches_supported_try_action
             or features.object_count > 0
         )
+
+    def _is_stale_reacquire_inventory_churn(
+        self,
+        features: ActionCandidateFeatures,
+        *,
+        inventory_tokens: set[str],
+        strong_prior_gain: bool,
+    ) -> bool:
+        """Return whether reacquiring a previously dropped local object is stale churn.
+
+        This specifically targets local object-family loops like `take leaflet` after the
+        object was already acquired, dropped, and failed to produce any durable score or
+        affordance improvement in the current cluster.
+        """
+
+        if features.verb_family != "acquire" or strong_prior_gain:
+            return False
+        if features.target_is_new_salient_object or features.touches_recent_affordance_object:
+            return False
+        if not features.noun_targets:
+            return False
+        if features.prior_score_success_for_object_family:
+            return False
+        if features.prior_affordance_gain_for_object_family > 0 and features.target_is_container_or_openable:
+            return False
+        if inventory_tokens & set(features.noun_targets):
+            return False
+        reacquire_seen_before = features.prior_inventory_gain_for_object_family > 0
+        churn_signal = (
+            features.prior_inventory_loss_for_object_family > 0
+            or features.cluster_repeat_count >= 3
+            or features.max_family_no_progress_count >= self.config.policy.object_family_no_progress_threshold
+            or features.local_scene_post_score_stale
+            or features.matches_supported_try_action
+        )
+        return reacquire_seen_before and churn_signal
 
     def _is_stale_reexpose_container_without_durable_gain(
         self,
@@ -1827,6 +2059,7 @@ class ActionGenerator:
         stale_movement_without_durable_gain: bool,
         stale_toggle_without_durable_gain: bool,
         stale_reexpose_container: bool,
+        stale_reacquire_inventory_churn: bool,
     ) -> bool:
         """Return whether object-family success should transfer to this action shape."""
 
@@ -1835,6 +2068,7 @@ class ActionGenerator:
             or (
                 not stale_movement_without_durable_gain
                 and not stale_toggle_without_durable_gain
+                and not stale_reacquire_inventory_churn
                 and not stale_reexpose_container
                 and not scene_stale_after_score
             )
