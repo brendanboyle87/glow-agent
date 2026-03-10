@@ -13,7 +13,12 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from zork_agent.types import StateSelectionMode, default_inverse_action_pairs, normalize_inverse_action_pairs
+from zork_agent.types import (
+    StateSelectionMode,
+    default_inverse_action_pairs,
+    default_verb_family_prior_scores,
+    normalize_inverse_action_pairs,
+)
 
 
 class StrictModel(BaseModel):
@@ -147,10 +152,35 @@ class PolicyConfig(StrictModel):
     repeated_movement_penalty: float = 1.0
     movement_cycle_penalty: float = 1.25
     same_region_repeat_penalty: float = 0.75
+    untried_action_bonus: float = 2.0
+    new_object_bonus: float = 1.25
+    inventory_affordance_bonus: float = 1.0
+    examine_read_take_bonus: float = 0.75
+    reflection_supported_try_bonus: float = 0.75
+    candidate_diversity_bonus: float = 0.35
+    repeated_no_gain_penalty: float = 1.0
+    inverse_action_penalty: float = 0.75
+    reversible_toggle_penalty: float = 0.75
+    movement_repeat_penalty: float = 1.25
+    same_cluster_movement_penalty: float = 1.0
+    reflection_supported_avoid_penalty: float = 1.25
     action_untried_bonus: float = 2.0
     action_new_noun_bonus: float = 1.0
     action_new_noun_interaction_bonus: float = 1.25
     action_repeated_no_gain_penalty: float = 1.0
+    verb_family_prior_scores: dict[str, float] = Field(default_factory=default_verb_family_prior_scores)
+    inspect_new_object_bonus: float = 1.4
+    acquire_new_object_bonus: float = 1.2
+    access_new_object_bonus: float = 0.8
+    readable_action_bonus: float = 0.8
+    openable_action_bonus: float = 0.6
+    simple_action_shape_bonus: float = 0.2
+    complex_transitive_penalty: float = 1.75
+    speculative_tool_use_penalty: float = 1.25
+    verb_family_success_bonus: float = 0.6
+    exact_action_success_bonus: float = 0.75
+    exact_action_failure_penalty: float = 1.0
+    object_family_success_bonus: float = 0.5
     object_family_no_progress_threshold: int = 2
     object_family_exhaustion_penalty: float = 2.0
     escape_mode_exit_bonus: float = 1.5
@@ -167,7 +197,10 @@ class PolicyConfig(StrictModel):
     movement_progress_cap: float = 0.5
     min_affordance_gain_for_movement_commit: int = 1
     branch_commit_min_progress_score: float = 1.0
+    branch_commit_movement_ratio_threshold: float = 0.75
     branch_fail_fast_penalty_threshold: float = 3.0
+    branch_fail_fast_movement_ratio_threshold: float = 0.75
+    branch_fail_fast_min_movement_actions: int = 3
     frontier_loop_penalty_weight: float = 1.0
     frontier_movement_penalty_weight: float = 1.0
     frontier_room_text_only_penalty_weight: float = 0.75
@@ -208,6 +241,38 @@ class PolicyConfig(StrictModel):
             raise ValueError("policy.snapshot_retention_limit must be >= 0.")
         return value
 
+    @field_validator("verb_family_prior_scores")
+    @classmethod
+    def validate_verb_family_prior_scores(cls, value: dict[str, float]) -> dict[str, float]:
+        """Normalize configured verb-family priors and fill in missing families."""
+
+        normalized = {str(key).strip().lower(): float(score) for key, score in value.items()}
+        defaults = default_verb_family_prior_scores()
+        for family, score in defaults.items():
+            normalized.setdefault(family, score)
+        return normalized
+
+    @field_validator(
+        "branch_commit_movement_ratio_threshold",
+        "branch_fail_fast_movement_ratio_threshold",
+    )
+    @classmethod
+    def validate_ratio_thresholds(cls, value: float, info) -> float:
+        """Validate ratio-like policy thresholds."""
+
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"policy.{info.field_name} must be between 0.0 and 1.0.")
+        return value
+
+    @field_validator("branch_fail_fast_min_movement_actions")
+    @classmethod
+    def validate_branch_fail_fast_min_movement_actions(cls, value: int) -> int:
+        """Require a positive branch fail-fast movement count."""
+
+        if value <= 0:
+            raise ValueError("policy.branch_fail_fast_min_movement_actions must be greater than 0.")
+        return value
+
     @field_validator("inverse_action_pairs")
     @classmethod
     def validate_inverse_action_pairs(cls, value: dict[str, str]) -> dict[str, str]:
@@ -225,6 +290,18 @@ class PolicyConfig(StrictModel):
         "repeated_movement_penalty",
         "movement_cycle_penalty",
         "same_region_repeat_penalty",
+        "untried_action_bonus",
+        "new_object_bonus",
+        "inventory_affordance_bonus",
+        "examine_read_take_bonus",
+        "reflection_supported_try_bonus",
+        "candidate_diversity_bonus",
+        "repeated_no_gain_penalty",
+        "inverse_action_penalty",
+        "reversible_toggle_penalty",
+        "movement_repeat_penalty",
+        "same_cluster_movement_penalty",
+        "reflection_supported_avoid_penalty",
         "action_untried_bonus",
         "action_new_noun_bonus",
         "action_new_noun_interaction_bonus",
@@ -343,6 +420,8 @@ class ExperimentConfig(StrictModel):
     frontier_refresh_cadence: int = 1
     local_exploration_cadence: int = 3
     branch_commit_steps: int = 4
+    fail_fast_no_durable_gain_steps: int = 10
+    fail_fast_same_cluster_movement_steps: int = 6
     stub_episode_length: int = 3
     deterministic: bool = True
 
@@ -354,6 +433,8 @@ class ExperimentConfig(StrictModel):
         "frontier_refresh_cadence",
         "local_exploration_cadence",
         "branch_commit_steps",
+        "fail_fast_no_durable_gain_steps",
+        "fail_fast_same_cluster_movement_steps",
         "stub_episode_length",
     )
     @classmethod

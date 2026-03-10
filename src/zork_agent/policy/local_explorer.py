@@ -429,6 +429,7 @@ class LocalExplorer:
                 )
                 or action_target_tokens(action, self.action_generator.config.policy.inverse_action_pairs),
                 movement_only_action=self._is_movement_action(action),
+                inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
             )
             action_cluster_history.observe_state_nouns(
                 observation=current_state.observation,
@@ -537,6 +538,11 @@ class LocalExplorer:
             and bool(current_state.state_cluster_id)
             and current_state.state_cluster_id == base_state.state_cluster_id
         )
+        movement_action_ratio = (
+            sum(1 for result in movement_results if result.movement_only_action) / len(actions_taken)
+            if actions_taken
+            else 0.0
+        )
         exhausted_family_count = len(
             action_cluster_history.exhausted_families(
                 self.action_generator.config.policy.object_family_no_progress_threshold
@@ -582,6 +588,13 @@ class LocalExplorer:
             oscillation_penalty_total=oscillation_penalty_total,
             movement_penalty_total=movement_penalty_total,
         )
+        low_value_movement_branch = self._is_low_value_movement_branch(
+            score_change=score_change,
+            persistent_inventory_gain_count=persistent_inventory_gain_count,
+            persistent_affordance_gain=persistent_affordance_gain,
+            novel_object_count=novel_object_count,
+            movement_action_ratio=movement_action_ratio,
+        )
         if (
             exhausted_family_count > 0
             and not durable_progress
@@ -591,6 +604,8 @@ class LocalExplorer:
                 branch_progress_score,
                 self.action_generator.config.policy.movement_progress_cap,
             )
+        if low_value_movement_branch:
+            branch_progress_score = min(branch_progress_score, 0.0)
         if (
             score_change <= 0
             and persistent_inventory_gain_count <= 0
@@ -672,6 +687,7 @@ class LocalExplorer:
             oscillation_penalty_total=oscillation_penalty_total,
             movement_penalty_total=movement_penalty_total,
             movement_only_action_count=sum(1 for result in movement_results if result.movement_only_action),
+            movement_action_ratio=movement_action_ratio,
             movement_repeat_count=max((result.movement_repeat_count for result in movement_results), default=0),
             loop_event_count=sum(1 for loop_result in loop_results if loop_result.loop_detected),
             notable_observation_changes=notable_changes,
@@ -682,6 +698,8 @@ class LocalExplorer:
                 "action_events": action_events,
                 "loop_results": [loop_result.to_record() for loop_result in loop_results],
                 "movement_results": [movement_result.to_record() for movement_result in movement_results],
+                "movement_action_ratio": movement_action_ratio,
+                "low_value_movement_branch": low_value_movement_branch,
             },
         )
 
@@ -903,7 +921,20 @@ class LocalExplorer:
                 f"best branch progress_score {branch.branch_progress_score:.2f} did not clear threshold {threshold:.2f}",
             )
 
-        if branch.score_change > 0 or branch.persistent_exit_gain_count > 0:
+        if self._branch_is_movement_commit_reject(branch):
+            return (
+                False,
+                "best branch was movement-dominated with no durable score, inventory, or affordance gain",
+            )
+
+        if branch.score_change > 0:
+            return True, ""
+
+        if branch.persistent_exit_gain_count > 0 and (
+            branch.persistent_affordance_gain >= policy.min_affordance_gain_for_movement_commit
+            or branch.novel_object_count > 0
+            or not branch.ended_in_same_cluster
+        ):
             return True, ""
 
         if branch.persistent_inventory_gain_count > 0 and branch.persistent_inventory_loss_count <= 0:
@@ -1064,10 +1095,55 @@ class LocalExplorer:
         ):
             return True
 
+        if (
+            action_cluster_history.movement_no_progress_steps
+            >= self.action_generator.config.policy.branch_fail_fast_min_movement_actions
+        ):
+            recent_clusters = [
+                cluster
+                for cluster in action_cluster_history.recent_cluster_sequence[
+                    -action_cluster_history.movement_no_progress_steps :
+                ]
+                if cluster
+            ]
+            if recent_clusters and len(set(recent_clusters)) <= 2:
+                return True
+
         return (
             not durable_progress
             and current_state.state_cluster_id == base_state.state_cluster_id
             and action_cluster_history.movement_no_progress_steps >= self.action_generator.config.policy.object_family_no_progress_threshold
+        )
+
+    def _is_low_value_movement_branch(
+        self,
+        *,
+        score_change: int,
+        persistent_inventory_gain_count: int,
+        persistent_affordance_gain: int,
+        novel_object_count: int,
+        movement_action_ratio: float,
+    ) -> bool:
+        """Return whether a branch was mostly movement without durable gains."""
+
+        policy = self.action_generator.config.policy
+        return (
+            movement_action_ratio >= policy.branch_commit_movement_ratio_threshold
+            and score_change <= 0
+            and persistent_inventory_gain_count <= 0
+            and persistent_affordance_gain <= 0
+            and novel_object_count <= 0
+        )
+
+    def _branch_is_movement_commit_reject(self, branch: LocalBranchOutcome) -> bool:
+        """Return whether a branch should be rejected as low-value wandering."""
+
+        return self._is_low_value_movement_branch(
+            score_change=branch.score_change,
+            persistent_inventory_gain_count=branch.persistent_inventory_gain_count,
+            persistent_affordance_gain=branch.persistent_affordance_gain,
+            novel_object_count=branch.novel_object_count,
+            movement_action_ratio=branch.movement_action_ratio,
         )
 
     def _looks_like_location_signal(self, observation: str) -> bool:

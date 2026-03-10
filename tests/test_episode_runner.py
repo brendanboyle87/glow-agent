@@ -26,6 +26,8 @@ from zork_agent.types import (
     BranchTerminationReason,
     LocalBranchOutcome,
     LocalExplorationResult,
+    TextGameState,
+    TextGameTransition,
 )
 
 
@@ -269,3 +271,69 @@ def test_episode_runner_rejects_zero_value_local_branch_commit(tmp_path: Path) -
     assert result.metadata["branch_commit_rejection_count"] == 1
     assert result.metadata["branch_commit_allowed"] is False
     assert "did not clear threshold" in result.metadata["commit_rejection_reason"]
+
+
+def test_episode_runner_fails_fast_on_stalled_movement_basin(tmp_path: Path) -> None:
+    """Movement-only no-progress episodes should stop early instead of burning the whole budget."""
+
+    class MovementBasinEnv:
+        """Small fake env that only wanders among forest descriptions."""
+
+        def __init__(self) -> None:
+            self._step = 0
+
+        def reset(self, seed: int | None = None) -> TextGameState:
+            self._step = 0
+            return TextGameState(
+                observation="Forest path among trees.",
+                inventory_text="Inventory empty.",
+                valid_actions=["go around trees", "west"],
+                score=0,
+                moves=0,
+                done=False,
+                world_state_hash="forest-0",
+            )
+
+        def step(self, action: str) -> TextGameTransition:
+            self._step += 1
+            observation = (
+                "A forest path winds among trees."
+                if self._step % 2
+                else "Forest path among trees."
+            )
+            return TextGameTransition(
+                action=action,
+                step_index=self._step - 1,
+                observation=observation,
+                reward=0.0,
+                done=False,
+                score=0,
+                moves=self._step,
+                inventory_text="Inventory empty.",
+                valid_actions=["go around trees", "west"],
+                world_state_hash=f"forest-{self._step % 2}",
+            )
+
+        def close(self) -> None:
+            return None
+
+    config = _build_config(tmp_path)
+    config.ensure_output_directories()
+    config.experiment.max_steps = 10
+    config.experiment.max_replay_attempts = 0
+    config.experiment.fail_fast_no_durable_gain_steps = 4
+    config.experiment.fail_fast_same_cluster_movement_steps = 3
+    runner = EpisodeRunner(config=config, llm_client=None)
+    runner.env = MovementBasinEnv()  # type: ignore[assignment]
+    runner.local_explorer.env = runner.env  # type: ignore[assignment]
+
+    def fake_propose_actions(*args, **kwargs) -> list[ActionProposal]:
+        return [ActionProposal(action="go around trees", source="stub")]
+
+    runner.action_generator.propose_actions = fake_propose_actions  # type: ignore[method-assign]
+
+    result = runner.run_episode(episode_id="episode-runner-fail-fast")
+
+    assert result.step_count < config.experiment.max_steps
+    assert "movement wandering persisted" in result.metadata["episode_fail_fast_reason"]
+    assert result.metadata["consecutive_same_cluster_movement_steps"] >= 3

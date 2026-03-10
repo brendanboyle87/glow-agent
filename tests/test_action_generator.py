@@ -115,10 +115,15 @@ def test_action_generator_parses_constrained_candidates_against_valid_actions(tm
 
     assert result.mode is ActionGenerationMode.CONSTRAINED
     assert result.raw_output.startswith("1. open mailbox")
-    assert [candidate.action for candidate in result.candidates] == ["open mailbox", "read leaflet"]
+    assert [candidate.action for candidate in result.candidates][:2] == ["open mailbox", "read leaflet"]
     assert result.candidates[0].confidence == 0.82
     assert result.candidates[0].rationale == "nearby interaction"
     assert result.candidates[0].source == "llm_constrained"
+    assert result.candidate_pool_before_rerank == ["open mailbox", "read leaflet", "look"]
+    assert result.ranking_source == "hybrid_merge"
+    assert result.candidates[0].features is not None
+    assert result.candidates[0].features.verb == "open"
+    assert result.candidates[0].features.noun_targets == ["mailbox"]
 
 
 def test_action_generator_parses_open_mode_rationales_and_confidence(tmp_path: Path) -> None:
@@ -146,10 +151,13 @@ def test_action_generator_parses_open_mode_rationales_and_confidence(tmp_path: P
     )
 
     assert result.mode is ActionGenerationMode.OPEN
-    assert [candidate.action for candidate in result.candidates] == ["open mailbox", "examine house", "inventory"]
-    assert result.candidates[0].rationale == "nearby object"
-    assert result.candidates[1].confidence == 0.55
-    assert result.candidates[1].source == "llm_open"
+    assert set(candidate.action for candidate in result.candidates[:2]) == {"open mailbox", "examine house"}
+    assert result.candidates[-1].action == "inventory"
+    open_mailbox = next(candidate for candidate in result.candidates if candidate.action == "open mailbox")
+    examine_house = next(candidate for candidate in result.candidates if candidate.action == "examine house")
+    assert open_mailbox.rationale == "nearby object"
+    assert examine_house.confidence == 0.55
+    assert examine_house.source == "llm_open"
 
 
 def test_action_generator_falls_back_when_llm_output_is_unusable(tmp_path: Path) -> None:
@@ -170,7 +178,9 @@ def test_action_generator_falls_back_when_llm_output_is_unusable(tmp_path: Path)
     assert result.mode is ActionGenerationMode.FALLBACK
     assert result.fallback_reason == "LLM output was unusable."
     assert result.raw_output == "I am not sure what to do here."
-    assert [candidate.action for candidate in result.candidates][:2] == ["open mailbox", "look"]
+    assert result.ranking_source == "heuristic_rerank"
+    assert set(result.candidate_pool_before_rerank) == {"open mailbox", "read leaflet", "look"}
+    assert result.candidates[0].action == "open mailbox"
     assert result.candidates[0].source == "fallback_constrained"
 
 
@@ -309,6 +319,8 @@ def test_action_generator_prefers_take_leaflet_over_repeated_close_mailbox_with_
     ranked_actions = [candidate.action for candidate in result.candidates]
 
     assert result.candidates[0].action == "take leaflet"
+    assert result.candidates[0].features is not None
+    assert result.candidates[0].features.touches_newly_salient_object is True
     assert "close mailbox" in ranked_actions
     assert ranked_actions.index("take leaflet") < ranked_actions.index("close mailbox")
     assert result.candidates[0].heuristic_bonus > 0.0
@@ -350,6 +362,7 @@ def test_action_generator_prefers_untried_object_interaction_over_stale_toggle(t
         valid_actions=["close window", "examine lamp", "take lamp", "look"],
         score=0,
         moves=3,
+        candidate_count=3,
         recent_actions=["open window"],
         recent_loop_results=[
             LoopHeuristicResult(
@@ -364,8 +377,8 @@ def test_action_generator_prefers_untried_object_interaction_over_stale_toggle(t
     )
 
     assert result.candidates[0].action in {"take lamp", "examine lamp"}
-    assert result.candidates[-1].action == "close window"
-    assert any("new_noun:lamp" in candidate.ranking_reason for candidate in result.candidates[:2])
+    assert "close window" not in [candidate.action for candidate in result.candidates]
+    assert any("new_object" in candidate.ranking_reason for candidate in result.candidates[:2])
 
 
 def test_action_generator_penalizes_repeated_go_around_trees_and_prefers_take_leaflet(
@@ -470,3 +483,324 @@ def test_action_generator_prefers_untried_object_interaction_over_repeated_movem
 
     assert result.candidates[0].action in {"take lamp", "examine lamp"}
     assert result.candidates[-1].movement_only_action is True
+
+
+def test_action_generator_prefers_leaflet_interaction_over_repeated_west_when_leaflet_is_visible(
+    tmp_path: Path,
+) -> None:
+    """A newly visible leaflet interaction should beat repeated movement in constrained mode."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(config, prompt_manager, FakeLLMClient("1. west\n2. close mailbox"))
+    history = ActionClusterHistory(cluster_label="mailbox-cluster")
+    history.observe_state_nouns(
+        observation="You are west of the house near a small mailbox.",
+        valid_actions=["west", "south"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_state_cluster(cluster_id="region:house-field", observation="West of House.")
+    history.record_state_cluster(cluster_id="region:house-field", observation="West of House.")
+    history.record_attempt(
+        action="west",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=False,
+        valid_actions_changed=False,
+    )
+
+    result = generator.generate(
+        observation="Opening the small mailbox reveals a leaflet.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["west", "south", "read leaflet", "examine leaflet", "close mailbox"],
+        score=0,
+        moves=4,
+        recent_actions=["west"],
+        state_action_history=history,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] in {"read leaflet", "examine leaflet"}
+    assert "west" not in ranked_actions or ranked_actions.index("read leaflet") < ranked_actions.index("west")
+    assert "west" not in ranked_actions or ranked_actions.index("examine leaflet") < ranked_actions.index("west")
+
+
+def test_action_generator_does_not_demote_toggle_with_prior_affordance_gain(tmp_path: Path) -> None:
+    """A reversible toggle should survive when it previously revealed a real affordance."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(config, prompt_manager, FakeLLMClient("1. open window\n2. west"))
+    history = ActionClusterHistory(cluster_label="window-cluster")
+    history.record_attempt(
+        action="open window",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=True,
+        revealed_new_object=True,
+    )
+
+    result = generator.generate(
+        observation="The window is shut.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["open window", "west"],
+        score=0,
+        moves=3,
+        recent_actions=["close window"],
+        recent_loop_results=[LoopHeuristicResult(no_progress=False)],
+        state_action_history=history,
+    )
+
+    open_window = next(candidate for candidate in result.candidates if candidate.action == "open window")
+    assert open_window.features is not None
+    assert open_window.features.produced_affordance_gain_before is True
+    assert open_window.heuristic_penalty < config.policy.reversible_toggle_penalty
+
+
+def test_action_generator_demotes_exhausted_mailbox_family_actions_after_leaflet_is_handled(
+    tmp_path: Path,
+) -> None:
+    """Exhausted mailbox-family toggles and put-back actions should lose to leaving the cul-de-sac."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(config, prompt_manager, FakeLLMClient("1. open mailbox\n2. put leaflet in mailbox"))
+    history = ActionClusterHistory(cluster_label="mailbox-cluster")
+    history.observe_state_nouns(
+        observation="Opening the small mailbox reveals a leaflet.",
+        valid_actions=["take leaflet", "close mailbox", "west"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="open mailbox",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=True,
+        revealed_new_object=True,
+        target_tokens={"mailbox"},
+    )
+    history.record_attempt(
+        action="close mailbox",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=False,
+        valid_actions_changed=False,
+        target_tokens={"mailbox"},
+    )
+    history.record_attempt(
+        action="close mailbox",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=False,
+        valid_actions_changed=False,
+        target_tokens={"mailbox"},
+    )
+
+    result = generator.generate(
+        observation="The mailbox is closed. You are carrying a leaflet.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["open mailbox", "put leaflet in mailbox", "west", "north"],
+        score=0,
+        moves=5,
+        recent_actions=["close mailbox"],
+        state_action_history=history,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] in {"west", "north"}
+    assert ranked_actions.index("open mailbox") > 0
+    assert ranked_actions.index("put leaflet in mailbox") > 0
+    open_mailbox = next(candidate for candidate in result.candidates if candidate.action == "open mailbox")
+    put_leaflet = next(candidate for candidate in result.candidates if candidate.action == "put leaflet in mailbox")
+    assert "historical_gain" not in open_mailbox.ranking_reason
+    assert "exhausted_family:mailbox" in open_mailbox.ranking_reason
+    assert "discard_inventory" in put_leaflet.ranking_reason
+
+
+def test_action_generator_top_k_keeps_object_centric_action_when_salient_objects_exist(
+    tmp_path: Path,
+) -> None:
+    """Top-k diversity should still keep at least one object-centric action around salient objects."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. west\n2. south\n3. go around forest"),
+    )
+    history = ActionClusterHistory(cluster_label="forest-cluster")
+    history.record_state_cluster(cluster_id="region:forest", observation="Forest path among trees.")
+    history.record_state_cluster(cluster_id="region:forest", observation="Forest path among trees.")
+    history.record_attempt(
+        action="go around forest",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=False,
+        valid_actions_changed=False,
+    )
+
+    result = generator.generate(
+        observation="You are in a forest clearing. A brass lamp is here.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["west", "south", "go around forest", "take lamp", "examine lamp"],
+        score=0,
+        moves=6,
+        candidate_count=3,
+        recent_actions=["go around forest"],
+        state_action_history=history,
+    )
+
+    assert any(
+        candidate.features is not None
+        and not candidate.features.is_movement_action
+        and "lamp" in candidate.features.noun_targets
+        for candidate in result.candidates
+    )
+
+
+def test_action_generator_prefers_examine_egg_over_throw_leaflet_at_egg(tmp_path: Path) -> None:
+    """Canonical inspect actions should beat speculative aggressive tool use on a new object."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. throw leaflet at egg\n2. examine egg"),
+    )
+
+    result = generator.generate(
+        observation="A jeweled egg rests in a nest.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["throw leaflet at egg", "examine egg", "north"],
+        score=0,
+        moves=5,
+        candidate_count=3,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "examine egg"
+    throw_candidate = next(candidate for candidate in result.candidates if candidate.action == "throw leaflet at egg")
+    assert throw_candidate.features is not None
+    assert throw_candidate.features.verb_family == "aggressive"
+    assert throw_candidate.features.action_shape_is_complex_transitive is True
+    assert "complex_transitive" in throw_candidate.ranking_reason
+    assert "speculative_tool_use" in throw_candidate.ranking_reason
+
+
+def test_action_generator_prefers_take_egg_over_throw_leaflet_at_nest(tmp_path: Path) -> None:
+    """Acquire actions on a newly encountered object should outrank speculative throws."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. throw leaflet at nest\n2. take egg"),
+    )
+
+    result = generator.generate(
+        observation="A jeweled egg is visible in a nest.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["throw leaflet at nest", "take egg", "west"],
+        score=0,
+        moves=5,
+        candidate_count=3,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "take egg"
+    assert ranked_actions.index("take egg") < ranked_actions.index("throw leaflet at nest")
+
+
+def test_action_generator_prefers_open_egg_over_close_egg_for_unexplored_object(tmp_path: Path) -> None:
+    """New container-like objects should prefer `open` over `close` before they are explored."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. close egg\n2. open egg"),
+    )
+
+    result = generator.generate(
+        observation="A jeweled egg lies here.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["close egg", "open egg", "look"],
+        score=0,
+        moves=5,
+        candidate_count=3,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "open egg"
+    close_candidate = next(candidate for candidate in result.candidates if candidate.action == "close egg")
+    assert close_candidate.features is not None
+    assert close_candidate.features.verb_family == "access"
+    assert "canonical_new_object" in close_candidate.ranking_reason
+
+
+def test_action_generator_prefers_read_leaflet_over_throw_leaflet_at_egg(tmp_path: Path) -> None:
+    """Readable inventory objects should favor canonical read/inspect actions before odd tool use."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. throw leaflet at egg\n2. read leaflet"),
+    )
+
+    result = generator.generate(
+        observation="A jeweled egg sits in a nest.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["throw leaflet at egg", "read leaflet", "north"],
+        score=0,
+        moves=5,
+        candidate_count=3,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "read leaflet"
+    read_candidate = next(candidate for candidate in result.candidates if candidate.action == "read leaflet")
+    assert read_candidate.features is not None
+    assert read_candidate.features.target_is_readable_candidate is True
+    assert "readable_candidate" in read_candidate.ranking_reason
+
+
+def test_action_generator_keeps_speculative_tool_use_available_but_low_ranked_without_evidence(
+    tmp_path: Path,
+) -> None:
+    """Speculative tool-use actions should remain available but trail canonical alternatives."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. use leaflet on egg\n2. examine egg"),
+    )
+
+    result = generator.generate(
+        observation="A jeweled egg is in a nest.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["use leaflet on egg", "examine egg", "open egg", "north"],
+        score=0,
+        moves=5,
+        candidate_count=4,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert "use leaflet on egg" in ranked_actions
+    assert ranked_actions.index("use leaflet on egg") > ranked_actions.index("examine egg")
+    speculative = next(candidate for candidate in result.candidates if candidate.action == "use leaflet on egg")
+    assert speculative.features is not None
+    assert speculative.features.verb_family == "use"
+    assert speculative.features.action_shape_is_complex_transitive is True
+    assert "speculative_tool_use" in speculative.ranking_reason

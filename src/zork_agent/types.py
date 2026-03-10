@@ -270,6 +270,13 @@ _DIRECTION_TOKENS = {
 
 _SALIENT_INTERACTION_VERBS = {"take", "get", "examine", "read"}
 _STATE_TOGGLE_FAMILY_VERBS = {"open", "close", "enter", "exit", "turn on", "turn off"}
+_INSPECT_VERBS = {"examine", "inspect", "look", "look at", "read"}
+_ACQUIRE_VERBS = {"take", "get"}
+_ACCESS_VERBS = {"open", "close", "unlock", "look in", "look inside"}
+_USE_VERBS = {"put", "insert", "use", "light", "extinguish", "unlock with", "open with"}
+_AGGRESSIVE_VERBS = {"throw", "attack", "break", "kick", "hit"}
+_READABLE_OBJECT_TOKENS = {"book", "card", "code", "diary", "document", "inscription", "label", "leaflet", "letter", "manual", "map", "note", "page", "paper", "plaque", "runes", "scroll", "sign", "tablet"}
+_OPENABLE_OBJECT_TOKENS = {"bag", "box", "cabinet", "case", "chest", "cupboard", "door", "drawer", "egg", "gate", "hatch", "mailbox", "nest", "package", "safe", "trapdoor", "trunk", "window"}
 _REVERSIBLE_STATE_TOKENS = {
     "close",
     "closed",
@@ -398,6 +405,20 @@ def normalize_parser_action(action: str) -> str:
     return " ".join(action.split()).strip().lower()
 
 
+def default_verb_family_prior_scores() -> dict[str, float]:
+    """Return the default IF-oriented prior score per verb family."""
+
+    return {
+        "inspect": 1.2,
+        "acquire": 1.0,
+        "access": 0.7,
+        "movement": 0.0,
+        "use": -0.2,
+        "aggressive": -1.25,
+        "other": 0.0,
+    }
+
+
 def split_action_command(action: str, inverse_pairs: Mapping[str, str] | None = None) -> tuple[str, str]:
     """Split a parser command into its verb phrase and object phrase."""
 
@@ -416,6 +437,151 @@ def split_action_command(action: str, inverse_pairs: Mapping[str, str] | None = 
     verb = parts[0]
     obj = _normalize_action_object(parts[1]) if len(parts) > 1 else ""
     return verb, obj
+
+
+def canonical_if_verb_family(
+    action: str,
+    inverse_pairs: Mapping[str, str] | None = None,
+) -> str:
+    """Return a lightweight IF verb-family label for one parser action."""
+
+    verb, _obj = split_action_command(action, inverse_pairs)
+    if verb in _INSPECT_VERBS:
+        return "inspect"
+    if verb in _ACQUIRE_VERBS:
+        return "acquire"
+    if verb in _ACCESS_VERBS:
+        return "access"
+    if is_movement_action(action, inverse_pairs):
+        return "movement"
+    if verb in _USE_VERBS or any(token in normalize_parser_action(action) for token in (" with ", " on ", " into ", " in ")):
+        return "use"
+    if verb in _AGGRESSIVE_VERBS:
+        return "aggressive"
+    return "other"
+
+
+def action_object_count(
+    action: str,
+    inverse_pairs: Mapping[str, str] | None = None,
+) -> int:
+    """Return a lightweight count of object-like arguments in one action."""
+
+    normalized = normalize_parser_action(action)
+    if not normalized:
+        return 0
+    if canonical_if_verb_family(action, inverse_pairs) == "movement":
+        return 0
+    object_tokens = action_target_tokens(normalized, inverse_pairs)
+    if not object_tokens:
+        return 0
+    if any(separator in normalized for separator in (" at ", " with ", " into ", " on ")):
+        return 2
+    if normalized.startswith("put ") and " in " in normalized:
+        return 2
+    return 1
+
+
+def action_uses_inventory_object(
+    action: str,
+    inventory_tokens: set[str],
+    inverse_pairs: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether an action appears to use a currently held object."""
+
+    if not inventory_tokens:
+        return False
+    return bool(action_target_tokens(action, inverse_pairs) & inventory_tokens)
+
+
+def target_is_container_or_openable_candidate(
+    action: str,
+    valid_actions: list[str] | None = None,
+    inverse_pairs: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether an action appears to target an openable/container-like object."""
+
+    target_tokens = action_target_tokens(action, inverse_pairs)
+    if target_tokens & _OPENABLE_OBJECT_TOKENS:
+        return True
+    normalized_targets = {normalize_parser_action(target) for target in target_tokens}
+    for valid_action in valid_actions or []:
+        verb, _obj = split_action_command(valid_action, inverse_pairs)
+        if verb not in {"open", "close", "look in", "look inside", "unlock"}:
+            continue
+        if action_target_tokens(valid_action, inverse_pairs) & normalized_targets:
+            return True
+    return False
+
+
+def target_is_readable_candidate(
+    action: str,
+    *,
+    observation: str,
+    inventory_text: str = "",
+    valid_actions: list[str] | None = None,
+    inverse_pairs: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether an action appears to target a readable object."""
+
+    target_tokens = action_target_tokens(action, inverse_pairs)
+    if target_tokens & _READABLE_OBJECT_TOKENS:
+        return True
+    salient_tokens = extract_salient_nouns(
+        observation=observation,
+        inventory_text=inventory_text,
+        valid_actions=valid_actions or [],
+        inverse_pairs=inverse_pairs,
+    )
+    readable_salient_tokens = salient_tokens & _READABLE_OBJECT_TOKENS
+    if target_tokens & readable_salient_tokens:
+        return True
+    for valid_action in valid_actions or []:
+        verb, _obj = split_action_command(valid_action, inverse_pairs)
+        if verb == "read" and action_target_tokens(valid_action, inverse_pairs) & target_tokens:
+            return True
+    return False
+
+
+def action_shape_is_simple(
+    action: str,
+    inverse_pairs: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether an action has a short canonical IF shape."""
+
+    normalized = normalize_parser_action(action)
+    if not normalized:
+        return False
+    family = canonical_if_verb_family(normalized, inverse_pairs)
+    if family == "movement":
+        return True
+    if family == "inspect" and (normalized.startswith("look at ") or normalized.startswith("look in ")):
+        return True
+    return action_object_count(normalized, inverse_pairs) <= 1 and not action_shape_is_complex_transitive(
+        normalized,
+        inverse_pairs,
+    )
+
+
+def action_shape_is_complex_transitive(
+    action: str,
+    inverse_pairs: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether an action is a speculative multi-argument transitive command."""
+
+    normalized = normalize_parser_action(action)
+    if not normalized:
+        return False
+    family = canonical_if_verb_family(normalized, inverse_pairs)
+    if family == "inspect" and any(normalized.startswith(prefix) for prefix in ("look at ", "look in ", "look inside ")):
+        return False
+    if action_object_count(normalized, inverse_pairs) >= 2:
+        return True
+    return any(separator in normalized for separator in (" with ", " at ", " on ", " into ")) and family in {
+        "use",
+        "aggressive",
+        "other",
+    }
 
 
 def actions_are_inverse(
@@ -1205,6 +1371,8 @@ class ActionClusterHistory:
     cluster_label: str = ""
     seen_nouns: set[str] = field(default_factory=set)
     action_stats: dict[str, ActionAttemptStats] = field(default_factory=dict)
+    verb_family_stats: dict[str, ActionAttemptStats] = field(default_factory=dict)
+    object_noun_stats: dict[str, ActionAttemptStats] = field(default_factory=dict)
     current_state_cluster_id: str = ""
     cluster_visit_counts: dict[str, int] = field(default_factory=dict)
     cluster_observation_signatures: dict[str, set[str]] = field(default_factory=dict)
@@ -1221,6 +1389,24 @@ class ActionClusterHistory:
             self.action_stats[normalized] = ActionAttemptStats(action=normalized)
         return self.action_stats[normalized]
 
+    def stats_for_verb_family(self, family: str) -> ActionAttemptStats:
+        """Return mutable stats for a verb family within this cluster."""
+
+        normalized = normalize_parser_action(family) or "other"
+        if normalized not in self.verb_family_stats:
+            self.verb_family_stats[normalized] = ActionAttemptStats(action=normalized)
+        return self.verb_family_stats[normalized]
+
+    def stats_for_object_noun(self, noun: str) -> ActionAttemptStats:
+        """Return mutable stats for a local object noun within this cluster."""
+
+        normalized = normalize_parser_action(noun)
+        if not normalized:
+            normalized = "unknown"
+        if normalized not in self.object_noun_stats:
+            self.object_noun_stats[normalized] = ActionAttemptStats(action=normalized)
+        return self.object_noun_stats[normalized]
+
     def record_attempt(
         self,
         *,
@@ -1235,10 +1421,23 @@ class ActionClusterHistory:
         revealed_new_object: bool = False,
         target_tokens: set[str] | None = None,
         movement_only_action: bool = False,
+        inverse_pairs: Mapping[str, str] | None = None,
     ) -> None:
         """Record one attempted action and its observed effect."""
 
-        self.stats_for(action).record_attempt(
+        exact_stats = self.stats_for(action)
+        exact_stats.record_attempt(
+            score_changed=score_changed,
+            inventory_changed=inventory_changed,
+            inventory_gained=inventory_gained,
+            inventory_lost=inventory_lost,
+            observation_changed=observation_changed,
+            valid_actions_changed=valid_actions_changed,
+            valid_actions_improved=valid_actions_improved,
+            revealed_new_object=revealed_new_object,
+        )
+        verb_family = canonical_if_verb_family(action, inverse_pairs)
+        self.stats_for_verb_family(verb_family).record_attempt(
             score_changed=score_changed,
             inventory_changed=inventory_changed,
             inventory_gained=inventory_gained,
@@ -1250,6 +1449,17 @@ class ActionClusterHistory:
         )
         durable_progress = any((score_changed, inventory_gained, valid_actions_improved, revealed_new_object))
         normalized_targets = {normalize_parser_action(token) for token in (target_tokens or set()) if normalize_parser_action(token)}
+        for token in normalized_targets:
+            self.stats_for_object_noun(token).record_attempt(
+                score_changed=score_changed,
+                inventory_changed=inventory_changed,
+                inventory_gained=inventory_gained,
+                inventory_lost=inventory_lost,
+                observation_changed=observation_changed,
+                valid_actions_changed=valid_actions_changed,
+                valid_actions_improved=valid_actions_improved,
+                revealed_new_object=revealed_new_object,
+            )
         if durable_progress:
             self.no_progress_steps = 0
             if movement_only_action:
@@ -1324,6 +1534,43 @@ class ActionClusterHistory:
             for family, count in self.object_family_no_progress_counts.items()
             if count >= threshold
         }
+
+    def max_family_no_progress_count(self, tokens: set[str]) -> int:
+        """Return the maximum no-progress count among the provided family tokens."""
+
+        if not tokens:
+            return 0
+        return max(self.family_no_progress_count(token) for token in tokens)
+
+    def prior_success_for_verb_family(self, family: str) -> int:
+        """Return durable-success count for one verb family."""
+
+        return self.verb_family_stats.get(normalize_parser_action(family), ActionAttemptStats(action="")).durable_gain_count
+
+    def prior_failure_for_verb_family(self, family: str) -> int:
+        """Return durable-failure count for one verb family."""
+
+        return self.verb_family_stats.get(normalize_parser_action(family), ActionAttemptStats(action="")).no_durable_gain_count
+
+    def prior_success_for_object_nouns(self, nouns: set[str]) -> int:
+        """Return the highest durable-success count among the provided object nouns."""
+
+        if not nouns:
+            return 0
+        return max(
+            self.object_noun_stats.get(normalize_parser_action(noun), ActionAttemptStats(action="")).durable_gain_count
+            for noun in nouns
+        )
+
+    def prior_failure_for_object_nouns(self, nouns: set[str]) -> int:
+        """Return the highest durable-failure count among the provided object nouns."""
+
+        if not nouns:
+            return 0
+        return max(
+            self.object_noun_stats.get(normalize_parser_action(noun), ActionAttemptStats(action="")).no_durable_gain_count
+            for noun in nouns
+        )
 
 
 class ReplayDivergenceReason(str, Enum):
@@ -1561,7 +1808,57 @@ class ActionProposal:
     movement_penalty: float = 0.0
     movement_penalty_reason: str = ""
     movement_only_action: bool = False
+    diversity_bonus: float = 0.0
+    features: ActionCandidateFeatures | None = None
     raw_line: str = ""
+
+
+@dataclass(slots=True)
+class ActionCandidateFeatures:
+    """Explicit evidence features used to rank parser-action candidates."""
+
+    action_text: str
+    source_mode: str
+    verb: str = ""
+    verb_family: str = "other"
+    noun_targets: list[str] = field(default_factory=list)
+    object_count: int = 0
+    is_movement_action: bool = False
+    is_reversible_toggle: bool = False
+    uses_inventory_object: bool = False
+    target_is_new_salient_object: bool = False
+    target_is_container_or_openable: bool = False
+    target_is_readable_candidate: bool = False
+    action_shape_is_simple: bool = False
+    action_shape_is_complex_transitive: bool = False
+    was_tried_before_in_local_cluster: bool = False
+    previous_attempt_count: int = 0
+    produced_score_gain_before: bool = False
+    produced_inventory_gain_before: bool = False
+    produced_affordance_gain_before: bool = False
+    prior_success_for_verb_family: bool = False
+    prior_success_for_exact_action: bool = False
+    prior_failure_for_exact_action: bool = False
+    prior_success_for_object_family: bool = False
+    prior_failure_for_object_family: bool = False
+    touches_newly_salient_object: bool = False
+    touches_supported_reflection_object: bool = False
+    inverse_of_previous_action: bool = False
+    movement_repeat_count: int = 0
+    cluster_repeat_count: int = 0
+    touches_exhausted_family: bool = False
+    exhausted_family_count: int = 0
+    max_family_no_progress_count: int = 0
+    matches_supported_try_action: bool = False
+    matches_supported_avoid_action: bool = False
+    plausibility_score: float = 0.0
+    canonical_prior_contribution: float = 0.0
+    object_family_evidence_contribution: float = 0.0
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the feature vector into a JSON-serializable dictionary."""
+
+        return asdict(self)
 
 
 class ActionGenerationMode(str, Enum):
@@ -1586,11 +1883,27 @@ class ActionGenerationResult:
     reranked_by_affordance_heuristics: bool = False
     reranked_by_movement_heuristics: bool = False
     augmented_with_valid_actions: bool = False
+    candidate_pool_before_rerank: list[str] = field(default_factory=list)
+    llm_ranked_actions: list[str] = field(default_factory=list)
+    candidate_feature_records: list[dict[str, Any]] = field(default_factory=list)
+    ranking_source: str = ""
+    top_selection_reason: str = ""
 
     def top_actions(self) -> list[str]:
         """Return the candidate action texts in ranked order."""
 
         return [candidate.action for candidate in self.candidates]
+
+    def feature_records(self) -> list[dict[str, Any]]:
+        """Return feature vectors for logging and debug summaries."""
+
+        if self.candidate_feature_records:
+            return list(self.candidate_feature_records)
+        return [
+            candidate.features.to_record()
+            for candidate in self.candidates
+            if candidate.features is not None
+        ]
 
 
 class StateSelectionMode(str, Enum):
@@ -1690,6 +2003,7 @@ class LocalBranchOutcome:
     oscillation_penalty_total: float = 0.0
     movement_penalty_total: float = 0.0
     movement_only_action_count: int = 0
+    movement_action_ratio: float = 0.0
     movement_repeat_count: int = 0
     loop_event_count: int = 0
     notable_observation_changes: list[str] = field(default_factory=list)

@@ -4,6 +4,9 @@ Observation:
 Inventory:
 {inventory}
 
+Salient objects:
+{salient_objects_block}
+
 Recent trajectory:
 {recent_trajectory_context}
 
@@ -11,13 +14,17 @@ Score: {score}
 Moves: {moves}
 Mode: {generation_mode}
 {valid_actions_block}
+{evidence_block}
+{canonical_guidance_block}
 
-Return up to {action_candidates} short parser commands.
-One candidate per line.
+If valid actions are listed, rank only from that list.
+Prefer short canonical parser actions.
+Prefer examining, taking, reading, or opening newly revealed objects before speculative tool use.
+Prefer direct object interaction before movement unless movement already showed progress.
+Avoid repeated movement unless it previously changed score, inventory, or useful affordances.
+Avoid reversible toggles unless they previously unlocked something.
+Avoid speculative tool-use or aggressive actions unless grounded by observed evidence.
+
+Return up to {action_candidates} short parser commands, one per line.
 Preferred format:
-action | confidence=0.0-1.0 | rationale
-
-If valid actions are listed, stay within them.
-Prefer newly available object interactions over low-value wandering movement.
-When a new object appears, favor actions like take/get/read/open/examine/look in before repeating movement.
-Avoid suggesting repeated movement or region wandering unless it clearly changed score, inventory, or available interactions.
+action | short reason

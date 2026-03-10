@@ -443,9 +443,48 @@ def test_local_explorer_rejects_zero_score_movement_only_branch(tmp_path: Path) 
     assert result.best_branch.affordance_gain == 0
     assert result.best_branch.movement_penalty_total > 0.0
     assert result.best_branch.movement_only_action_count == 2
+    assert result.best_branch.movement_action_ratio == 1.0
     assert result.branch_commit_allowed is False
     assert (
         "did not clear threshold" in result.commit_rejection_reason
+        or "movement-dominated" in result.commit_rejection_reason
         or "no score gain, inventory gain, exit gain, or sufficient affordance gain"
         in result.commit_rejection_reason
     )
+
+
+def test_local_explorer_aborts_low_value_movement_cycle_early(tmp_path: Path) -> None:
+    """Movement-only cycles between one or two clusters should fail fast inside a branch."""
+
+    config = _build_config(tmp_path)
+    config.policy.branch_fail_fast_min_movement_actions = 3
+    env = JerichoEnv(config, env_factory=WanderingForestBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    def scripted_proposals(
+        state: TextGameState,
+        *,
+        recent_trajectory_context: str | None = None,
+        candidate_count: int | None = None,
+        temperature: float | None = None,
+        recent_actions: list[str] | None = None,
+        recent_loop_results=None,
+        state_action_history=None,
+    ) -> list[ActionProposal]:
+        return [
+            ActionProposal(action="go around trees", rank=1),
+            ActionProposal(action="west", rank=2),
+        ]
+
+    action_generator.propose_actions = scripted_proposals  # type: ignore[method-assign]
+
+    base_state = env.reset(seed=23)
+    result = explorer.explore_from_state(base_state, branch_count=1, branch_horizon=8)
+
+    assert result.best_branch is not None
+    assert result.best_branch.termination_reason is BranchTerminationReason.LOOP_ABORTED
+    assert len(result.best_branch.actions_taken) < 8
+    assert result.best_branch.movement_action_ratio == 1.0
+    assert result.branch_commit_allowed is False

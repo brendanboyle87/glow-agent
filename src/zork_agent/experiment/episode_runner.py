@@ -29,6 +29,7 @@ from zork_agent.types import (
     EpisodeResult,
     LoopHeuristicResult,
     MovementHeuristicResult,
+    ReflectionGuidance,
     StateSelectionResult,
     TextGameState,
     Trajectory,
@@ -98,6 +99,7 @@ class EpisodeRunner:
         replay_success_count = 0
         local_exploration_count = 0
         reflection_update_count = 0
+        latest_reflection_guidance = ReflectionGuidance()
         selection_mode_counts: Counter[str] = Counter()
         action_generation_mode_counts: Counter[str] = Counter()
         restore_mode_counts: Counter[str] = Counter()
@@ -113,6 +115,10 @@ class EpisodeRunner:
         movement_loop_detected_count = 0
         movement_penalty_total = 0.0
         branch_commit_rejection_count = 0
+        consecutive_no_durable_gain_steps = 0
+        consecutive_same_cluster_movement_steps = 0
+        recent_stalled_movement_clusters: list[str] = []
+        episode_fail_fast_reason = ""
         last_selection_result: StateSelectionResult | None = None
         last_local_exploration = None
 
@@ -161,6 +167,7 @@ class EpisodeRunner:
                 revisit_made_progress = False
                 chosen_action: str | None = None
                 action_source = "action_generator"
+                action_generation_result = None
                 loaded_branch_plan_this_step = False
                 branch_progress_score = 0.0
                 branch_commit_allowed = False
@@ -229,6 +236,7 @@ class EpisodeRunner:
                                     reflection_context,
                                     reflection_result.prompt_context,
                                 )
+                            latest_reflection_guidance = reflection_result.guidance
 
                             best_branch = last_local_exploration.best_branch
                             branch_progress_score = last_local_exploration.best_branch_progress_score
@@ -335,9 +343,21 @@ class EpisodeRunner:
                             recent_actions=episode_action_history,
                             recent_loop_results=episode_loop_results,
                             state_action_history=action_cluster_history,
+                            supported_try_actions=latest_reflection_guidance.supported_try_actions,
+                            supported_avoid_actions=latest_reflection_guidance.supported_avoid_actions,
+                            supported_reflection_objects=latest_reflection_guidance.salient_objects,
                         )
-                        if self.action_generator.last_result is not None:
-                            action_generation_mode_counts[self.action_generator.last_result.mode.value] += 1
+                        action_generation_result = self.action_generator.last_result
+                        if action_generation_result is not None:
+                            action_generation_mode_counts[action_generation_result.mode.value] += 1
+                            self.logger.info(
+                                "Action ranking before=%s final=%s source=%s top_reason=%s features=%s",
+                                action_generation_result.candidate_pool_before_rerank,
+                                [candidate.action for candidate in action_generation_result.candidates],
+                                action_generation_result.ranking_source or action_generation_result.mode.value,
+                                action_generation_result.top_selection_reason or "none",
+                                to_jsonable(action_generation_result.feature_records()),
+                            )
                         chosen_action = proposals[0].action if proposals else "look"
 
                 action_source_counts[action_source] += 1
@@ -422,6 +442,7 @@ class EpisodeRunner:
                         chosen_action,
                         self.config.policy.inverse_action_pairs,
                     ),
+                    inverse_pairs=self.config.policy.inverse_action_pairs,
                 )
                 loop_result = evaluate_reversible_action_loop(
                     action=chosen_action,
@@ -483,12 +504,7 @@ class EpisodeRunner:
                         "inventory_gained": inventory_gained,
                         "inventory_lost": inventory_lost,
                         "revealed_new_object": bool(novel_object_tokens),
-                        "durable_progress": bool(
-                            next_state.score > pre_step_state.score
-                            or inventory_gained
-                            or affordance_gain > 0
-                            or bool(novel_object_tokens)
-                        ),
+                        "durable_progress": False,
                         "selected_frontier_state": selected_entry.state_id if selected_entry is not None else None,
                         "selected_frontier_reason": last_selection_result.reason if last_selection_result is not None else "",
                         "selection_mode": (
@@ -513,6 +529,31 @@ class EpisodeRunner:
                             if reflection_result is not None
                             else []
                         ),
+                        "candidate_pool_before_rerank": (
+                            list(action_generation_result.candidate_pool_before_rerank)
+                            if action_source == "action_generator" and action_generation_result is not None
+                            else []
+                        ),
+                        "candidate_feature_vectors": (
+                            to_jsonable(action_generation_result.feature_records())
+                            if action_source == "action_generator" and action_generation_result is not None
+                            else []
+                        ),
+                        "final_ranked_candidates": (
+                            [candidate.action for candidate in action_generation_result.candidates]
+                            if action_source == "action_generator" and action_generation_result is not None
+                            else []
+                        ),
+                        "candidate_ranking_source": (
+                            action_generation_result.ranking_source
+                            if action_source == "action_generator" and action_generation_result is not None
+                            else ""
+                        ),
+                        "top_selection_reason": (
+                            action_generation_result.top_selection_reason
+                            if action_source == "action_generator" and action_generation_result is not None
+                            else ""
+                        ),
                         "branch_progress_score": branch_progress_score,
                         "branch_commit_allowed": branch_commit_allowed,
                         "commit_rejection_reason": commit_rejection_reason,
@@ -525,6 +566,15 @@ class EpisodeRunner:
                     },
                 )
                 steps.append(step)
+
+                durable_progress = self._step_has_durable_progress(
+                    score_gain=next_state.score - pre_step_state.score,
+                    inventory_gained=inventory_gained,
+                    affordance_gain=affordance_gain,
+                    novel_object_count=len(novel_object_tokens),
+                    movement_only_action=movement_result.movement_only_action,
+                )
+                step.metadata["durable_progress"] = durable_progress
 
                 self.logger.info(
                     "Episode %s step %s action=%s source=%s score=%s reward=%.2f frontier=%s loop_penalty=%.2f "
@@ -607,6 +657,28 @@ class EpisodeRunner:
                     inverse_pairs=self.config.policy.inverse_action_pairs,
                 )
                 current_state = next_state
+
+                (
+                    consecutive_no_durable_gain_steps,
+                    consecutive_same_cluster_movement_steps,
+                    recent_stalled_movement_clusters,
+                    episode_fail_fast_reason,
+                ) = self._update_episode_fail_fast_state(
+                    consecutive_no_durable_gain_steps=consecutive_no_durable_gain_steps,
+                    consecutive_same_cluster_movement_steps=consecutive_same_cluster_movement_steps,
+                    recent_stalled_movement_clusters=recent_stalled_movement_clusters,
+                    durable_progress=durable_progress,
+                    movement_only_action=movement_result.movement_only_action,
+                    current_cluster_id=current_state.state_cluster_id,
+                )
+                if episode_fail_fast_reason:
+                    self.logger.info(
+                        "Fail-fast ending episode %s at step %s: %s",
+                        generated_episode_id,
+                        episode_step_index,
+                        episode_fail_fast_reason,
+                    )
+                    break
         finally:
             self.env.close()
 
@@ -631,6 +703,9 @@ class EpisodeRunner:
             "movement_loop_detected_count": movement_loop_detected_count,
             "movement_penalty_total": movement_penalty_total,
             "branch_commit_rejection_count": branch_commit_rejection_count,
+            "consecutive_no_durable_gain_steps": consecutive_no_durable_gain_steps,
+            "consecutive_same_cluster_movement_steps": consecutive_same_cluster_movement_steps,
+            "episode_fail_fast_reason": episode_fail_fast_reason,
             "final_guidance": reflection_context,
             "final_reflection_mode": final_reflection.mode.value,
             "reflection_removed_items": list(final_reflection.guidance.unsupported_items_removed),
@@ -1041,6 +1116,76 @@ class EpisodeRunner:
             inverse_pairs=self.config.policy.inverse_action_pairs,
         )
         return max(0, len(base_items - final_items))
+
+    def _step_has_durable_progress(
+        self,
+        *,
+        score_gain: int,
+        inventory_gained: bool,
+        affordance_gain: int,
+        novel_object_count: int,
+        movement_only_action: bool,
+    ) -> bool:
+        """Return whether the current real episode step made durable progress."""
+
+        return any(
+            (
+                score_gain > 0,
+                inventory_gained,
+                affordance_gain > 0,
+                novel_object_count > 0 and not movement_only_action,
+            )
+        )
+
+    def _update_episode_fail_fast_state(
+        self,
+        *,
+        consecutive_no_durable_gain_steps: int,
+        consecutive_same_cluster_movement_steps: int,
+        recent_stalled_movement_clusters: list[str],
+        durable_progress: bool,
+        movement_only_action: bool,
+        current_cluster_id: str,
+    ) -> tuple[int, int, list[str], str]:
+        """Update episode-level stall counters and return an optional fail-fast reason."""
+
+        if durable_progress:
+            return 0, 0, [], ""
+
+        no_durable_gain_steps = consecutive_no_durable_gain_steps + 1
+        movement_steps = 0
+        stalled_clusters: list[str] = []
+        if movement_only_action:
+            movement_steps = consecutive_same_cluster_movement_steps + 1
+            stalled_clusters = [*recent_stalled_movement_clusters, current_cluster_id][-32:]
+
+        if no_durable_gain_steps >= self.config.experiment.fail_fast_no_durable_gain_steps:
+            return (
+                no_durable_gain_steps,
+                movement_steps,
+                stalled_clusters,
+                (
+                    f"no durable progress for {no_durable_gain_steps} consecutive steps "
+                    f"(threshold {self.config.experiment.fail_fast_no_durable_gain_steps})"
+                ),
+            )
+
+        if (
+            movement_steps >= self.config.experiment.fail_fast_same_cluster_movement_steps
+            and stalled_clusters
+            and len(set(stalled_clusters[-movement_steps:])) <= 2
+        ):
+            return (
+                no_durable_gain_steps,
+                movement_steps,
+                stalled_clusters,
+                (
+                    f"movement wandering persisted for {movement_steps} steps across "
+                    f"{len(set(stalled_clusters[-movement_steps:]))} cluster(s)"
+                ),
+            )
+
+        return no_durable_gain_steps, movement_steps, stalled_clusters, ""
 
     def _room_text_only_gain(
         self,

@@ -64,16 +64,35 @@ class PromptManager:
         generation_mode: str = "open",
         recent_trajectory_context: str = "",
         valid_actions: list[str] | None = None,
+        salient_objects: list[str] | None = None,
+        supported_try_actions: list[str] | None = None,
+        supported_avoid_actions: list[str] | None = None,
     ) -> str:
         """Render the action proposal prompt."""
 
         valid_actions = valid_actions or []
+        salient_objects = salient_objects or []
+        supported_try_actions = supported_try_actions or []
+        supported_avoid_actions = supported_avoid_actions or []
         valid_actions_block = (
             "Valid actions:\n" + "\n".join(f"- {action}" for action in valid_actions)
             if valid_actions
             else "Valid actions:\n(unavailable)"
         )
         recent_trajectory_block = recent_trajectory_context.strip() or "(none)"
+        salient_objects_block = ", ".join(salient_objects) if salient_objects else "(none)"
+        evidence_block = (
+            f"Prefer if supported: {', '.join(supported_try_actions) or '(none)'}\n"
+            f"Avoid if repeated low-value: {', '.join(supported_avoid_actions) or '(none)'}"
+        )
+        canonical_guidance_block = (
+            "Canonical preference:\n"
+            "1. examine/look at/read a newly revealed object\n"
+            "2. take/get a newly revealed portable object\n"
+            "3. open/look in a container-like object\n"
+            "4. move only after direct object actions are exhausted\n"
+            "5. speculative tool use or aggressive actions only if grounded by evidence"
+        )
         return self.render(
             self.config.action_proposal_file,
             observation=observation,
@@ -84,6 +103,9 @@ class PromptManager:
             generation_mode=generation_mode,
             recent_trajectory_context=recent_trajectory_block,
             valid_actions_block=valid_actions_block,
+            salient_objects_block=salient_objects_block,
+            evidence_block=evidence_block,
+            canonical_guidance_block=canonical_guidance_block,
         )
 
     def render_trajectory_analysis(
