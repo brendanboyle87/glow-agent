@@ -370,6 +370,7 @@ class LocalExplorer:
                 final_state=raw_state,
             )
             affordance_gain = persistent_affordance_gain + persistent_exit_gain
+            movement_only_action = self._is_movement_action(action)
             novel_object_tokens = (
                 extract_salient_nouns(
                     observation=raw_state.observation,
@@ -388,6 +389,9 @@ class LocalExplorer:
                 pre_step_states[-1].valid_actions,
                 raw_state.valid_actions,
             )
+            revealed_new_object = bool(novel_object_tokens) and (
+                not movement_only_action or affordance_gain > 0 or materially_new_actions
+            )
             current_state = self._annotate_branch_state(
                 raw_state,
                 history=action_cluster_history,
@@ -396,8 +400,8 @@ class LocalExplorer:
                 inventory_changed=self._normalize_text(raw_state.inventory_text)
                 != self._normalize_text(pre_step_states[-1].inventory_text),
                 affordance_gain=affordance_gain,
-                novel_object_count=len(novel_object_tokens),
-                movement_only_action=self._is_movement_action(action),
+                novel_object_count=len(novel_object_tokens) if revealed_new_object else 0,
+                movement_only_action=movement_only_action,
                 materially_new_actions=materially_new_actions,
             )
             action_cluster_history.record_attempt(
@@ -420,7 +424,7 @@ class LocalExplorer:
                     final_state=current_state,
                 ) > 0
                 or self._count_new_exit_actions(base_state=pre_step_states[-1], final_state=current_state) > 0,
-                revealed_new_object=bool(novel_object_tokens),
+                revealed_new_object=revealed_new_object,
                 target_tokens=extract_salient_nouns(
                     observation="",
                     inventory_text="",
@@ -428,7 +432,7 @@ class LocalExplorer:
                     inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
                 )
                 or action_target_tokens(action, self.action_generator.config.policy.inverse_action_pairs),
-                movement_only_action=self._is_movement_action(action),
+                movement_only_action=movement_only_action,
                 inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
             )
             action_cluster_history.observe_state_nouns(
@@ -469,7 +473,7 @@ class LocalExplorer:
                     "score_delta": current_state.score - pre_step_states[-1].score,
                     "inventory_gained": inventory_gained,
                     "inventory_lost": inventory_lost,
-                    "revealed_new_object": bool(novel_object_tokens),
+                    "revealed_new_object": revealed_new_object,
                     "persistent_affordance_gain": persistent_affordance_gain,
                     "persistent_exit_gain_count": persistent_exit_gain,
                     "loop_detected": loop_result.loop_detected,
@@ -592,7 +596,6 @@ class LocalExplorer:
             score_change=score_change,
             persistent_inventory_gain_count=persistent_inventory_gain_count,
             persistent_affordance_gain=persistent_affordance_gain,
-            novel_object_count=novel_object_count,
             movement_action_ratio=movement_action_ratio,
         )
         if (
@@ -1121,7 +1124,6 @@ class LocalExplorer:
         score_change: int,
         persistent_inventory_gain_count: int,
         persistent_affordance_gain: int,
-        novel_object_count: int,
         movement_action_ratio: float,
     ) -> bool:
         """Return whether a branch was mostly movement without durable gains."""
@@ -1132,7 +1134,6 @@ class LocalExplorer:
             and score_change <= 0
             and persistent_inventory_gain_count <= 0
             and persistent_affordance_gain <= 0
-            and novel_object_count <= 0
         )
 
     def _branch_is_movement_commit_reject(self, branch: LocalBranchOutcome) -> bool:
@@ -1142,7 +1143,6 @@ class LocalExplorer:
             score_change=branch.score_change,
             persistent_inventory_gain_count=branch.persistent_inventory_gain_count,
             persistent_affordance_gain=branch.persistent_affordance_gain,
-            novel_object_count=branch.novel_object_count,
             movement_action_ratio=branch.movement_action_ratio,
         )
 

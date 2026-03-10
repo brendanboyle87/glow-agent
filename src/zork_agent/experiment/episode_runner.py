@@ -374,6 +374,10 @@ class EpisodeRunner:
                     final_state=raw_state,
                 )
                 affordance_gain = persistent_affordance_gain + persistent_exit_gain_count
+                movement_only_action = is_movement_action(
+                    chosen_action,
+                    self.config.policy.inverse_action_pairs,
+                )
                 novel_object_tokens = (
                     extract_salient_nouns(
                         observation=raw_state.observation,
@@ -403,6 +407,9 @@ class EpisodeRunner:
                     pre_step_state.valid_actions,
                     raw_state.valid_actions,
                 )
+                revealed_new_object = bool(novel_object_tokens) and (
+                    not movement_only_action or affordance_gain > 0 or materially_new_actions
+                )
                 next_state = self._annotate_state(
                     raw_state,
                     episode_id=generated_episode_id,
@@ -411,11 +418,8 @@ class EpisodeRunner:
                     previous_state=pre_step_state,
                     inventory_changed=inventory_changed,
                     affordance_gain=affordance_gain,
-                    novel_object_count=len(novel_object_tokens),
-                    movement_only_action=is_movement_action(
-                        chosen_action,
-                        self.config.policy.inverse_action_pairs,
-                    ),
+                    novel_object_count=len(novel_object_tokens) if revealed_new_object else 0,
+                    movement_only_action=movement_only_action,
                     materially_new_actions=materially_new_actions,
                 )
                 action_cluster_history.record_attempt(
@@ -433,15 +437,12 @@ class EpisodeRunner:
                         self._normalize_text(candidate) for candidate in pre_step_state.valid_actions
                     },
                     valid_actions_improved=affordance_gain > 0,
-                    revealed_new_object=bool(novel_object_tokens),
+                    revealed_new_object=revealed_new_object,
                     target_tokens=action_target_tokens(
                         chosen_action,
                         self.config.policy.inverse_action_pairs,
                     ),
-                    movement_only_action=is_movement_action(
-                        chosen_action,
-                        self.config.policy.inverse_action_pairs,
-                    ),
+                    movement_only_action=movement_only_action,
                     inverse_pairs=self.config.policy.inverse_action_pairs,
                 )
                 loop_result = evaluate_reversible_action_loop(
@@ -503,7 +504,7 @@ class EpisodeRunner:
                         "persistent_exit_gain_count": persistent_exit_gain_count,
                         "inventory_gained": inventory_gained,
                         "inventory_lost": inventory_lost,
-                        "revealed_new_object": bool(novel_object_tokens),
+                        "revealed_new_object": revealed_new_object,
                         "durable_progress": False,
                         "selected_frontier_state": selected_entry.state_id if selected_entry is not None else None,
                         "selected_frontier_reason": last_selection_result.reason if last_selection_result is not None else "",
@@ -571,8 +572,8 @@ class EpisodeRunner:
                     score_gain=next_state.score - pre_step_state.score,
                     inventory_gained=inventory_gained,
                     affordance_gain=affordance_gain,
-                    novel_object_count=len(novel_object_tokens),
-                    movement_only_action=movement_result.movement_only_action,
+                    novel_object_count=len(novel_object_tokens) if revealed_new_object else 0,
+                    movement_only_action=movement_only_action,
                 )
                 step.metadata["durable_progress"] = durable_progress
 
