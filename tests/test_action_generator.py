@@ -254,8 +254,8 @@ def test_action_generator_does_not_penalize_inverse_candidate_after_real_gain(tm
     )
 
     assert result.reranked_by_loop_penalty is False
-    assert [candidate.action for candidate in result.candidates] == ["drop egg", "inventory"]
-    assert result.candidates[0].loop_penalty == 0.0
+    drop_egg = next(candidate for candidate in result.candidates if candidate.action == "drop egg")
+    assert drop_egg.loop_penalty == 0.0
 
 
 def test_action_generator_prefers_take_leaflet_over_repeated_close_mailbox_with_directions_present(
@@ -804,6 +804,54 @@ def test_action_generator_penalizes_jump_against_plain_exits(tmp_path: Path) -> 
     assert jump_candidate.features.verb_family == "other"
     assert "ungrounded_other_action" in jump_candidate.ranking_reason
     assert jump_candidate.selection_score < 0.0
+
+
+def test_action_generator_demotes_shake_egg_after_the_scene_already_scored(tmp_path: Path) -> None:
+    """Odd noun-targeted `other` verbs should not outrank exits after the scene already paid off."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. shake egg\n2. down\n3. take nest"),
+    )
+    history = ActionClusterHistory(cluster_label="egg-cluster")
+    history.observe_state_nouns(
+        observation="A jeweled egg rests in a nest.",
+        valid_actions=["take egg", "take nest", "down"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="take egg",
+        score_changed=True,
+        inventory_changed=True,
+        inventory_gained=True,
+        observation_changed=True,
+        valid_actions_changed=False,
+        target_tokens={"egg"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="You are in the tree beside the nest.",
+        inventory_text="You are carrying a jeweled egg and a leaflet.",
+        valid_actions=["shake egg", "down", "take nest", "close nest"],
+        score=5,
+        moves=10,
+        candidate_count=4,
+        recent_actions=["take egg"],
+        state_action_history=history,
+        supported_try_actions=["shake egg", "take nest"],
+        supported_reflection_objects=["egg", "nest"],
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions.index("down") < ranked_actions.index("shake egg")
+    shake_candidate = next(candidate for candidate in result.candidates if candidate.action == "shake egg")
+    assert shake_candidate.features is not None
+    assert shake_candidate.features.verb_family == "other"
+    assert "ungrounded_other_action" in shake_candidate.ranking_reason
 
 
 def test_action_generator_top_k_keeps_object_centric_action_when_salient_objects_exist(

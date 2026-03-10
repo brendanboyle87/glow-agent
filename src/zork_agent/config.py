@@ -164,7 +164,7 @@ class PolicyConfig(StrictModel):
     movement_repeat_penalty: float = 1.25
     same_cluster_movement_penalty: float = 1.0
     reflection_supported_avoid_penalty: float = 1.25
-    other_action_penalty: float = 1.25
+    other_action_penalty: float = 2.0
     escape_mode_other_action_penalty: float = 1.5
     action_untried_bonus: float = 2.0
     action_new_noun_bonus: float = 1.0

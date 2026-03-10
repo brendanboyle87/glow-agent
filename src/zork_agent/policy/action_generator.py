@@ -1617,14 +1617,10 @@ class ActionGenerator:
 
         if features.verb_family != "other":
             return False
-        if features.noun_targets:
-            return False
         if self._has_strong_prior_gain(features):
             return False
         if (
-            features.matches_supported_try_action
-            or features.touches_supported_reflection_object
-            or features.prior_success_for_exact_action
+            features.prior_success_for_exact_action
             or features.prior_success_for_verb_family
         ):
             return False
