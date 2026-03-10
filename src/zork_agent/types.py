@@ -840,6 +840,28 @@ def extract_salient_nouns(
     return nouns
 
 
+def inventory_item_tokens(
+    inventory_text: str,
+    inverse_pairs: Mapping[str, str] | None = None,
+) -> set[str]:
+    """Extract lightweight inventory item tokens, ignoring empty-inventory boilerplate."""
+
+    normalized_inventory = normalize_parser_action(inventory_text)
+    if not normalized_inventory:
+        return set()
+    if any(
+        marker in normalized_inventory
+        for marker in ("inventory empty", "empty-handed", "empty handed", "inventory unavailable")
+    ):
+        return set()
+    return extract_salient_nouns(
+        observation="",
+        inventory_text=inventory_text,
+        valid_actions=[],
+        inverse_pairs=inverse_pairs,
+    )
+
+
 def action_target_tokens(
     action: str,
     inverse_pairs: Mapping[str, str] | None = None,
@@ -986,14 +1008,14 @@ def derive_state_cluster_id(
     if "west of a white house" in normalized_observation or "west of house" in normalized_observation:
         return "region:house-field"
 
-    salient_tokens = extract_salient_nouns(
+    observation_tokens = extract_salient_nouns(
         observation=observation,
-        inventory_text=inventory_text,
+        inventory_text="",
         valid_actions=[],
         inverse_pairs=inverse_pairs,
     )
     for token in _STATE_CLUSTER_PRIORITY_TOKENS:
-        if token in salient_tokens:
+        if token in observation_tokens:
             return f"region:{token}"
 
     valid_action_targets = {
@@ -1006,7 +1028,12 @@ def derive_state_cluster_id(
         if token in valid_action_targets:
             return f"region:{token}"
 
-    stable_tokens = sorted((salient_tokens | valid_action_targets) - _ROOM_TEXT_ONLY_TOKENS)
+    inventory_tokens = inventory_item_tokens(inventory_text, inverse_pairs)
+    for token in _STATE_CLUSTER_PRIORITY_TOKENS:
+        if token in inventory_tokens and token not in {"leaflet", "lamp"}:
+            return f"region:{token}"
+
+    stable_tokens = sorted((observation_tokens | valid_action_targets | inventory_tokens) - _ROOM_TEXT_ONLY_TOKENS)
     if stable_tokens:
         return "region:" + "|".join(stable_tokens[:3])
     if summary_text.strip():
@@ -1037,19 +1064,27 @@ def compute_region_novelty_score(
 ) -> float:
     """Return a lightweight novelty score for a state cluster revisit."""
 
-    if score_gain > 0 or inventory_changed or affordance_gain > 0:
+    if score_gain > 0:
         return 1.0
-    if novel_object_count > 0 or materially_new_actions:
+    if inventory_changed:
+        return 0.85
+    if affordance_gain > 0 and (novel_object_count > 0 or materially_new_actions):
         return 0.7
+    if affordance_gain > 0 and cluster_visit_count <= 1 and not observation_seen_before:
+        return 0.45
+    if novel_object_count > 0 or materially_new_actions:
+        return 0.45
     if cluster_visit_count <= 1 and not observation_seen_before:
-        return 0.35
+        return 0.25
     if movement_only_action:
         if cluster_visit_count <= 1 and not observation_seen_before:
-            return 0.2
+            return 0.15
         if cluster_visit_count == 2:
-            return 0.1
-        return 0.05
-    return 0.15 if not observation_seen_before else 0.05
+            return 0.05
+        return 0.02
+    if cluster_visit_count == 2:
+        return 0.08 if not observation_seen_before else 0.04
+    return 0.05 if not observation_seen_before else 0.02
 
 
 def derive_state_family_key(
@@ -1103,30 +1138,33 @@ class ActionAttemptStats:
     attempts: int = 0
     score_change_count: int = 0
     inventory_change_count: int = 0
+    inventory_gain_count: int = 0
+    inventory_loss_count: int = 0
     observation_change_count: int = 0
     valid_actions_change_count: int = 0
+    valid_actions_improvement_count: int = 0
+    revealed_object_count: int = 0
+    durable_gain_count: int = 0
     no_gain_count: int = 0
+    no_durable_gain_count: int = 0
 
     @property
     def had_any_gain(self) -> bool:
         """Return whether the action ever produced an observable gain signal."""
 
-        return any(
-            (
-                self.score_change_count,
-                self.inventory_change_count,
-                self.observation_change_count,
-                self.valid_actions_change_count,
-            )
-        )
+        return self.durable_gain_count > 0
 
     def record_attempt(
         self,
         *,
         score_changed: bool,
         inventory_changed: bool,
+        inventory_gained: bool = False,
+        inventory_lost: bool = False,
         observation_changed: bool,
         valid_actions_changed: bool,
+        valid_actions_improved: bool = False,
+        revealed_new_object: bool = False,
     ) -> None:
         """Accumulate one observed action outcome."""
 
@@ -1135,12 +1173,25 @@ class ActionAttemptStats:
             self.score_change_count += 1
         if inventory_changed:
             self.inventory_change_count += 1
+        if inventory_gained:
+            self.inventory_gain_count += 1
+        if inventory_lost:
+            self.inventory_loss_count += 1
         if observation_changed:
             self.observation_change_count += 1
         if valid_actions_changed:
             self.valid_actions_change_count += 1
+        if valid_actions_improved:
+            self.valid_actions_improvement_count += 1
+        if revealed_new_object:
+            self.revealed_object_count += 1
         if not any((score_changed, inventory_changed, observation_changed, valid_actions_changed)):
             self.no_gain_count += 1
+        durable_progress = any((score_changed, inventory_gained, valid_actions_improved, revealed_new_object))
+        if durable_progress:
+            self.durable_gain_count += 1
+        else:
+            self.no_durable_gain_count += 1
 
 
 @dataclass(slots=True)
@@ -1157,7 +1208,10 @@ class ActionClusterHistory:
     current_state_cluster_id: str = ""
     cluster_visit_counts: dict[str, int] = field(default_factory=dict)
     cluster_observation_signatures: dict[str, set[str]] = field(default_factory=dict)
+    object_family_no_progress_counts: dict[str, int] = field(default_factory=dict)
     recent_cluster_sequence: list[str] = field(default_factory=list)
+    no_progress_steps: int = 0
+    movement_no_progress_steps: int = 0
 
     def stats_for(self, action: str) -> ActionAttemptStats:
         """Return mutable stats for an action within this cluster."""
@@ -1173,17 +1227,41 @@ class ActionClusterHistory:
         action: str,
         score_changed: bool,
         inventory_changed: bool,
+        inventory_gained: bool = False,
+        inventory_lost: bool = False,
         observation_changed: bool,
         valid_actions_changed: bool,
+        valid_actions_improved: bool = False,
+        revealed_new_object: bool = False,
+        target_tokens: set[str] | None = None,
+        movement_only_action: bool = False,
     ) -> None:
         """Record one attempted action and its observed effect."""
 
         self.stats_for(action).record_attempt(
             score_changed=score_changed,
             inventory_changed=inventory_changed,
+            inventory_gained=inventory_gained,
+            inventory_lost=inventory_lost,
             observation_changed=observation_changed,
             valid_actions_changed=valid_actions_changed,
+            valid_actions_improved=valid_actions_improved,
+            revealed_new_object=revealed_new_object,
         )
+        durable_progress = any((score_changed, inventory_gained, valid_actions_improved, revealed_new_object))
+        normalized_targets = {normalize_parser_action(token) for token in (target_tokens or set()) if normalize_parser_action(token)}
+        if durable_progress:
+            self.no_progress_steps = 0
+            if movement_only_action:
+                self.movement_no_progress_steps = 0
+            for token in normalized_targets:
+                self.object_family_no_progress_counts.pop(token, None)
+        else:
+            self.no_progress_steps += 1
+            if movement_only_action:
+                self.movement_no_progress_steps += 1
+            for token in normalized_targets:
+                self.object_family_no_progress_counts[token] = self.object_family_no_progress_counts.get(token, 0) + 1
 
     def observe_state_nouns(
         self,
@@ -1227,6 +1305,25 @@ class ActionClusterHistory:
         if not target_cluster:
             return 0
         return self.cluster_visit_counts.get(target_cluster, 0)
+
+    def family_no_progress_count(self, token: str) -> int:
+        """Return the no-progress count for a local object/action family token."""
+
+        normalized = normalize_parser_action(token)
+        if not normalized:
+            return 0
+        return self.object_family_no_progress_counts.get(normalized, 0)
+
+    def exhausted_families(self, threshold: int) -> set[str]:
+        """Return local object families that have exceeded the no-progress threshold."""
+
+        if threshold <= 0:
+            return set()
+        return {
+            family
+            for family, count in self.object_family_no_progress_counts.items()
+            if count >= threshold
+        }
 
 
 class ReplayDivergenceReason(str, Enum):
@@ -1555,6 +1652,7 @@ class BranchTerminationReason(str, Enum):
     TERMINATED = "terminated"
     NO_ACTIONS = "no_actions"
     RESTORE_FAILED = "restore_failed"
+    LOOP_ABORTED = "loop_aborted"
 
 
 @dataclass(slots=True)
@@ -1572,7 +1670,14 @@ class LocalBranchOutcome:
     new_room_or_object_detected: bool = False
     appears_stuck: bool = False
     inventory_changed: bool = False
+    persistent_inventory_gain_count: int = 0
+    persistent_inventory_loss_count: int = 0
     new_affordance_count: int = 0
+    persistent_affordance_gain: int = 0
+    persistent_exit_gain_count: int = 0
+    ended_in_same_cluster: bool = False
+    durable_progress: bool = False
+    exhausted_family_count: int = 0
     affordance_gain: int = 0
     new_room_location_signal: bool = False
     landmark_gain: int = 0

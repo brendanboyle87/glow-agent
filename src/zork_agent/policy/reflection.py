@@ -399,45 +399,43 @@ class ReflectionEngine:
         avoid_branches = [
             branch
             for branch in local_exploration.branches
-            if branch.appears_stuck or branch.loop_event_count > 0 or branch.oscillation_penalty_total > 0.0
+            if (
+                branch.appears_stuck
+                or branch.loop_event_count > 0
+                or branch.oscillation_penalty_total > 0.0
+                or branch.movement_penalty_total > 0.0
+                or (branch.exhausted_family_count > 0 and not branch.durable_progress)
+            )
         ]
 
-        try_actions = self._dedupe_preserve_order(
-            action
+        productive_events = [
+            event
             for branch in sorted(productive_branches, key=self._branch_sort_key, reverse=True)
-            for action in branch.actions_taken
-            if action
+            for event in self._productive_branch_events(branch)
+        ]
+        try_actions = self._dedupe_preserve_order(
+            str(event["action"])
+            for event in productive_events
+            if event.get("action")
         )[:4]
+        if not try_actions:
+            try_actions = self._dedupe_preserve_order(
+                action
+                for branch in sorted(productive_branches, key=self._branch_sort_key, reverse=True)
+                for action in branch.actions_taken
+                if action
+            )[:4]
         productive_action_keys = {normalize_parser_action(action) for action in try_actions}
         avoid_action_counts: Counter[str] = Counter()
         avoid_action_labels: dict[str, str] = {}
         for branch in avoid_branches:
-            loop_results = branch.metadata.get("loop_results", [])
-            movement_results = branch.metadata.get("movement_results", [])
-            branch_low_value = (
-                branch.score_change <= 0
-                and not branch.inventory_changed
-                and branch.affordance_gain <= 0
-            )
-            for index, action in enumerate(branch.actions_taken):
+            for event in self._avoid_branch_events(branch):
+                action = str(event.get("action", ""))
                 normalized = normalize_parser_action(action)
                 if not normalized or normalized in productive_action_keys:
                     continue
-                loop_flag = (
-                    bool(loop_results[index].get("loop_detected", False))
-                    if index < len(loop_results) and isinstance(loop_results[index], dict)
-                    else False
-                )
-                movement_flag = False
-                if index < len(movement_results) and isinstance(movement_results[index], dict):
-                    movement_flag = bool(
-                        float(movement_results[index].get("total_penalty", 0.0)) > 0.0
-                        or int(movement_results[index].get("movement_repeat_count", 0)) > 0
-                    )
-                repeated_low_value = branch.actions_taken.count(action) > 1 and branch_low_value
-                if loop_flag or movement_flag or repeated_low_value:
-                    avoid_action_counts[normalized] += 1
-                    avoid_action_labels.setdefault(normalized, action)
+                avoid_action_counts[normalized] += 1
+                avoid_action_labels.setdefault(normalized, action)
         avoid_actions = [
             avoid_action_labels[key]
             for key, count in avoid_action_counts.items()
@@ -478,7 +476,15 @@ class ReflectionEngine:
         for step in steps:
             score_delta = step.score - previous_score
             inventory_changed = normalize_parser_action(step.inventory_text) != normalize_parser_action(previous_inventory)
-            had_progress = step.reward > 0.0 or score_delta > 0 or inventory_changed or step.affordance_gain > 0
+            had_progress = bool(
+                step.metadata.get("durable_progress", False)
+                or step.reward > 0.0
+                or score_delta > 0
+                or bool(step.metadata.get("inventory_gained", False))
+                or int(step.metadata.get("persistent_affordance_gain", 0)) > 0
+                or int(step.metadata.get("persistent_exit_gain_count", 0)) > 0
+                or bool(step.metadata.get("revealed_new_object", False))
+            )
             if had_progress:
                 productive_steps.append(step)
             if step.loop_penalty > 0.0 or step.movement_penalty > 0.0:
@@ -528,13 +534,103 @@ class ReflectionEngine:
             (
                 branch.score_change > 0,
                 branch.total_reward > 0.0,
-                branch.inventory_changed,
-                branch.affordance_gain > 0,
-                branch.new_room_location_signal,
-                branch.novel_object_count > 0,
-                branch.new_room_or_object_detected,
+                branch.persistent_inventory_gain_count > 0,
+                branch.persistent_affordance_gain > 0,
+                branch.persistent_exit_gain_count > 0,
             )
         )
+
+    def _productive_branch_events(self, branch: LocalBranchOutcome) -> list[dict[str, object]]:
+        """Return branch action events that reflect durable forward progress."""
+
+        events = branch.metadata.get("action_events", [])
+        if not isinstance(events, list):
+            return []
+        productive_events: list[dict[str, object]] = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if (
+                int(event.get("score_delta", 0)) > 0
+                or bool(event.get("inventory_gained", False))
+                or int(event.get("persistent_affordance_gain", 0)) > 0
+                or int(event.get("persistent_exit_gain_count", 0)) > 0
+                or bool(event.get("revealed_new_object", False))
+            ):
+                productive_events.append(event)
+        return productive_events
+
+    def _avoid_branch_events(self, branch: LocalBranchOutcome) -> list[dict[str, object]]:
+        """Return branch action events that clearly look low-value or loop-like."""
+
+        events = branch.metadata.get("action_events", [])
+        if not isinstance(events, list) or not events:
+            return self._synthetic_avoid_branch_events(branch)
+        avoid_events: list[dict[str, object]] = []
+        action_counts = Counter(
+            normalize_parser_action(str(event.get("action", "")))
+            for event in events
+            if isinstance(event, dict) and str(event.get("action", "")).strip()
+        )
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            action = str(event.get("action", ""))
+            normalized = normalize_parser_action(action)
+            if not normalized:
+                continue
+            is_productive = (
+                int(event.get("score_delta", 0)) > 0
+                or bool(event.get("inventory_gained", False))
+                or int(event.get("persistent_affordance_gain", 0)) > 0
+                or int(event.get("persistent_exit_gain_count", 0)) > 0
+                or bool(event.get("revealed_new_object", False))
+            )
+            if is_productive:
+                continue
+            if (
+                bool(event.get("loop_detected", False))
+                or float(event.get("loop_penalty", 0.0)) > 0.0
+                or float(event.get("movement_penalty", 0.0)) > 0.0
+                or action_counts[normalized] > 1
+            ):
+                avoid_events.append(event)
+        return avoid_events
+
+    def _synthetic_avoid_branch_events(self, branch: LocalBranchOutcome) -> list[dict[str, object]]:
+        """Fallback avoid-event synthesis for fixtures or older branches without per-step events."""
+
+        loop_results = branch.metadata.get("loop_results", [])
+        movement_results = branch.metadata.get("movement_results", [])
+        branch_low_value = (
+            branch.score_change <= 0
+            and branch.persistent_inventory_gain_count <= 0
+            and branch.persistent_affordance_gain <= 0
+            and branch.persistent_exit_gain_count <= 0
+        )
+        events: list[dict[str, object]] = []
+        for index, action in enumerate(branch.actions_taken):
+            loop_flag = (
+                bool(loop_results[index].get("loop_detected", False))
+                if index < len(loop_results) and isinstance(loop_results[index], dict)
+                else False
+            )
+            movement_flag = False
+            if index < len(movement_results) and isinstance(movement_results[index], dict):
+                movement_flag = bool(
+                    float(movement_results[index].get("total_penalty", 0.0)) > 0.0
+                    or int(movement_results[index].get("movement_repeat_count", 0)) > 0
+                )
+            repeated_low_value = branch.actions_taken.count(action) > 1 and branch_low_value
+            if loop_flag or movement_flag or repeated_low_value:
+                events.append(
+                    {
+                        "action": action,
+                        "loop_detected": loop_flag,
+                        "movement_penalty": 1.0 if movement_flag else 0.0,
+                    }
+                )
+        return events
 
     def _collect_branch_objects(self, branches: list[LocalBranchOutcome]) -> list[str]:
         """Collect salient object tokens from productive branches."""

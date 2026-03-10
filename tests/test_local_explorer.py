@@ -403,7 +403,7 @@ def test_local_explorer_allows_inventory_gain_branch_with_zero_score(tmp_path: P
     assert result.best_branch.actions_taken == ["take lamp"]
     assert result.best_branch.score_change == 0
     assert result.best_branch.inventory_changed is True
-    assert result.best_branch.new_affordance_count >= 1
+    assert result.best_branch.persistent_inventory_gain_count == 1
     assert result.best_branch.branch_progress_score > config.policy.branch_commit_min_progress_score
     assert result.branch_commit_allowed is True
 
@@ -444,4 +444,8 @@ def test_local_explorer_rejects_zero_score_movement_only_branch(tmp_path: Path) 
     assert result.best_branch.movement_penalty_total > 0.0
     assert result.best_branch.movement_only_action_count == 2
     assert result.branch_commit_allowed is False
-    assert "no score gain, inventory gain, or sufficient affordance gain" in result.commit_rejection_reason
+    assert (
+        "did not clear threshold" in result.commit_rejection_reason
+        or "no score gain, inventory gain, exit gain, or sufficient affordance gain"
+        in result.commit_rejection_reason
+    )

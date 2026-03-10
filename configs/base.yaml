@@ -52,9 +52,15 @@ policy:
   action_new_noun_bonus: 1.0
   action_new_noun_interaction_bonus: 1.25
   action_repeated_no_gain_penalty: 1.0
+  object_family_no_progress_threshold: 2
+  object_family_exhaustion_penalty: 2.0
+  escape_mode_exit_bonus: 1.5
+  discard_inventory_penalty: 2.0
   branch_progress_score_weight: 1.0
   branch_progress_inventory_weight: 1.0
+  branch_progress_inventory_loss_penalty: 1.25
   branch_progress_affordance_weight: 0.35
+  branch_progress_exit_weight: 1.0
   branch_progress_location_weight: 1.0
   branch_progress_object_weight: 0.25
   branch_progress_loop_reduction_weight: 0.5
@@ -62,6 +68,7 @@ policy:
   movement_progress_cap: 0.5
   min_affordance_gain_for_movement_commit: 1
   branch_commit_min_progress_score: 1.0
+  branch_fail_fast_penalty_threshold: 3.0
   frontier_loop_penalty_weight: 1.0
   frontier_movement_penalty_weight: 1.0
   frontier_room_text_only_penalty_weight: 0.75

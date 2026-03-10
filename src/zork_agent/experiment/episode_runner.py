@@ -36,9 +36,11 @@ from zork_agent.types import (
     derive_state_family_key,
     compute_region_novelty_score,
     derive_state_cluster_id,
+    action_target_tokens,
     evaluate_reversible_action_loop,
     evaluate_movement_action,
     extract_salient_nouns,
+    inventory_item_tokens,
     is_movement_action,
     valid_actions_materially_different,
 )
@@ -343,10 +345,15 @@ class EpisodeRunner:
                 transition = self.env.step(chosen_action)
                 total_reward += transition.reward
                 raw_state = transition.to_state()
-                affordance_gain = self._count_new_affordances(
+                persistent_affordance_gain = self._count_persistent_affordances(
                     base_state=pre_step_state,
                     final_state=raw_state,
                 )
+                persistent_exit_gain_count = self._count_new_exit_actions(
+                    base_state=pre_step_state,
+                    final_state=raw_state,
+                )
+                affordance_gain = persistent_affordance_gain + persistent_exit_gain_count
                 novel_object_tokens = (
                     extract_salient_nouns(
                         observation=raw_state.observation,
@@ -364,6 +371,14 @@ class EpisodeRunner:
                 inventory_changed = self._normalize_text(raw_state.inventory_text) != self._normalize_text(
                     pre_step_state.inventory_text
                 )
+                inventory_gained = self._count_inventory_gain(
+                    base_state=pre_step_state,
+                    final_state=raw_state,
+                ) > 0
+                inventory_lost = self._count_inventory_loss(
+                    base_state=pre_step_state,
+                    final_state=raw_state,
+                ) > 0
                 materially_new_actions = valid_actions_materially_different(
                     pre_step_state.valid_actions,
                     raw_state.valid_actions,
@@ -387,6 +402,8 @@ class EpisodeRunner:
                     action=chosen_action,
                     score_changed=next_state.score != pre_step_state.score,
                     inventory_changed=inventory_changed,
+                    inventory_gained=inventory_gained,
+                    inventory_lost=inventory_lost,
                     observation_changed=self._normalize_text(next_state.observation)
                     != self._normalize_text(pre_step_state.observation),
                     valid_actions_changed={
@@ -395,6 +412,16 @@ class EpisodeRunner:
                     != {
                         self._normalize_text(candidate) for candidate in pre_step_state.valid_actions
                     },
+                    valid_actions_improved=affordance_gain > 0,
+                    revealed_new_object=bool(novel_object_tokens),
+                    target_tokens=action_target_tokens(
+                        chosen_action,
+                        self.config.policy.inverse_action_pairs,
+                    ),
+                    movement_only_action=is_movement_action(
+                        chosen_action,
+                        self.config.policy.inverse_action_pairs,
+                    ),
                 )
                 loop_result = evaluate_reversible_action_loop(
                     action=chosen_action,
@@ -451,6 +478,17 @@ class EpisodeRunner:
                         "region_novelty_score": next_state.region_novelty_score,
                         "room_text_only_gain": room_text_only_gain,
                         "affordance_gain": affordance_gain,
+                        "persistent_affordance_gain": persistent_affordance_gain,
+                        "persistent_exit_gain_count": persistent_exit_gain_count,
+                        "inventory_gained": inventory_gained,
+                        "inventory_lost": inventory_lost,
+                        "revealed_new_object": bool(novel_object_tokens),
+                        "durable_progress": bool(
+                            next_state.score > pre_step_state.score
+                            or inventory_gained
+                            or affordance_gain > 0
+                            or bool(novel_object_tokens)
+                        ),
                         "selected_frontier_state": selected_entry.state_id if selected_entry is not None else None,
                         "selected_frontier_reason": last_selection_result.reason if last_selection_result is not None else "",
                         "selection_mode": (
@@ -533,12 +571,35 @@ class EpisodeRunner:
                             "episode_step_index": episode_step_index,
                             "action_source": action_source,
                             "loop_no_progress": loop_result.no_progress,
+                            "persistent_affordance_gain": persistent_affordance_gain,
+                            "persistent_exit_gain_count": persistent_exit_gain_count,
+                            "inventory_gained": inventory_gained,
+                            "inventory_lost": inventory_lost,
+                            "revealed_new_object": bool(novel_object_tokens),
                         },
                     )
 
                 episode_action_history.append(chosen_action)
                 episode_state_history.append(next_state)
                 episode_loop_results.append(loop_result)
+                if pending_branch_actions and action_source.startswith("best_local_branch"):
+                    exhausted_families = action_cluster_history.exhausted_families(
+                        self.config.policy.object_family_no_progress_threshold
+                    )
+                    if (
+                        exhausted_families
+                        and next_state.score <= pre_step_state.score
+                        and not inventory_gained
+                        and affordance_gain <= 0
+                        and movement_result.total_penalty + loop_result.total_penalty > 0.0
+                    ):
+                        self.logger.info(
+                            "Discarding remaining local branch plan after exhausted-family no-progress step. "
+                            "action=%s exhausted_families=%s",
+                            chosen_action,
+                            sorted(exhausted_families),
+                        )
+                        pending_branch_actions = []
                 action_cluster_history.observe_state_nouns(
                     observation=next_state.observation,
                     inventory_text=next_state.inventory_text,
@@ -921,6 +982,65 @@ class EpisodeRunner:
             if self._normalize_text(action) and self._normalize_text(action) not in base_actions
         }
         return min(len(discovered_actions), 4)
+
+    def _count_persistent_affordances(self, *, base_state: TextGameState, final_state: TextGameState) -> int:
+        """Count end-state affordances that expose genuinely new targets or interactions."""
+
+        base_targets = {
+            token
+            for action in base_state.valid_actions
+            if not is_movement_action(action, self.config.policy.inverse_action_pairs)
+            for token in action_target_tokens(action, self.config.policy.inverse_action_pairs)
+        }
+        discovered_actions = 0
+        for action in final_state.valid_actions:
+            if is_movement_action(action, self.config.policy.inverse_action_pairs):
+                continue
+            targets = action_target_tokens(action, self.config.policy.inverse_action_pairs)
+            if targets - base_targets:
+                discovered_actions += 1
+        return min(discovered_actions, 4)
+
+    def _count_new_exit_actions(self, *, base_state: TextGameState, final_state: TextGameState) -> int:
+        """Count newly available movement exits at the end state."""
+
+        base_exits = {
+            self._normalize_text(action)
+            for action in base_state.valid_actions
+            if is_movement_action(action, self.config.policy.inverse_action_pairs)
+        }
+        final_exits = {
+            self._normalize_text(action)
+            for action in final_state.valid_actions
+            if is_movement_action(action, self.config.policy.inverse_action_pairs)
+        }
+        return max(0, len(final_exits - base_exits))
+
+    def _count_inventory_gain(self, *, base_state: TextGameState, final_state: TextGameState) -> int:
+        """Count durable inventory items gained by the end state."""
+
+        base_items = inventory_item_tokens(
+            base_state.inventory_text,
+            inverse_pairs=self.config.policy.inverse_action_pairs,
+        )
+        final_items = inventory_item_tokens(
+            final_state.inventory_text,
+            inverse_pairs=self.config.policy.inverse_action_pairs,
+        )
+        return max(0, len(final_items - base_items))
+
+    def _count_inventory_loss(self, *, base_state: TextGameState, final_state: TextGameState) -> int:
+        """Count inventory items lost by the end state."""
+
+        base_items = inventory_item_tokens(
+            base_state.inventory_text,
+            inverse_pairs=self.config.policy.inverse_action_pairs,
+        )
+        final_items = inventory_item_tokens(
+            final_state.inventory_text,
+            inverse_pairs=self.config.policy.inverse_action_pairs,
+        )
+        return max(0, len(base_items - final_items))
 
     def _room_text_only_gain(
         self,

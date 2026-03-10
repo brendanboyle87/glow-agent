@@ -27,6 +27,7 @@ from zork_agent.types import (
     count_repeated_movement_actions,
     estimate_candidate_loop_penalty,
     extract_salient_nouns,
+    inventory_item_tokens,
     is_movement_action,
     movement_actions_are_cycle,
     normalize_parser_action,
@@ -468,9 +469,18 @@ class ActionGenerator:
             valid_actions=[],
             inverse_pairs=self.config.policy.inverse_action_pairs,
         )
+        inventory_tokens = inventory_item_tokens(
+            inventory_text,
+            inverse_pairs=self.config.policy.inverse_action_pairs,
+        )
         known_nouns = set(state_action_history.seen_nouns) if state_action_history is not None else set()
         new_visible_nouns = visible_nouns - known_nouns
         apply_affordance_heuristics = bool(valid_actions and state_action_history is not None)
+        exhausted_families = (
+            state_action_history.exhausted_families(self.config.policy.object_family_no_progress_threshold)
+            if state_action_history is not None
+            else set()
+        )
         if apply_affordance_heuristics:
             self._augment_candidates_with_valid_actions(
                 result,
@@ -478,6 +488,8 @@ class ActionGenerator:
                 candidate_count=candidate_count,
                 visible_nouns=visible_nouns,
                 new_visible_nouns=new_visible_nouns,
+                inventory_tokens=inventory_tokens,
+                exhausted_families=exhausted_families,
                 state_action_history=state_action_history,
             )
 
@@ -485,6 +497,10 @@ class ActionGenerator:
         affordance_reranked = False
         movement_reranked = False
         for index, candidate in enumerate(result.candidates):
+            candidate.movement_only_action = is_movement_action(
+                candidate.action,
+                self.config.policy.inverse_action_pairs,
+            )
             loop_penalty, loop_reason = estimate_candidate_loop_penalty(
                 candidate_action=candidate.action,
                 recent_actions=recent_actions,
@@ -500,15 +516,13 @@ class ActionGenerator:
                     state_action_history=state_action_history,
                     visible_nouns=visible_nouns,
                     new_visible_nouns=new_visible_nouns,
+                    inventory_tokens=inventory_tokens,
+                    exhausted_families=exhausted_families,
                 )
             else:
                 heuristic_bonus = 0.0
                 heuristic_penalty = 0.0
                 ranking_reason = ""
-            candidate.movement_only_action = is_movement_action(
-                candidate.action,
-                self.config.policy.inverse_action_pairs,
-            )
             candidate.loop_penalty = loop_penalty
             candidate.loop_penalty_reason = loop_reason
             candidate.heuristic_bonus = heuristic_bonus
@@ -535,6 +549,7 @@ class ActionGenerator:
                 visible_nouns=visible_nouns,
                 new_visible_nouns=new_visible_nouns,
                 preferred_object_actions_exist=preferred_object_actions_exist,
+                exhausted_families=exhausted_families,
             )
             candidate.movement_penalty = movement_penalty
             candidate.movement_penalty_reason = movement_reason
@@ -575,6 +590,8 @@ class ActionGenerator:
         candidate_count: int,
         visible_nouns: set[str],
         new_visible_nouns: set[str],
+        inventory_tokens: set[str],
+        exhausted_families: set[str],
         state_action_history: ActionClusterHistory | None,
     ) -> None:
         """Ensure reranking can consider available Jericho valid actions."""
@@ -594,12 +611,18 @@ class ActionGenerator:
         candidate_slots = max(1, candidate_count - len(result.candidates))
         scored_missing_actions: list[tuple[float, str]] = []
         for action in missing_actions:
-            preview_candidate = ActionProposal(action=action, source="valid_action_fallback")
+            preview_candidate = ActionProposal(
+                action=action,
+                source="valid_action_fallback",
+                movement_only_action=is_movement_action(action, self.config.policy.inverse_action_pairs),
+            )
             bonus, penalty, _reason = self._action_affordance_score(
                 candidate=preview_candidate,
                 state_action_history=state_action_history,
                 visible_nouns=visible_nouns,
                 new_visible_nouns=new_visible_nouns,
+                inventory_tokens=inventory_tokens,
+                exhausted_families=exhausted_families,
             )
             scored_missing_actions.append((bonus - penalty, action))
 
@@ -623,6 +646,8 @@ class ActionGenerator:
         state_action_history: ActionClusterHistory | None,
         visible_nouns: set[str],
         new_visible_nouns: set[str],
+        inventory_tokens: set[str],
+        exhausted_families: set[str],
     ) -> tuple[float, float, str]:
         """Score one candidate for salient affordances and stale-action penalties."""
 
@@ -630,6 +655,7 @@ class ActionGenerator:
         penalty = 0.0
         reasons: list[str] = []
         normalized_action = normalize_parser_action(candidate.action)
+        verb, _obj = split_action_command(candidate.action, self.config.policy.inverse_action_pairs)
         attempt_stats = (
             state_action_history.action_stats.get(normalized_action)
             if state_action_history is not None
@@ -645,21 +671,32 @@ class ActionGenerator:
         if attempts == 0 and not is_generic_action:
             bonus += self.config.policy.action_untried_bonus
             reasons.append("untried_action")
-        elif attempt_stats is not None and not attempt_stats.had_any_gain and attempt_stats.no_gain_count > 0:
-            penalty += self.config.policy.action_repeated_no_gain_penalty * float(attempt_stats.no_gain_count)
-            reasons.append(f"repeated_no_gain={attempt_stats.no_gain_count}")
+        elif attempt_stats is not None and not attempt_stats.had_any_gain and attempt_stats.no_durable_gain_count > 0:
+            penalty += self.config.policy.action_repeated_no_gain_penalty * float(attempt_stats.no_durable_gain_count)
+            reasons.append(f"repeated_no_gain={attempt_stats.no_durable_gain_count}")
 
         touched_new_nouns = target_tokens & new_visible_nouns
         if touched_new_nouns:
             bonus += self.config.policy.action_new_noun_bonus * float(len(touched_new_nouns))
             reasons.append("new_noun:" + ",".join(sorted(touched_new_nouns)))
-            verb, _obj = split_action_command(candidate.action, self.config.policy.inverse_action_pairs)
             if verb in {"take", "get", "examine", "read", "open", "enter"} or normalized_action.startswith(("look in ", "look inside ")):
                 bonus += self.config.policy.action_new_noun_interaction_bonus
                 reasons.append(f"salient_interaction:{verb}")
         elif target_tokens and visible_nouns and target_tokens.isdisjoint(visible_nouns):
             penalty += 0.25
             reasons.append("nonvisible_target")
+
+        if exhausted_families and target_tokens & exhausted_families:
+            penalty += self.config.policy.object_family_exhaustion_penalty * float(len(target_tokens & exhausted_families))
+            reasons.append("exhausted_family:" + ",".join(sorted(target_tokens & exhausted_families)))
+
+        if verb in {"drop", "put"} and target_tokens & inventory_tokens:
+            penalty += self.config.policy.discard_inventory_penalty
+            reasons.append("discard_inventory")
+
+        if candidate.movement_only_action and exhausted_families and attempts == 0:
+            bonus += self.config.policy.escape_mode_exit_bonus
+            reasons.append("escape_exhausted_family")
 
         return bonus, penalty, ", ".join(reasons)
 
@@ -672,6 +709,7 @@ class ActionGenerator:
         visible_nouns: set[str],
         new_visible_nouns: set[str],
         preferred_object_actions_exist: bool,
+        exhausted_families: set[str],
     ) -> tuple[float, str]:
         """Penalize stale movement wandering when object affordances are available."""
 
@@ -682,7 +720,7 @@ class ActionGenerator:
         reasons: list[str] = []
         normalized_action = normalize_parser_action(candidate.action)
         attempt_stats = state_action_history.action_stats.get(normalized_action)
-        no_gain_attempts = attempt_stats.no_gain_count if attempt_stats is not None else 0
+        no_gain_attempts = attempt_stats.no_durable_gain_count if attempt_stats is not None else 0
         cluster_visits = state_action_history.cluster_visit_count()
         repeated_count = count_repeated_movement_actions(
             [*recent_actions, candidate.action],
@@ -711,11 +749,11 @@ class ActionGenerator:
             penalty += self.config.policy.same_region_repeat_penalty * float(cluster_visits - 1)
             reasons.append(f"same_region_repeat={cluster_visits}")
 
-        if preferred_object_actions_exist:
+        if preferred_object_actions_exist and not exhausted_families:
             penalty += self.config.policy.same_region_repeat_penalty
             reasons.append("object_affordance_available")
 
-        if new_visible_nouns:
+        if new_visible_nouns and not exhausted_families:
             penalty += self.config.policy.same_region_repeat_penalty
             reasons.append("new_object_available")
         elif not visible_nouns:

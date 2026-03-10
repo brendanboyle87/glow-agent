@@ -151,9 +151,15 @@ class PolicyConfig(StrictModel):
     action_new_noun_bonus: float = 1.0
     action_new_noun_interaction_bonus: float = 1.25
     action_repeated_no_gain_penalty: float = 1.0
+    object_family_no_progress_threshold: int = 2
+    object_family_exhaustion_penalty: float = 2.0
+    escape_mode_exit_bonus: float = 1.5
+    discard_inventory_penalty: float = 2.0
     branch_progress_score_weight: float = 1.0
     branch_progress_inventory_weight: float = 1.0
+    branch_progress_inventory_loss_penalty: float = 1.25
     branch_progress_affordance_weight: float = 0.35
+    branch_progress_exit_weight: float = 1.0
     branch_progress_location_weight: float = 1.0
     branch_progress_object_weight: float = 0.25
     branch_progress_loop_reduction_weight: float = 0.5
@@ -161,6 +167,7 @@ class PolicyConfig(StrictModel):
     movement_progress_cap: float = 0.5
     min_affordance_gain_for_movement_commit: int = 1
     branch_commit_min_progress_score: float = 1.0
+    branch_fail_fast_penalty_threshold: float = 3.0
     frontier_loop_penalty_weight: float = 1.0
     frontier_movement_penalty_weight: float = 1.0
     frontier_room_text_only_penalty_weight: float = 0.75
@@ -222,15 +229,21 @@ class PolicyConfig(StrictModel):
         "action_new_noun_bonus",
         "action_new_noun_interaction_bonus",
         "action_repeated_no_gain_penalty",
+        "object_family_exhaustion_penalty",
+        "escape_mode_exit_bonus",
+        "discard_inventory_penalty",
         "branch_progress_score_weight",
         "branch_progress_inventory_weight",
+        "branch_progress_inventory_loss_penalty",
         "branch_progress_affordance_weight",
+        "branch_progress_exit_weight",
         "branch_progress_location_weight",
         "branch_progress_object_weight",
         "branch_progress_loop_reduction_weight",
         "room_text_only_weight",
         "movement_progress_cap",
         "branch_commit_min_progress_score",
+        "branch_fail_fast_penalty_threshold",
         "frontier_loop_penalty_weight",
         "frontier_movement_penalty_weight",
         "frontier_room_text_only_penalty_weight",
@@ -262,6 +275,15 @@ class PolicyConfig(StrictModel):
 
         if value < 0:
             raise ValueError("policy.min_affordance_gain_for_movement_commit must be >= 0.")
+        return value
+
+    @field_validator("object_family_no_progress_threshold")
+    @classmethod
+    def validate_object_family_no_progress_threshold(cls, value: int) -> int:
+        """Require a positive threshold for exhausting a local object family."""
+
+        if value <= 0:
+            raise ValueError("policy.object_family_no_progress_threshold must be > 0.")
         return value
 
 
