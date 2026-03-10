@@ -605,6 +605,40 @@ def test_local_explorer_rejects_zero_score_inventory_churn_branch(tmp_path: Path
     )
 
 
+def test_local_explorer_rejects_zero_score_inventory_scene_churn_branch(tmp_path: Path) -> None:
+    """Zero-score inventory gain should not commit when the branch is stuck or oscillatory."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=OscillatingBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    allowed, reason = explorer._branch_clears_commit_gate(  # type: ignore[attr-defined]
+        LocalBranchOutcome(
+            branch_index=0,
+            actions_taken=["take nest", "close nest", "open nest", "close nest"],
+            total_reward=0.0,
+            score_change=0,
+            final_score=5,
+            final_observation="You are still in the tree scene with the nest.",
+            terminated=False,
+            termination_reason=BranchTerminationReason.HORIZON_REACHED,
+            persistent_inventory_gain_count=1,
+            persistent_inventory_loss_count=0,
+            persistent_affordance_gain=0,
+            persistent_exit_gain_count=0,
+            branch_progress_score=4.28,
+            appears_stuck=True,
+            oscillation_penalty_total=1.75,
+            loop_event_count=1,
+        )
+    )
+
+    assert allowed is False
+    assert "stuck or oscillatory local scene" in reason
+
+
 def test_local_explorer_rejects_exit_only_branch_without_score_or_inventory(tmp_path: Path) -> None:
     """Pure exit discovery should not be committed from local exploration without durable gain."""
 

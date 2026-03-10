@@ -850,6 +850,17 @@ class LocalExplorer:
             oscillation_penalty_total=oscillation_penalty_total,
             movement_penalty_total=movement_penalty_total,
         )
+        if self._branch_is_zero_score_inventory_scene_churn(
+            score_change=score_change,
+            persistent_inventory_gain_count=persistent_inventory_gain_count,
+            persistent_exit_gain_count=persistent_exit_gain_count,
+            oscillation_penalty_total=oscillation_penalty_total,
+            appears_stuck=appears_stuck,
+            inventory_churn_penalty=inventory_churn_penalty,
+            post_gain_churn_action_count=post_gain_churn_action_count,
+            exhausted_family_count=exhausted_family_count,
+        ):
+            branch_progress_score = min(branch_progress_score, 0.0)
         if appears_stuck:
             notable_changes.append("branch appears stuck")
         if terminated:
@@ -1221,6 +1232,12 @@ class LocalExplorer:
             return (
                 False,
                 "best branch relied on bulk or transient inventory churn without score or exit gain",
+            )
+
+        if self._branch_is_zero_score_inventory_scene_churn_reject(branch):
+            return (
+                False,
+                "best branch gained inventory only through a stuck or oscillatory local scene",
             )
 
         if branch.score_change > 0:
@@ -1659,6 +1676,51 @@ class LocalExplorer:
                 or branch.post_gain_churn_action_count > 0
             )
             and branch.inventory_churn_penalty > 0.0
+        )
+
+    def _branch_is_zero_score_inventory_scene_churn(
+        self,
+        *,
+        score_change: int,
+        persistent_inventory_gain_count: int,
+        persistent_exit_gain_count: int,
+        oscillation_penalty_total: float,
+        appears_stuck: bool,
+        inventory_churn_penalty: float,
+        post_gain_churn_action_count: int,
+        exhausted_family_count: int,
+    ) -> bool:
+        """Return whether a zero-score inventory branch only churned a local scene.
+
+        This keeps clean zero-score inventory pickups possible, but blocks branches that
+        only look good because they grabbed a local item while also looping or stalling.
+        """
+
+        return (
+            score_change <= 0
+            and persistent_inventory_gain_count > 0
+            and persistent_exit_gain_count <= 0
+            and (
+                oscillation_penalty_total > 0.0
+                or appears_stuck
+                or inventory_churn_penalty > 0.0
+                or post_gain_churn_action_count > 0
+                or exhausted_family_count > 0
+            )
+        )
+
+    def _branch_is_zero_score_inventory_scene_churn_reject(self, branch: LocalBranchOutcome) -> bool:
+        """Return whether a best branch should be rejected as local inventory scene churn."""
+
+        return self._branch_is_zero_score_inventory_scene_churn(
+            score_change=branch.score_change,
+            persistent_inventory_gain_count=branch.persistent_inventory_gain_count,
+            persistent_exit_gain_count=branch.persistent_exit_gain_count,
+            oscillation_penalty_total=branch.oscillation_penalty_total,
+            appears_stuck=branch.appears_stuck,
+            inventory_churn_penalty=branch.inventory_churn_penalty,
+            post_gain_churn_action_count=branch.post_gain_churn_action_count,
+            exhausted_family_count=branch.exhausted_family_count,
         )
 
     def _branch_has_simple_inventory_progress(
