@@ -1428,6 +1428,9 @@ class ActionClusterHistory:
     cluster_visit_counts: dict[str, int] = field(default_factory=dict)
     cluster_observation_signatures: dict[str, set[str]] = field(default_factory=dict)
     object_family_no_progress_counts: dict[str, int] = field(default_factory=dict)
+    recent_affordance_targets: set[str] = field(default_factory=set)
+    current_visible_nouns: set[str] = field(default_factory=set)
+    fresh_visible_nouns: set[str] = field(default_factory=set)
     recent_cluster_sequence: list[str] = field(default_factory=list)
     no_progress_steps: int = 0
     movement_no_progress_steps: int = 0
@@ -1527,6 +1530,12 @@ class ActionClusterHistory:
                 bulk_inventory_action=bulk_inventory_action,
                 discard_like_action=discard_like_action,
             )
+        if valid_actions_improved or revealed_new_object:
+            self.recent_affordance_targets = set(normalized_targets)
+        elif normalized_targets & self.recent_affordance_targets:
+            # Once we have attempted a follow-up on the freshly revealed object family,
+            # stop treating it as "just revealed" for subsequent ranking steps.
+            self.recent_affordance_targets.difference_update(normalized_targets)
         if durable_progress:
             self.no_progress_steps = 0
             if movement_only_action:
@@ -1553,14 +1562,21 @@ class ActionClusterHistory:
     ) -> None:
         """Remember nouns that have already been surfaced in this local cluster."""
 
-        self.seen_nouns.update(
-            extract_salient_nouns(
-                observation=observation,
-                inventory_text=inventory_text,
-                valid_actions=valid_actions,
-                inverse_pairs=inverse_pairs,
-            )
+        visible_nouns = extract_salient_nouns(
+            observation=observation,
+            inventory_text=inventory_text,
+            valid_actions=[],
+            inverse_pairs=inverse_pairs,
         )
+        memory_nouns = extract_salient_nouns(
+            observation=observation,
+            inventory_text=inventory_text,
+            valid_actions=valid_actions,
+            inverse_pairs=inverse_pairs,
+        )
+        self.current_visible_nouns = set(visible_nouns)
+        self.fresh_visible_nouns = visible_nouns - self.seen_nouns
+        self.seen_nouns.update(memory_nouns)
 
     def record_state_cluster(self, *, cluster_id: str, observation: str) -> tuple[int, bool]:
         """Record a visit to the current state cluster and return visit metadata."""
@@ -1604,6 +1620,16 @@ class ActionClusterHistory:
             for family, count in self.object_family_no_progress_counts.items()
             if count >= threshold
         }
+
+    def touches_recent_affordance_targets(self, targets: set[str]) -> bool:
+        """Return whether a candidate touches an object family with freshly improved affordances."""
+
+        normalized_targets = {
+            normalize_parser_action(token)
+            for token in targets
+            if normalize_parser_action(token)
+        }
+        return bool(normalized_targets & self.recent_affordance_targets)
 
     def max_family_no_progress_count(self, tokens: set[str]) -> int:
         """Return the maximum no-progress count among the provided family tokens."""
@@ -1931,10 +1957,12 @@ class ActionCandidateFeatures:
     prior_success_for_object_family: bool = False
     prior_failure_for_object_family: bool = False
     touches_newly_salient_object: bool = False
+    touches_recent_affordance_object: bool = False
     touches_supported_reflection_object: bool = False
     inverse_of_previous_action: bool = False
     movement_repeat_count: int = 0
     cluster_repeat_count: int = 0
+    movement_targets_landmark: bool = False
     touches_exhausted_family: bool = False
     exhausted_family_count: int = 0
     max_family_no_progress_count: int = 0
@@ -2106,6 +2134,8 @@ class LocalBranchOutcome:
     loop_event_count: int = 0
     first_durable_gain_action_index: int | None = None
     first_durable_gain_action: str = ""
+    last_meaningful_progress_action_index: int | None = None
+    last_meaningful_progress_action: str = ""
     notable_observation_changes: list[str] = field(default_factory=list)
     final_state: TextGameState | None = None
     restore_result: ReplayResult | None = None

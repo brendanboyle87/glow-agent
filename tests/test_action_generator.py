@@ -766,6 +766,164 @@ def test_action_generator_prefers_exit_after_local_scene_already_paid_off(
     assert "post_score_scene_exhausted" in throw_egg.ranking_reason
 
 
+def test_action_generator_prefers_take_canary_when_canary_is_freshly_revealed(
+    tmp_path: Path,
+) -> None:
+    """A freshly revealed canary should outrank stale egg/nest churn in the scored tree scene."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. close egg\n2. take nest\n3. down"),
+    )
+    history = ActionClusterHistory(cluster_label="tree-cluster")
+    history.observe_state_nouns(
+        observation="Up a Tree. A nest holds a jeweled egg.",
+        inventory_text="jewel-encrusted egg",
+        valid_actions=["down", "take nest", "take on egg", "close nest"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="take egg",
+        score_changed=True,
+        inventory_changed=True,
+        inventory_gained=True,
+        observation_changed=True,
+        valid_actions_changed=False,
+        target_tokens={"egg"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="take on egg",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=True,
+        revealed_new_object=True,
+        target_tokens={"egg"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.observe_state_nouns(
+        observation=(
+            "The egg is open and there is a golden clockwork canary nestled in the egg."
+        ),
+        inventory_text="broken jewel-encrusted egg",
+        valid_actions=["down", "take canary", "close egg", "close nest", "take nest"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="The egg is open and there is a golden clockwork canary nestled in the egg.",
+        inventory_text="broken jewel-encrusted egg",
+        valid_actions=["down", "take canary", "close egg", "close nest", "take nest"],
+        score=5,
+        moves=9,
+        recent_actions=["take on egg"],
+        state_action_history=history,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "take canary"
+    take_canary = result.candidates[0]
+    assert take_canary.features is not None
+    assert take_canary.features.target_is_new_salient_object is True
+    close_egg = next(candidate for candidate in result.candidates if candidate.action == "close egg")
+    assert "post_score_scene_exhausted" in close_egg.ranking_reason
+    assert "take nest" not in ranked_actions or ranked_actions.index("take canary") < ranked_actions.index("take nest")
+
+
+def test_action_generator_does_not_let_reflection_try_rescue_stale_nonnew_acquire(
+    tmp_path: Path,
+) -> None:
+    """A non-new acquire action should lose to exits when it only has soft reflection support."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. take nest\n2. down"),
+    )
+    history = ActionClusterHistory(cluster_label="nest-cluster")
+    history.observe_state_nouns(
+        observation="You are in the tree beside a nest and a canary.",
+        valid_actions=["take nest", "down", "west"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="You are in the tree beside a nest and a canary.",
+        inventory_text="You are carrying a jeweled egg and a leaflet.",
+        valid_actions=["take nest", "down", "west"],
+        score=5,
+        moves=12,
+        candidate_count=3,
+        state_action_history=history,
+        supported_try_actions=["take nest", "down"],
+        supported_reflection_objects=["nest", "egg"],
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] in {"down", "west"}
+    take_nest = next(candidate for candidate in result.candidates if candidate.action == "take nest")
+    assert take_nest.features is not None
+    assert take_nest.features.matches_supported_try_action is True
+    assert "reflection_supported_try" not in take_nest.ranking_reason
+    assert "stale_nonnew_acquire" in take_nest.ranking_reason
+
+
+def test_action_generator_does_not_transfer_object_family_success_to_aggressive_throw(
+    tmp_path: Path,
+) -> None:
+    """Object-family success should not make aggressive throw actions rank like sensible follow-ups."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. throw nest at ground\n2. down"),
+    )
+    history = ActionClusterHistory(cluster_label="nest-cluster")
+    history.observe_state_nouns(
+        observation="You are in the tree holding a nest.",
+        valid_actions=["throw nest at ground", "down", "close nest"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="take nest",
+        score_changed=False,
+        inventory_changed=True,
+        inventory_gained=True,
+        observation_changed=True,
+        valid_actions_changed=False,
+        target_tokens={"nest"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="You are in the tree holding a nest.",
+        inventory_text="You are carrying a nest, a jeweled egg, and a leaflet.",
+        valid_actions=["throw nest at ground", "down", "close nest"],
+        score=5,
+        moves=13,
+        candidate_count=3,
+        state_action_history=history,
+        supported_reflection_objects=["nest"],
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "down"
+    throw_nest = next(candidate for candidate in result.candidates if candidate.action == "throw nest at ground")
+    assert throw_nest.features is not None
+    assert throw_nest.features.prior_success_for_object_family is True
+    assert "object_family_success" not in throw_nest.ranking_reason
+    assert "speculative_tool_use" in throw_nest.ranking_reason
+
+
 def test_action_generator_penalizes_jump_against_plain_exits(tmp_path: Path) -> None:
     """Ungrounded generic actions should lose to simple exits even without extra history support."""
 
@@ -804,6 +962,41 @@ def test_action_generator_penalizes_jump_against_plain_exits(tmp_path: Path) -> 
     assert jump_candidate.features.verb_family == "other"
     assert "ungrounded_other_action" in jump_candidate.ranking_reason
     assert jump_candidate.selection_score < 0.0
+
+
+def test_action_generator_prefers_up_in_tree_scene_over_generic_escape_movement(
+    tmp_path: Path,
+) -> None:
+    """Climbable tree scenes should prefer `up` over arbitrary lateral wandering."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. east\n2. west\n3. south"),
+    )
+    history = ActionClusterHistory(cluster_label="forest-cluster")
+    history.record_state_cluster(cluster_id="region:forest", observation="Forest path among trees.")
+    history.record_state_cluster(cluster_id="region:forest", observation="Forest path among trees.")
+
+    result = generator.generate(
+        observation="You are at the base of a large tree. Branches and leaves are overhead.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["up", "east", "west", "south", "put down leaflet"],
+        score=0,
+        moves=6,
+        candidate_count=4,
+        recent_actions=["north", "south"],
+        state_action_history=history,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "up"
+    up_candidate = next(candidate for candidate in result.candidates if candidate.action == "up")
+    assert up_candidate.features is not None
+    assert up_candidate.features.movement_targets_landmark is True
+    assert "landmark_movement" in up_candidate.ranking_reason
 
 
 def test_action_generator_demotes_shake_egg_after_the_scene_already_scored(tmp_path: Path) -> None:
@@ -852,6 +1045,56 @@ def test_action_generator_demotes_shake_egg_after_the_scene_already_scored(tmp_p
     assert shake_candidate.features is not None
     assert shake_candidate.features.verb_family == "other"
     assert "ungrounded_other_action" in shake_candidate.ranking_reason
+
+
+def test_action_generator_prefers_take_egg_after_open_egg_revealed_affordances(
+    tmp_path: Path,
+) -> None:
+    """Freshly opened/high-affordance objects should get an immediate follow-up bias."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. down\n2. close egg\n3. throw egg at ground"),
+    )
+    history = ActionClusterHistory(cluster_label="egg-cluster")
+    history.observe_state_nouns(
+        observation="There is a jeweled egg here.",
+        valid_actions=["open egg with leaflet", "take egg", "down"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="open egg with leaflet",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=True,
+        revealed_new_object=True,
+        target_tokens={"egg"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="The egg is open. The jeweled egg is exposed beside the nest.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["take egg", "down", "close egg", "throw egg at ground"],
+        score=0,
+        moves=8,
+        candidate_count=4,
+        recent_actions=["open egg with leaflet"],
+        state_action_history=history,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "take egg"
+    take_egg = next(candidate for candidate in result.candidates if candidate.action == "take egg")
+    assert take_egg.features is not None
+    assert take_egg.features.touches_recent_affordance_object is True
+    assert "fresh_affordance_followup" in take_egg.ranking_reason
+    assert ranked_actions.index("take egg") < ranked_actions.index("down")
 
 
 def test_action_generator_top_k_keeps_object_centric_action_when_salient_objects_exist(

@@ -186,8 +186,11 @@ class PolicyConfig(StrictModel):
     object_family_no_progress_threshold: int = 2
     object_family_exhaustion_penalty: float = 2.0
     post_score_scene_exhaustion_penalty: float = 2.5
+    post_score_local_churn_penalty: float = 1.75
     stale_reflection_try_penalty: float = 0.75
     escape_mode_exit_bonus: float = 1.5
+    landmark_movement_bonus: float = 1.25
+    fresh_affordance_followup_bonus: float = 1.5
     discard_inventory_penalty: float = 2.0
     bulk_inventory_action_penalty: float = 2.5
     branch_progress_score_weight: float = 1.0

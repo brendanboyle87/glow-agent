@@ -353,6 +353,11 @@ class LocalExplorer:
         total_reward = 0.0
         first_durable_gain_action_index: int | None = None
         first_durable_gain_action = ""
+        last_meaningful_progress_action_index: int | None = None
+        last_meaningful_progress_action = ""
+        max_persistent_inventory_gain_count = 0
+        max_persistent_affordance_gain = 0
+        max_persistent_exit_gain_count = 0
         termination_reason = BranchTerminationReason.HORIZON_REACHED
         terminated = False
 
@@ -390,22 +395,26 @@ class LocalExplorer:
             transition = env.step(action)
             total_reward += transition.reward
             raw_state = transition.to_state()
-            inventory_gained = self._count_inventory_gain(
+            inventory_gain_count = self._count_inventory_gain(
                 base_state=pre_step_states[-1],
                 final_state=raw_state,
-            ) > 0
-            inventory_lost = self._count_inventory_loss(
+            )
+            inventory_loss_count = self._count_inventory_loss(
                 base_state=pre_step_states[-1],
                 final_state=raw_state,
-            ) > 0
-            persistent_inventory_gained_vs_base = self._count_inventory_gain(
+            )
+            persistent_inventory_gain_count = self._count_inventory_gain(
                 base_state=base_state,
                 final_state=raw_state,
-            ) > 0
-            persistent_inventory_lost_vs_base = self._count_inventory_loss(
+            )
+            persistent_inventory_loss_count = self._count_inventory_loss(
                 base_state=base_state,
                 final_state=raw_state,
-            ) > 0
+            )
+            inventory_gained = inventory_gain_count > 0
+            inventory_lost = inventory_loss_count > 0
+            persistent_inventory_gained_vs_base = persistent_inventory_gain_count > 0
+            persistent_inventory_lost_vs_base = persistent_inventory_loss_count > 0
             persistent_affordance_gain = self._count_persistent_affordances(
                 base_state=base_state,
                 final_state=raw_state,
@@ -555,6 +564,36 @@ class LocalExplorer:
             )
             movement_results.append(movement_result)
             movement_penalty_total += movement_result.total_penalty
+            meaningful_progress_this_step = self._action_is_meaningful_branch_progress(
+                action=action,
+                movement_only_action=movement_only_action,
+                discard_like_action=discard_like_action,
+                aggressive_action=aggressive_action,
+                speculative_tool_use_action=speculative_tool_use_action,
+                score_delta=current_state.score - pre_step_states[-1].score,
+                persistent_inventory_gain_count=persistent_inventory_gain_count,
+                persistent_affordance_gain=persistent_affordance_gain,
+                persistent_exit_gain_count=persistent_exit_gain,
+                persistent_revealed_new_object=persistent_revealed_new_object,
+                max_persistent_inventory_gain_count=max_persistent_inventory_gain_count,
+                max_persistent_affordance_gain=max_persistent_affordance_gain,
+                max_persistent_exit_gain_count=max_persistent_exit_gain_count,
+            )
+            if meaningful_progress_this_step:
+                last_meaningful_progress_action_index = len(actions_taken) - 1
+                last_meaningful_progress_action = action
+            max_persistent_inventory_gain_count = max(
+                max_persistent_inventory_gain_count,
+                persistent_inventory_gain_count,
+            )
+            max_persistent_affordance_gain = max(
+                max_persistent_affordance_gain,
+                persistent_affordance_gain,
+            )
+            max_persistent_exit_gain_count = max(
+                max_persistent_exit_gain_count,
+                persistent_exit_gain,
+            )
             action_events.append(
                 {
                     "action": action,
@@ -570,6 +609,7 @@ class LocalExplorer:
                     "loop_penalty": loop_result.total_penalty,
                     "movement_penalty": movement_result.total_penalty,
                     "state_cluster_id": current_state.state_cluster_id,
+                    "meaningful_progress": meaningful_progress_this_step,
                 }
             )
             if (
@@ -871,6 +911,8 @@ class LocalExplorer:
             loop_event_count=sum(1 for loop_result in loop_results if loop_result.loop_detected),
             first_durable_gain_action_index=first_durable_gain_action_index,
             first_durable_gain_action=first_durable_gain_action,
+            last_meaningful_progress_action_index=last_meaningful_progress_action_index,
+            last_meaningful_progress_action=last_meaningful_progress_action,
             notable_observation_changes=notable_changes,
             final_state=current_state,
             restore_result=restore_result,
@@ -1293,6 +1335,44 @@ class LocalExplorer:
             - float(oscillation_penalty_total)
             - float(movement_penalty_total)
         )
+
+    def _action_is_meaningful_branch_progress(
+        self,
+        *,
+        action: str,
+        movement_only_action: bool,
+        discard_like_action: bool,
+        aggressive_action: bool,
+        speculative_tool_use_action: bool,
+        score_delta: int,
+        persistent_inventory_gain_count: int,
+        persistent_affordance_gain: int,
+        persistent_exit_gain_count: int,
+        persistent_revealed_new_object: bool,
+        max_persistent_inventory_gain_count: int,
+        max_persistent_affordance_gain: int,
+        max_persistent_exit_gain_count: int,
+    ) -> bool:
+        """Return whether a branch step added durable progress worth committing through."""
+
+        if score_delta > 0:
+            return True
+        if persistent_inventory_gain_count > max_persistent_inventory_gain_count and not discard_like_action:
+            return True
+        if persistent_revealed_new_object and not movement_only_action:
+            return True
+        if persistent_affordance_gain > max_persistent_affordance_gain:
+            if not movement_only_action:
+                return True
+            return persistent_inventory_gain_count > max_persistent_inventory_gain_count
+        if persistent_exit_gain_count > max_persistent_exit_gain_count:
+            return not movement_only_action
+        if aggressive_action or discard_like_action or speculative_tool_use_action:
+            return False
+        action_text = self._normalize_text(action)
+        if action_text.startswith(("take ", "get ", "read ", "examine ", "look at ", "open ")):
+            return persistent_inventory_gain_count > max_persistent_inventory_gain_count
+        return False
 
     def _should_abort_branch_early(
         self,

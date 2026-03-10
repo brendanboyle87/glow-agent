@@ -297,11 +297,15 @@ class EpisodeRunner:
                                     episode_movement_results = []
                                     pending_branch_actions = self._branch_commit_actions(best_branch)
                                     self.logger.info(
-                                        "Committing branch %s with actions=%s first_durable_gain_index=%s first_durable_gain_action=%s",
+                                        "Committing branch %s with actions=%s first_durable_gain_index=%s "
+                                        "first_durable_gain_action=%s last_meaningful_progress_index=%s "
+                                        "last_meaningful_progress_action=%s",
                                         best_branch.branch_index,
                                         pending_branch_actions,
                                         best_branch.first_durable_gain_action_index,
                                         best_branch.first_durable_gain_action or "none",
+                                        best_branch.last_meaningful_progress_action_index,
+                                        best_branch.last_meaningful_progress_action or "none",
                                     )
                                     loaded_branch_plan_this_step = bool(pending_branch_actions)
                                 else:
@@ -797,16 +801,20 @@ class EpisodeRunner:
         """Return the branch prefix that should be committed into the main episode.
 
         The baseline behavior used a fixed prefix length, which can truncate the
-        actual gain event from an otherwise strong branch. We now extend the commit
-        prefix through the first durable gain action when needed.
+        actual gain event from an otherwise strong branch. We now commit through
+        the last meaningful progress action, while trimming any churn after that.
         """
 
         if not branch.actions_taken:
             return []
 
         commit_length = min(len(branch.actions_taken), self.config.experiment.branch_commit_steps)
-        if branch.first_durable_gain_action_index is not None:
+        if branch.last_meaningful_progress_action_index is not None:
+            commit_length = max(commit_length, branch.last_meaningful_progress_action_index + 1)
+            commit_length = min(commit_length, branch.last_meaningful_progress_action_index + 1)
+        elif branch.first_durable_gain_action_index is not None:
             commit_length = max(commit_length, branch.first_durable_gain_action_index + 1)
+            commit_length = min(commit_length, branch.first_durable_gain_action_index + 1)
         return list(branch.actions_taken[:commit_length])
 
     def _build_frontier(self) -> FrontierQueue:
