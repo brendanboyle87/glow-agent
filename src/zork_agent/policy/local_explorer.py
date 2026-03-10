@@ -1,0 +1,888 @@
+"""Shallow local branching from a replay-restored frontier state.
+
+This module intentionally avoids complex tree search. It restores the same base
+state before each branch rollout, tries a small number of short horizons, and
+compares branch outcomes using explicit heuristics.
+
+TODO: revisit branch diversification once real Jericho runs expose better signals.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from zork_agent.env.jericho_env import JerichoEnv
+from zork_agent.env.replay import restore_saved_node
+from zork_agent.memory.frontier import FrontierEntry, FrontierQueue
+from zork_agent.policy.action_generator import ActionGenerator
+from zork_agent.policy.state_selector import StateSelector
+from zork_agent.types import (
+    ActionClusterHistory,
+    ActionProposal,
+    BranchTerminationReason,
+    LocalBranchOutcome,
+    LocalExplorationResult,
+    LoopHeuristicResult,
+    MovementHeuristicResult,
+    ReplayResult,
+    RestoreMode,
+    SavedNode,
+    TextGameState,
+    compute_region_novelty_score,
+    derive_state_cluster_id,
+    evaluate_reversible_action_loop,
+    evaluate_movement_action,
+    extract_salient_nouns,
+    is_movement_action,
+    valid_actions_materially_different,
+)
+
+_LOGGER = logging.getLogger("zork_agent.local_explorer")
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "you",
+    "your",
+}
+
+_LOCATION_HINT_TOKENS = {
+    "attic",
+    "canyon",
+    "cellar",
+    "east",
+    "field",
+    "forest",
+    "house",
+    "inside",
+    "kitchen",
+    "north",
+    "outside",
+    "passage",
+    "room",
+    "south",
+    "valley",
+    "west",
+}
+
+
+class LocalExplorer:
+    """Run shallow multi-branch local exploration from one restored state."""
+
+    def __init__(
+        self,
+        action_generator: ActionGenerator,
+        state_selector: StateSelector | None = None,
+        *,
+        env: JerichoEnv | None = None,
+        logger: logging.Logger | None = None,
+        default_branch_count: int | None = None,
+        default_branch_horizon: int | None = None,
+        default_temperature: float | None = None,
+        default_action_candidate_count: int | None = None,
+    ):
+        # TODO: move explorer-specific config into a dedicated model only if it grows further.
+        self.action_generator = action_generator
+        self.state_selector = state_selector
+        self.env = env
+        self.logger = logger or _LOGGER
+        self.default_branch_count = (
+            default_branch_count
+            if default_branch_count is not None
+            else action_generator.config.policy.rollout_count
+        )
+        self.default_branch_horizon = (
+            default_branch_horizon
+            if default_branch_horizon is not None
+            else action_generator.config.policy.rollout_depth
+        )
+        self.default_temperature = (
+            default_temperature
+            if default_temperature is not None
+            else action_generator.config.llm.temperature
+        )
+        self.default_action_candidate_count = (
+            default_action_candidate_count
+            if default_action_candidate_count is not None
+            else action_generator.config.policy.action_candidates
+        )
+
+    def expand(self, state: TextGameState, frontier: FrontierQueue) -> tuple[FrontierEntry | None, list[ActionProposal]]:
+        """Backward-compatible helper that selects a frontier node and proposes actions."""
+
+        selected = self.state_selector.select(frontier) if self.state_selector is not None else None
+        actions = self.action_generator.propose_actions(
+            state,
+            state_action_history=ActionClusterHistory(cluster_label=state.world_state_hash),
+        )
+        return selected, actions
+
+    def explore_from_state(
+        self,
+        restored_state: TextGameState,
+        *,
+        env: JerichoEnv | None = None,
+        branch_count: int | None = None,
+        branch_horizon: int | None = None,
+        temperature: float | None = None,
+        action_candidate_count: int | None = None,
+        recent_trajectory_context: str | None = None,
+    ) -> LocalExplorationResult:
+        """Restore the same base state before each branch and compare shallow rollouts."""
+
+        active_env = env or self.env
+        if active_env is None:
+            raise ValueError("LocalExplorer requires a JerichoEnv instance to run branch rollouts.")
+
+        effective_branch_count = max(1, branch_count or self.default_branch_count)
+        effective_branch_horizon = max(1, branch_horizon or self.default_branch_horizon)
+        effective_temperature = self.default_temperature if temperature is None else temperature
+        effective_action_candidate_count = max(
+            1,
+            action_candidate_count or self.default_action_candidate_count,
+        )
+
+        base_saved_node = self._saved_node_from_state(restored_state)
+        comparison_notes = ""
+        if base_saved_node is None and effective_branch_count > 1:
+            comparison_notes = (
+                "Base state had no replayable snapshot; local exploration was reduced to one branch."
+            )
+            self.logger.warning(comparison_notes)
+            effective_branch_count = 1
+
+        branches: list[LocalBranchOutcome] = []
+        for branch_index in range(effective_branch_count):
+            outcome = self._run_branch(
+                branch_index=branch_index,
+                base_state=restored_state,
+                base_saved_node=base_saved_node,
+                env=active_env,
+                branch_horizon=effective_branch_horizon,
+                temperature=effective_temperature,
+                action_candidate_count=effective_action_candidate_count,
+                recent_trajectory_context=recent_trajectory_context,
+            )
+            branches.append(outcome)
+
+        best_branch_index = None
+        branch_commit_allowed = False
+        commit_rejection_reason = ""
+        comparable_branches = [branch for branch in branches if branch.termination_reason is not BranchTerminationReason.RESTORE_FAILED]
+        if comparable_branches:
+            best_branch = max(comparable_branches, key=self._branch_sort_key)
+            best_branch_index = best_branch.branch_index
+            threshold = self.action_generator.config.policy.branch_commit_min_progress_score
+            branch_commit_allowed = (
+                best_branch.branch_progress_score > threshold
+                and (
+                    best_branch.score_change > 0
+                    or best_branch.inventory_changed
+                    or best_branch.affordance_gain
+                    >= self.action_generator.config.policy.min_affordance_gain_for_movement_commit
+                )
+            )
+            best_branch.branch_commit_allowed = branch_commit_allowed
+            if not branch_commit_allowed:
+                if (
+                    best_branch.score_change <= 0
+                    and not best_branch.inventory_changed
+                    and best_branch.affordance_gain
+                    < self.action_generator.config.policy.min_affordance_gain_for_movement_commit
+                ):
+                    commit_rejection_reason = (
+                        "best branch had no score gain, inventory gain, or sufficient affordance gain"
+                    )
+                else:
+                    commit_rejection_reason = (
+                        f"best branch progress_score {best_branch.branch_progress_score:.2f} "
+                        f"did not clear threshold {threshold:.2f}"
+                    )
+                best_branch.commit_rejection_reason = commit_rejection_reason
+        else:
+            commit_rejection_reason = "No comparable branches were available for commit."
+
+        if not comparison_notes:
+            comparison_notes = (
+                "Branches are compared by an explicit progress score over score gain, inventory change, "
+                "new affordances, room/location signals, novel object mentions, and loop reduction."
+            )
+
+        if best_branch_index is not None:
+            best_branch = next(branch for branch in branches if branch.branch_index == best_branch_index)
+            self.logger.info(
+                "Local exploration best branch=%s progress_score=%.2f commit_allowed=%s rejection=%s",
+                best_branch.branch_index,
+                best_branch.branch_progress_score,
+                branch_commit_allowed,
+                commit_rejection_reason or "none",
+            )
+
+        return LocalExplorationResult(
+            base_state=restored_state,
+            branch_count=effective_branch_count,
+            branch_horizon=effective_branch_horizon,
+            temperature=effective_temperature,
+            action_candidate_count=effective_action_candidate_count,
+            branches=branches,
+            best_branch_index=best_branch_index,
+            branch_commit_allowed=branch_commit_allowed,
+            commit_rejection_reason=commit_rejection_reason,
+            comparison_notes=comparison_notes,
+        )
+
+    def run_local_rollouts(
+        self,
+        restored_state: TextGameState,
+        *,
+        env: JerichoEnv | None = None,
+        branch_count: int | None = None,
+        branch_horizon: int | None = None,
+        temperature: float | None = None,
+        action_candidate_count: int | None = None,
+        recent_trajectory_context: str | None = None,
+    ) -> LocalExplorationResult:
+        """Backward-compatible alias for `explore_from_state`."""
+
+        return self.explore_from_state(
+            restored_state,
+            env=env,
+            branch_count=branch_count,
+            branch_horizon=branch_horizon,
+            temperature=temperature,
+            action_candidate_count=action_candidate_count,
+            recent_trajectory_context=recent_trajectory_context,
+        )
+
+    def _run_branch(
+        self,
+        *,
+        branch_index: int,
+        base_state: TextGameState,
+        base_saved_node: SavedNode | None,
+        env: JerichoEnv,
+        branch_horizon: int,
+        temperature: float,
+        action_candidate_count: int,
+        recent_trajectory_context: str | None,
+    ) -> LocalBranchOutcome:
+        """Restore the base state and run one shallow local rollout."""
+
+        restore_result = self._restore_branch_start(
+            env=env,
+            base_state=base_state,
+            base_saved_node=base_saved_node,
+            branch_index=branch_index,
+        )
+        if not restore_result.success:
+            self.logger.warning(
+                "Local branch %s could not restore the base state: %s",
+                branch_index,
+                restore_result.message,
+            )
+            return LocalBranchOutcome(
+                branch_index=branch_index,
+                actions_taken=[],
+                total_reward=0.0,
+                score_change=0,
+                final_score=restore_result.final_score,
+                final_observation=restore_result.final_observation,
+                terminated=False,
+                termination_reason=BranchTerminationReason.RESTORE_FAILED,
+                final_state=restore_result.final_state,
+                restore_result=restore_result,
+                metadata={"restore_mode": restore_result.restore_mode.value},
+            )
+
+        current_state = restore_result.final_state
+        current_state = self._annotate_branch_state(
+            current_state,
+            history=None,
+            previous_state=None,
+            score_gain=0,
+            inventory_changed=False,
+            affordance_gain=0,
+            novel_object_count=0,
+            movement_only_action=False,
+            materially_new_actions=False,
+        )
+        visited_states = [current_state]
+        action_cluster_history = ActionClusterHistory(cluster_label=current_state.world_state_hash)
+        action_cluster_history.record_state_cluster(
+            cluster_id=current_state.state_cluster_id or current_state.world_state_hash,
+            observation=current_state.observation,
+        )
+        actions_taken: list[str] = []
+        loop_results: list[LoopHeuristicResult] = []
+        movement_results: list[MovementHeuristicResult] = []
+        oscillation_penalty_total = 0.0
+        movement_penalty_total = 0.0
+        total_reward = 0.0
+        termination_reason = BranchTerminationReason.HORIZON_REACHED
+        terminated = False
+
+        for step_offset in range(branch_horizon):
+            context = self._branch_context(
+                base_context=recent_trajectory_context,
+                actions_taken=actions_taken,
+            )
+            proposals = self.action_generator.propose_actions(
+                current_state,
+                recent_trajectory_context=context,
+                candidate_count=action_candidate_count,
+                temperature=temperature,
+                recent_actions=actions_taken,
+                recent_loop_results=loop_results,
+                state_action_history=action_cluster_history,
+            )
+            if not proposals:
+                termination_reason = BranchTerminationReason.NO_ACTIONS
+                break
+
+            action = self._choose_branch_action(
+                proposals=proposals,
+                branch_index=branch_index,
+                step_offset=step_offset,
+            )
+            pre_step_actions = list(actions_taken)
+            pre_step_states = list(visited_states)
+            transition = env.step(action)
+            total_reward += transition.reward
+            raw_state = transition.to_state()
+            affordance_gain = self._count_new_affordances(base_state=pre_step_states[-1], final_state=raw_state)
+            novel_object_tokens = (
+                extract_salient_nouns(
+                    observation=raw_state.observation,
+                    inventory_text=raw_state.inventory_text,
+                    valid_actions=[],
+                    inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+                )
+                - extract_salient_nouns(
+                    observation=pre_step_states[-1].observation,
+                    inventory_text=pre_step_states[-1].inventory_text,
+                    valid_actions=[],
+                    inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+                )
+            )
+            materially_new_actions = valid_actions_materially_different(
+                pre_step_states[-1].valid_actions,
+                raw_state.valid_actions,
+            )
+            current_state = self._annotate_branch_state(
+                raw_state,
+                history=action_cluster_history,
+                previous_state=pre_step_states[-1],
+                score_gain=raw_state.score - pre_step_states[-1].score,
+                inventory_changed=self._normalize_text(raw_state.inventory_text)
+                != self._normalize_text(pre_step_states[-1].inventory_text),
+                affordance_gain=affordance_gain,
+                novel_object_count=len(novel_object_tokens),
+                movement_only_action=self._is_movement_action(action),
+                materially_new_actions=materially_new_actions,
+            )
+            action_cluster_history.record_attempt(
+                action=action,
+                score_changed=current_state.score != pre_step_states[-1].score,
+                inventory_changed=self._normalize_text(current_state.inventory_text)
+                != self._normalize_text(pre_step_states[-1].inventory_text),
+                observation_changed=self._normalize_text(current_state.observation)
+                != self._normalize_text(pre_step_states[-1].observation),
+                valid_actions_changed={
+                    self._normalize_text(candidate) for candidate in current_state.valid_actions
+                }
+                != {
+                    self._normalize_text(candidate) for candidate in pre_step_states[-1].valid_actions
+                },
+            )
+            action_cluster_history.observe_state_nouns(
+                observation=pre_step_states[-1].observation,
+                inventory_text=pre_step_states[-1].inventory_text,
+                valid_actions=pre_step_states[-1].valid_actions,
+                inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+            )
+            loop_result = evaluate_reversible_action_loop(
+                action=action,
+                recent_actions=pre_step_actions,
+                state_history=pre_step_states,
+                current_state=current_state,
+                inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+                immediate_inverse_penalty=self.action_generator.config.policy.immediate_inverse_penalty,
+                repeated_pair_penalty=self.action_generator.config.policy.repeated_pair_penalty,
+                reversible_no_progress_penalty=self.action_generator.config.policy.reversible_no_progress_penalty,
+            )
+            actions_taken.append(action)
+            visited_states.append(current_state)
+            loop_results.append(loop_result)
+            oscillation_penalty_total += loop_result.total_penalty
+            movement_result = evaluate_movement_action(
+                action=action,
+                recent_actions=pre_step_actions,
+                previous_state=pre_step_states[-1],
+                current_state=current_state,
+                inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+                repeated_movement_penalty=self.action_generator.config.policy.repeated_movement_penalty,
+                movement_cycle_penalty=self.action_generator.config.policy.movement_cycle_penalty,
+                same_region_repeat_penalty=self.action_generator.config.policy.same_region_repeat_penalty,
+            )
+            movement_results.append(movement_result)
+            movement_penalty_total += movement_result.total_penalty
+            if loop_result.loop_detected:
+                self.logger.info(
+                    "Local branch %s detected reversible loop for action=%s penalty=%.2f reason=%s",
+                    branch_index,
+                    action,
+                    loop_result.total_penalty,
+                    loop_result.reason,
+                )
+            if movement_result.total_penalty > 0.0:
+                self.logger.info(
+                    "Local branch %s detected low-value movement for action=%s penalty=%.2f reason=%s",
+                    branch_index,
+                    action,
+                    movement_result.total_penalty,
+                    movement_result.reason,
+                )
+            if transition.done:
+                terminated = True
+                termination_reason = BranchTerminationReason.TERMINATED
+                break
+
+        score_change = current_state.score - base_state.score
+        notable_changes, new_room_or_object_detected, new_room_location_signal, novel_tokens = self._describe_observation_changes(
+            base_state=base_state,
+            visited_states=visited_states,
+            score_change=score_change,
+        )
+        inventory_changed = self._normalize_text(current_state.inventory_text) != self._normalize_text(base_state.inventory_text)
+        new_affordance_count = self._count_new_affordances(base_state=base_state, final_state=current_state)
+        affordance_gain = new_affordance_count
+        novel_object_count = min(len(novel_tokens), 4)
+        landmark_gain = 1 if new_room_location_signal and (novel_object_count > 0 or new_affordance_count > 0 or inventory_changed or score_change > 0) else 0
+        room_text_only_gain = self._room_text_only_gain(
+            base_state=base_state,
+            final_state=current_state,
+            score_change=score_change,
+            inventory_changed=inventory_changed,
+            affordance_gain=new_affordance_count,
+            novel_object_count=novel_object_count,
+            landmark_gain=landmark_gain,
+        )
+        loop_penalty_reduction = self._loop_penalty_reduction(loop_results)
+        branch_progress_score = self._branch_progress_score(
+            score_change=score_change,
+            inventory_changed=inventory_changed,
+            affordance_gain=new_affordance_count,
+            landmark_gain=landmark_gain,
+            novel_object_count=novel_object_count,
+            room_text_only_gain=room_text_only_gain,
+            loop_penalty_reduction=loop_penalty_reduction,
+            oscillation_penalty_total=oscillation_penalty_total,
+            movement_penalty_total=movement_penalty_total,
+        )
+        if score_change <= 0 and not inventory_changed and new_affordance_count <= 0:
+            branch_progress_score = min(
+                branch_progress_score,
+                self.action_generator.config.policy.movement_progress_cap,
+            )
+        appears_stuck = self._appears_stuck(
+            base_state=base_state,
+            visited_states=visited_states,
+            total_reward=total_reward,
+            score_change=score_change,
+            new_room_or_object_detected=new_room_or_object_detected,
+            oscillation_penalty_total=oscillation_penalty_total,
+            movement_penalty_total=movement_penalty_total,
+        )
+        if appears_stuck:
+            notable_changes.append("branch appears stuck")
+        if terminated:
+            notable_changes.append("branch terminated")
+        if oscillation_penalty_total > 0.0:
+            notable_changes.append(f"oscillation penalty {oscillation_penalty_total:.2f}")
+        if movement_penalty_total > 0.0:
+            notable_changes.append(f"movement penalty {movement_penalty_total:.2f}")
+        if inventory_changed:
+            notable_changes.append("inventory changed")
+        if new_affordance_count > 0:
+            notable_changes.append(f"new affordances {new_affordance_count}")
+        if new_room_location_signal:
+            notable_changes.append("room/location signal")
+        if room_text_only_gain > 0.0:
+            notable_changes.append(f"room text only gain {room_text_only_gain:.2f}")
+        if branch_progress_score > 0.0:
+            notable_changes.append(f"progress score {branch_progress_score:.2f}")
+
+        self.logger.info(
+            "Local branch %s finished: actions=%s score_change=%s reward=%.2f terminated=%s stuck=%s "
+            "loop_penalty=%.2f movement_penalty=%.2f progress_score=%.2f",
+            branch_index,
+            actions_taken,
+            score_change,
+            total_reward,
+            terminated,
+            appears_stuck,
+            oscillation_penalty_total,
+            movement_penalty_total,
+            branch_progress_score,
+        )
+        return LocalBranchOutcome(
+            branch_index=branch_index,
+            actions_taken=actions_taken,
+            total_reward=total_reward,
+            score_change=score_change,
+            final_score=current_state.score,
+            final_observation=current_state.observation,
+            terminated=terminated,
+            termination_reason=termination_reason,
+            new_room_or_object_detected=new_room_or_object_detected,
+            appears_stuck=appears_stuck,
+            inventory_changed=inventory_changed,
+            new_affordance_count=new_affordance_count,
+            affordance_gain=affordance_gain,
+            new_room_location_signal=new_room_location_signal,
+            landmark_gain=landmark_gain,
+            novel_object_count=novel_object_count,
+            room_text_only_gain=room_text_only_gain,
+            loop_penalty_reduction=loop_penalty_reduction,
+            branch_progress_score=branch_progress_score,
+            oscillation_penalty_total=oscillation_penalty_total,
+            movement_penalty_total=movement_penalty_total,
+            movement_only_action_count=sum(1 for result in movement_results if result.movement_only_action),
+            movement_repeat_count=max((result.movement_repeat_count for result in movement_results), default=0),
+            loop_event_count=sum(1 for loop_result in loop_results if loop_result.loop_detected),
+            notable_observation_changes=notable_changes,
+            final_state=current_state,
+            restore_result=restore_result,
+            metadata={
+                "restore_mode": restore_result.restore_mode.value,
+                "loop_results": [loop_result.to_record() for loop_result in loop_results],
+                "movement_results": [movement_result.to_record() for movement_result in movement_results],
+            },
+        )
+
+    def _restore_branch_start(
+        self,
+        *,
+        env: JerichoEnv,
+        base_state: TextGameState,
+        base_saved_node: SavedNode | None,
+        branch_index: int,
+    ) -> ReplayResult:
+        """Restore the same base state before every branch rollout."""
+
+        if base_saved_node is None:
+            self.logger.info(
+                "Local branch %s is starting from the current env state because no saved snapshot is available.",
+                branch_index,
+            )
+            return ReplayResult(
+                success=True,
+                restore_mode=RestoreMode.RESET_ONLY,
+                divergence_reason=env.validate_restored_state(
+                    expected_observation=base_state.observation,
+                    expected_score=base_state.score,
+                    expected_inventory_text=base_state.inventory_text,
+                ).divergence_reason,
+                final_observation=base_state.observation,
+                final_score=base_state.score,
+                replayed_action_count=0,
+                target_step_index=None,
+                final_state=base_state,
+                message="No saved node was available; using the current env state as the branch start.",
+            )
+
+        return restore_saved_node(
+            env,
+            base_saved_node,
+            target_step_index=base_saved_node.step_index,
+            logger=self.logger,
+        )
+
+    def _saved_node_from_state(self, state: TextGameState) -> SavedNode | None:
+        """Build a replayable saved node from a restored state snapshot."""
+
+        snapshot = state.world_state_snapshot
+        if snapshot is None:
+            return None
+        step_index = len(snapshot.replay_actions) - 1
+        return SavedNode(
+            state_id=state.world_state_hash,
+            episode_id=str(state.metadata.get("episode_id", "local-explorer")),
+            step_index=step_index,
+            native_state=snapshot.native_state,
+            action_prefix=list(snapshot.replay_actions),
+            score=state.score,
+            observation=state.observation,
+            inventory_text=state.inventory_text,
+            world_state_hash=state.world_state_hash,
+            valid_actions=list(state.valid_actions),
+            summary_text=str(state.metadata.get("summary_text", "")),
+            metadata=dict(state.metadata),
+        )
+
+    def _choose_branch_action(
+        self,
+        *,
+        proposals: list[ActionProposal],
+        branch_index: int,
+        step_offset: int,
+    ) -> str:
+        """Diversify shallow branches mainly through the first action."""
+
+        if step_offset == 0:
+            proposal_index = min(branch_index, len(proposals) - 1)
+        else:
+            proposal_index = 0
+        return proposals[proposal_index].action
+
+    def _branch_context(self, *, base_context: str | None, actions_taken: list[str]) -> str:
+        """Build a short trajectory context string for the current branch."""
+
+        context_parts: list[str] = []
+        if base_context:
+            context_parts.append(base_context.strip())
+        if actions_taken:
+            context_parts.append("branch_actions=" + " -> ".join(actions_taken[-3:]))
+        return " | ".join(part for part in context_parts if part)
+
+    def _describe_observation_changes(
+        self,
+        *,
+        base_state: TextGameState,
+        visited_states: list[TextGameState],
+        score_change: int,
+    ) -> tuple[list[str], bool, bool, set[str]]:
+        """Describe notable branch changes and whether anything novel appeared."""
+
+        notes: list[str] = []
+        base_tokens = self._significant_tokens(f"{base_state.observation} {base_state.inventory_text}")
+        state_hash_changed = False
+
+        for state in visited_states[1:]:
+            if state.world_state_hash != base_state.world_state_hash:
+                state_hash_changed = True
+
+        if score_change > 0:
+            notes.append(f"score increased by {score_change}")
+        elif score_change < 0:
+            notes.append(f"score decreased by {-score_change}")
+
+        if state_hash_changed:
+            notes.append("world state changed")
+
+        final_state = visited_states[-1]
+        novel_tokens = self._significant_tokens(f"{final_state.observation} {final_state.inventory_text}") - base_tokens
+        new_room_location_signal = (
+            final_state.world_state_hash != base_state.world_state_hash
+            and self._normalize_text(final_state.observation) != self._normalize_text(base_state.observation)
+            and self._looks_like_location_signal(final_state.observation)
+        )
+        if self._normalize_text(final_state.observation) != self._normalize_text(base_state.observation):
+            notes.append("final observation changed")
+        if novel_tokens:
+            preview = ", ".join(sorted(novel_tokens)[:5])
+            notes.append(f"new tokens: {preview}")
+
+        new_room_or_object_detected = bool(novel_tokens) or new_room_location_signal
+        return notes, new_room_or_object_detected, new_room_location_signal, novel_tokens
+
+    def _appears_stuck(
+        self,
+        *,
+        base_state: TextGameState,
+        visited_states: list[TextGameState],
+        total_reward: float,
+        score_change: int,
+        new_room_or_object_detected: bool,
+        oscillation_penalty_total: float,
+        movement_penalty_total: float,
+    ) -> bool:
+        """Return whether a branch looks unproductive by simple local heuristics."""
+
+        normalized_observations = {self._normalize_text(state.observation) for state in visited_states}
+        unique_hashes = {state.world_state_hash for state in visited_states}
+        return (
+            total_reward <= 0.0
+            and score_change == 0
+            and not new_room_or_object_detected
+            and len(normalized_observations) <= 1
+            and len(unique_hashes) <= 1
+            and oscillation_penalty_total <= 0.0
+            and movement_penalty_total <= 0.0
+        ) or (
+            total_reward <= 0.0
+            and score_change == 0
+            and (oscillation_penalty_total > 0.0 or movement_penalty_total > 0.0)
+        )
+
+    def _significant_tokens(self, text: str) -> set[str]:
+        """Extract a small set of informative tokens for novelty heuristics."""
+
+        return {
+            token
+            for token in re.findall(r"[a-z]+", text.lower())
+            if len(token) > 2 and token not in _STOPWORDS
+        }
+
+    def _normalize_text(self, text: str) -> str:
+        """Normalize observation text for simple equality checks."""
+
+        return " ".join(text.split()).strip().lower()
+
+    def _branch_sort_key(self, branch: LocalBranchOutcome) -> tuple[float, float, int, int, float, float, int]:
+        """Return an explicit comparison key for branch outcomes."""
+
+        return (
+            float(branch.branch_progress_score),
+            float(branch.score_change),
+            int(branch.inventory_changed),
+            int(branch.affordance_gain),
+            float(branch.total_reward - branch.oscillation_penalty_total - branch.movement_penalty_total),
+            -float(branch.movement_penalty_total),
+            int(not branch.appears_stuck),
+            -len(branch.actions_taken),
+        )
+
+    def _count_new_affordances(self, *, base_state: TextGameState, final_state: TextGameState) -> int:
+        """Count newly surfaced valid actions across the branch."""
+
+        base_actions = {self._normalize_text(action) for action in base_state.valid_actions if self._normalize_text(action)}
+        discovered_actions = {
+            self._normalize_text(action)
+            for action in final_state.valid_actions
+            if self._normalize_text(action) and self._normalize_text(action) not in base_actions
+        }
+        return min(len(discovered_actions), 4)
+
+    def _loop_penalty_reduction(self, loop_results: list[LoopHeuristicResult]) -> float:
+        """Measure whether the branch moved away from an early oscillation pattern."""
+
+        if not loop_results:
+            return 0.0
+        penalties = [loop_result.total_penalty for loop_result in loop_results]
+        return max(0.0, max(penalties) - penalties[-1])
+
+    def _branch_progress_score(
+        self,
+        *,
+        score_change: int,
+        inventory_changed: bool,
+        affordance_gain: int,
+        landmark_gain: int,
+        novel_object_count: int,
+        room_text_only_gain: float,
+        loop_penalty_reduction: float,
+        oscillation_penalty_total: float,
+        movement_penalty_total: float,
+    ) -> float:
+        """Score one branch using explicit weighted progress signals."""
+
+        policy = self.action_generator.config.policy
+        return (
+            max(float(score_change), 0.0) * policy.branch_progress_score_weight
+            + (1.0 if inventory_changed else 0.0) * policy.branch_progress_inventory_weight
+            + float(affordance_gain) * policy.branch_progress_affordance_weight
+            + float(landmark_gain) * policy.branch_progress_location_weight
+            + float(novel_object_count) * policy.branch_progress_object_weight
+            + float(room_text_only_gain) * policy.room_text_only_weight
+            + float(loop_penalty_reduction) * policy.branch_progress_loop_reduction_weight
+            - float(oscillation_penalty_total)
+            - float(movement_penalty_total)
+        )
+
+    def _looks_like_location_signal(self, observation: str) -> bool:
+        """Return whether an observation looks like a room/location transition."""
+
+        tokens = self._significant_tokens(observation)
+        return bool(tokens & _LOCATION_HINT_TOKENS)
+
+    def _room_text_only_gain(
+        self,
+        *,
+        base_state: TextGameState,
+        final_state: TextGameState,
+        score_change: int,
+        inventory_changed: bool,
+        affordance_gain: int,
+        novel_object_count: int,
+        landmark_gain: int,
+    ) -> float:
+        """Return a small gain only when branch novelty is mostly room-text variation."""
+
+        if self._normalize_text(base_state.observation) == self._normalize_text(final_state.observation):
+            return 0.0
+        if score_change != 0 or inventory_changed or affordance_gain > 0 or novel_object_count > 0:
+            return 0.0
+        if landmark_gain > 0:
+            return 0.0
+        return 1.0
+
+    def _annotate_branch_state(
+        self,
+        state: TextGameState,
+        *,
+        history: ActionClusterHistory | None,
+        previous_state: TextGameState | None,
+        score_gain: int,
+        inventory_changed: bool,
+        affordance_gain: int,
+        novel_object_count: int,
+        movement_only_action: bool,
+        materially_new_actions: bool,
+    ) -> TextGameState:
+        """Attach region-cluster metadata used by movement suppression heuristics."""
+
+        state.state_cluster_id = derive_state_cluster_id(
+            observation=state.observation,
+            inventory_text=state.inventory_text,
+            valid_actions=state.valid_actions,
+            summary_text=str(state.metadata.get("summary_text", "")),
+            inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+        )
+        if history is None:
+            observation_seen_before = False
+            state.cluster_visit_count = max(state.cluster_visit_count, 1)
+        else:
+            state.cluster_visit_count, observation_seen_before = history.record_state_cluster(
+                cluster_id=state.state_cluster_id,
+                observation=state.observation,
+            )
+        state.region_novelty_score = compute_region_novelty_score(
+            cluster_visit_count=state.cluster_visit_count,
+            observation_seen_before=observation_seen_before,
+            score_gain=score_gain,
+            inventory_changed=inventory_changed,
+            affordance_gain=affordance_gain,
+            novel_object_count=novel_object_count,
+            materially_new_actions=materially_new_actions,
+            movement_only_action=movement_only_action,
+        )
+        state.metadata = dict(state.metadata)
+        state.metadata["state_cluster_id"] = state.state_cluster_id
+        state.metadata["cluster_visit_count"] = state.cluster_visit_count
+        state.metadata["region_novelty_score"] = state.region_novelty_score
+        if previous_state is not None:
+            state.metadata["previous_state_cluster_id"] = previous_state.state_cluster_id
+        return state
+
+    def _is_movement_action(self, action: str) -> bool:
+        """Return whether one action is primarily navigation."""
+
+        return is_movement_action(action, self.action_generator.config.policy.inverse_action_pairs)

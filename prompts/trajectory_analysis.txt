@@ -1,0 +1,19 @@
+Episode id: {episode_id}
+Seed: {seed}
+
+Recent trajectory:
+{trajectory_excerpt}
+
+Grounding constraints:
+{grounding_constraints}
+
+Return only compact game-grounded guidance supported by the observed outcomes.
+Do not repeat prompt instructions, objective/task/format text, or self-referential language.
+Prefer concrete Zork actions and nouns.
+
+Use this plain-text schema:
+try_actions: action; action
+avoid_actions: action; action
+salient_objects: noun; noun
+discovered_affordances: noun -> verb; noun -> verb
+short_guidance_text: one short operational sentence tied to observed outcomes

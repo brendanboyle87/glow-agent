@@ -1,0 +1,21 @@
+Local rollout summaries:
+{state_summary}
+
+Recent action patterns:
+{recent_actions}
+
+Grounding constraints:
+{grounding_constraints}
+
+Return only compact game-grounded guidance supported by the observed outcomes.
+Do not repeat prompt instructions, objective/task/format text, or self-referential language.
+Prefer concrete Zork actions and nouns.
+Only put an action in avoid_actions if it was repeatedly low-value, looped, or clearly underperformed alternatives.
+Do not mark an action as avoid if it revealed the only meaningful object, affordance, or inventory change.
+
+Use this plain-text schema:
+try_actions: action; action
+avoid_actions: action; action
+salient_objects: noun; noun
+discovered_affordances: noun -> verb; noun -> verb
+short_guidance_text: one short operational sentence tied to observed outcomes

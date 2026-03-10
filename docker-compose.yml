@@ -1,0 +1,20 @@
+services:
+  jericho:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.jericho
+    image: glow-agent-jericho:latest
+    working_dir: /workspace
+    init: true
+    environment:
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
+      LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-lm-studio}
+      LMSTUDIO_MODEL_NAME: ${LMSTUDIO_MODEL_NAME:-local-model}
+      ZORK1_GAME_PATH: ${ZORK1_GAME_PATH:-games/zork1.z5}
+      SMOKE_CONFIG: ${DOCKER_SMOKE_CONFIG:-configs/zork1_local.yaml}
+    volumes:
+      - .:/workspace
+    stdin_open: true
+    tty: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

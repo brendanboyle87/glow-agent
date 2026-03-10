@@ -1,0 +1,102 @@
+extends:
+
+project_name: zork-agent
+
+runtime:
+  jericho_game_path: games/zork1.z5
+  use_live_jericho: false
+  docker_image: glow-agent-jericho:latest
+  container_workdir: /workspace
+  docker_notes:
+    - "Run Jericho inside Docker on Linux for compatibility."
+    - "When the agent runs in Docker on macOS, use host.docker.internal for LM Studio."
+
+llm:
+  provider: lmstudio
+  base_url: http://127.0.0.1:1234/v1
+  api_key: lm-studio
+  model_name: local-model
+  temperature: 0.2
+  max_tokens: 256
+  request_timeout_seconds: 60.0
+  offline_stub: true
+
+prompts:
+  directory: prompts
+  system_file: system.txt
+  action_proposal_file: action_proposal.txt
+  trajectory_analysis_file: trajectory_analysis.txt
+  local_reflection_file: local_reflection.txt
+  state_selection_file: state_selection.txt
+
+policy:
+  rollout_count: 4
+  rollout_depth: 6
+  frontier_max_size: 32
+  snapshot_retention_limit: 8
+  archive_top_k: 8
+  action_candidates: 4
+  state_selection_mode: heuristic
+  inverse_action_pairs:
+    open: close
+    take: drop
+    enter: exit
+    turn on: turn off
+  immediate_inverse_penalty: 0.75
+  repeated_pair_penalty: 1.0
+  reversible_no_progress_penalty: 1.0
+  repeated_movement_penalty: 1.25
+  movement_cycle_penalty: 1.5
+  same_region_repeat_penalty: 0.75
+  action_untried_bonus: 2.0
+  action_new_noun_bonus: 1.0
+  action_new_noun_interaction_bonus: 1.25
+  action_repeated_no_gain_penalty: 1.0
+  branch_progress_score_weight: 1.0
+  branch_progress_inventory_weight: 1.0
+  branch_progress_affordance_weight: 0.35
+  branch_progress_location_weight: 1.0
+  branch_progress_object_weight: 0.25
+  branch_progress_loop_reduction_weight: 0.5
+  room_text_only_weight: 0.1
+  movement_progress_cap: 0.5
+  min_affordance_gain_for_movement_commit: 1
+  branch_commit_min_progress_score: 1.0
+  frontier_loop_penalty_weight: 1.0
+  frontier_movement_penalty_weight: 1.0
+  frontier_room_text_only_penalty_weight: 0.75
+  frontier_reversible_state_penalty_weight: 1.0
+  frontier_revisit_saturation_penalty_weight: 1.0
+  frontier_cluster_revisit_saturation_weight: 0.75
+  frontier_reversible_toggle_novelty_scale: 0.2
+  frontier_trivial_observation_novelty_scale: 0.35
+  frontier_oscillating_pair_novelty_scale: 0.2
+  frontier_family_repeat_novelty_decay: 0.75
+  frontier_family_repeat_penalty: 0.5
+  frontier_family_revisit_saturation_weight: 0.5
+  frontier_base_reversible_state_penalty: 0.75
+  frontier_oscillating_pair_penalty: 1.0
+  frontier_trivial_reversible_penalty: 0.5
+
+paths:
+  artifacts_dir: artifacts
+  trajectory_dir: artifacts/trajectories
+  archive_dir: artifacts/archive
+  log_dir: artifacts/logs
+  summary_dir: artifacts/summaries
+
+logging:
+  level: INFO
+  run_log_filename: agent.log
+
+experiment:
+  game_id: zork1
+  seed: 7
+  batch_size: 3
+  max_steps: 8
+  max_replay_attempts: 2
+  frontier_refresh_cadence: 1
+  local_exploration_cadence: 3
+  branch_commit_steps: 4
+  stub_episode_length: 3
+  deterministic: true

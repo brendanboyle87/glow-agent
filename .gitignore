@@ -1,0 +1,13 @@
+# TODO: tighten ignores if the repository later adopts tracked artifacts.
+.env
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+artifacts/
+build/
+dist/
+games/
+
