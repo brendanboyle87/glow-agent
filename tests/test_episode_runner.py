@@ -338,6 +338,102 @@ def test_episode_runner_rejects_zero_value_local_branch_commit(tmp_path: Path) -
     assert "did not clear threshold" in result.metadata["commit_rejection_reason"]
 
 
+def test_episode_runner_skips_local_exploration_during_post_gain_cooldown(tmp_path: Path) -> None:
+    """Score gains should start a cooldown that suppresses immediate revisit/local-exploration probes."""
+
+    class CooldownEnv:
+        """Tiny env that scores once, then keeps offering plain movement."""
+
+        def __init__(self) -> None:
+            self._step = 0
+
+        def reset(self, seed: int | None = None) -> TextGameState:
+            self._step = 0
+            return TextGameState(
+                observation="Mailbox scene.",
+                inventory_text="Inventory empty.",
+                valid_actions=["take treasure", "north"],
+                score=0,
+                moves=0,
+                done=False,
+                world_state_hash="mailbox-start",
+            )
+
+        def step(self, action: str) -> TextGameTransition:
+            self._step += 1
+            if action == "take treasure":
+                return TextGameTransition(
+                    action=action,
+                    step_index=self._step - 1,
+                    observation="You are carrying a treasure.",
+                    reward=1.0,
+                    done=False,
+                    score=1,
+                    moves=self._step,
+                    inventory_text="You are carrying a treasure.",
+                    valid_actions=["north"],
+                    world_state_hash="treasure-state",
+                )
+            return TextGameTransition(
+                action=action,
+                step_index=self._step - 1,
+                observation="A plain hallway.",
+                reward=0.0,
+                done=False,
+                score=1,
+                moves=self._step,
+                inventory_text="You are carrying a treasure.",
+                valid_actions=["north"],
+                world_state_hash=f"hall-{self._step}",
+            )
+
+        def close(self) -> None:
+            return None
+
+    config = _build_config(tmp_path)
+    config.ensure_output_directories()
+    config.experiment.max_steps = 4
+    config.experiment.local_exploration_cadence = 2
+    config.experiment.local_exploration_post_gain_cooldown_steps = 3
+    config.experiment.max_replay_attempts = 3
+    runner = EpisodeRunner(config=config, llm_client=None)
+    runner.env = CooldownEnv()  # type: ignore[assignment]
+    runner.local_explorer.env = runner.env  # type: ignore[assignment]
+
+    def fake_propose_actions(state: TextGameState, **kwargs) -> list[ActionProposal]:
+        if "treasure" in state.inventory_text.lower():
+            return [ActionProposal(action="north", source="stub")]
+        return [ActionProposal(action="take treasure", source="stub")]
+
+    explore_call_count = 0
+
+    def fake_explore_from_state(*args, **kwargs) -> LocalExplorationResult:
+        nonlocal explore_call_count
+        explore_call_count += 1
+        base_state = args[0]
+        return LocalExplorationResult(
+            base_state=base_state,
+            branch_count=1,
+            branch_horizon=1,
+            temperature=0.2,
+            action_candidate_count=1,
+            branches=[],
+            best_branch_index=None,
+            branch_commit_allowed=False,
+            commit_rejection_reason="no branches",
+            comparison_notes="should not be called during cooldown",
+        )
+
+    runner.action_generator.propose_actions = fake_propose_actions  # type: ignore[method-assign]
+    runner.local_explorer.explore_from_state = fake_explore_from_state  # type: ignore[method-assign]
+
+    result = runner.run_episode(episode_id="episode-runner-cooldown")
+
+    assert result.final_score == 1
+    assert explore_call_count == 0
+    assert result.metadata["local_exploration_count"] == 0
+
+
 def test_episode_runner_fails_fast_on_stalled_movement_basin(tmp_path: Path) -> None:
     """Movement-only no-progress episodes should stop early instead of burning the whole budget."""
 

@@ -21,7 +21,13 @@ from zork_agent.env.jericho_env import JerichoEnv
 from zork_agent.llm.prompts import PromptManager
 from zork_agent.policy.action_generator import ActionGenerator
 from zork_agent.policy.local_explorer import LocalExplorer
-from zork_agent.types import ActionProposal, BranchTerminationReason, LocalBranchOutcome, TextGameState
+from zork_agent.types import (
+    ActionProposal,
+    BranchTerminationReason,
+    LocalBranchOutcome,
+    TextGameState,
+    WorldStateSnapshot,
+)
 
 
 class _FakeInventoryItem:
@@ -628,3 +634,72 @@ def test_local_explorer_rejects_exit_only_branch_without_score_or_inventory(tmp_
 
     assert allowed is False
     assert "changed reachable exits without score or inventory gain" in reason
+
+
+def test_local_explorer_stops_early_in_post_score_stale_scene(tmp_path: Path) -> None:
+    """Post-score stale scenes should stop sampling branches once multiple zero-progress probes agree."""
+
+    config = _build_config(tmp_path)
+    config.policy.post_score_scene_branch_patience = 2
+    env = JerichoEnv(config, env_factory=BranchingBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    base_state = TextGameState(
+        observation="You are in the jeweled egg tree scene.",
+        inventory_text="You are carrying a jewel-encrusted egg.",
+        valid_actions=["take nest", "down", "close nest"],
+        score=5,
+        moves=7,
+        done=False,
+        world_state_hash="egg-scene",
+        state_cluster_id="region:egg|encrusted|jewel",
+        world_state_snapshot=WorldStateSnapshot(
+            step_index=7,
+            observation="You are in the jeweled egg tree scene.",
+            done=False,
+            score=5,
+            moves=7,
+            inventory_text="You are carrying a jewel-encrusted egg.",
+            valid_actions=["take nest", "down", "close nest"],
+            world_state_hash="egg-scene",
+            replay_actions=["north", "west", "up", "take egg"],
+            native_state=("fake", "egg-scene"),
+            restore_strategy="native_snapshot",
+        ),
+    )
+
+    call_count = 0
+
+    def fake_run_branch(*args, **kwargs) -> LocalBranchOutcome:
+        nonlocal call_count
+        branch_index = kwargs["branch_index"]
+        call_count += 1
+        return LocalBranchOutcome(
+            branch_index=branch_index,
+            actions_taken=["take nest", "down", "up"],
+            total_reward=0.0,
+            score_change=0,
+            final_score=5,
+            final_observation="You are in the jeweled egg tree scene.",
+            terminated=False,
+            termination_reason=BranchTerminationReason.HORIZON_REACHED,
+            persistent_inventory_gain_count=0,
+            persistent_affordance_gain=0,
+            persistent_exit_gain_count=0,
+            ended_in_same_cluster=True,
+            durable_progress=False,
+            post_gain_churn_action_count=1,
+            branch_progress_score=0.0,
+            final_state=base_state,
+        )
+
+    explorer._run_branch = fake_run_branch  # type: ignore[method-assign]
+
+    result = explorer.explore_from_state(base_state, branch_count=6, branch_horizon=8)
+
+    assert call_count == 2
+    assert result.branch_count == 2
+    assert len(result.branches) == 2
+    assert "post-score scene" in result.comparison_notes

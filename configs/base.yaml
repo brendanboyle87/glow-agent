@@ -115,6 +115,8 @@ policy:
   branch_fail_fast_min_movement_actions: 3
   branch_fail_fast_bulk_no_progress_steps: 2
   branch_fail_fast_post_gain_churn_actions: 2
+  branch_fail_fast_post_score_no_progress_steps: 3
+  post_score_scene_branch_patience: 2
   frontier_loop_penalty_weight: 1.0
   frontier_movement_penalty_weight: 1.0
   frontier_room_text_only_penalty_weight: 0.75
@@ -150,6 +152,7 @@ experiment:
   max_replay_attempts: 2
   frontier_refresh_cadence: 1
   local_exploration_cadence: 3
+  local_exploration_post_gain_cooldown_steps: 0
   branch_commit_steps: 4
   fail_fast_no_durable_gain_steps: 10
   fail_fast_same_cluster_movement_steps: 6

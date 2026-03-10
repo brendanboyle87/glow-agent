@@ -212,6 +212,8 @@ class PolicyConfig(StrictModel):
     branch_fail_fast_min_movement_actions: int = 3
     branch_fail_fast_bulk_no_progress_steps: int = 2
     branch_fail_fast_post_gain_churn_actions: int = 2
+    branch_fail_fast_post_score_no_progress_steps: int = 3
+    post_score_scene_branch_patience: int = 2
     frontier_loop_penalty_weight: float = 1.0
     frontier_movement_penalty_weight: float = 1.0
     frontier_room_text_only_penalty_weight: float = 0.75
@@ -279,6 +281,8 @@ class PolicyConfig(StrictModel):
         "branch_fail_fast_min_movement_actions",
         "branch_fail_fast_bulk_no_progress_steps",
         "branch_fail_fast_post_gain_churn_actions",
+        "branch_fail_fast_post_score_no_progress_steps",
+        "post_score_scene_branch_patience",
     )
     @classmethod
     def validate_positive_branch_policy_counts(cls, value: int, info) -> int:
@@ -443,6 +447,7 @@ class ExperimentConfig(StrictModel):
     max_replay_attempts: int = 2
     frontier_refresh_cadence: int = 1
     local_exploration_cadence: int = 3
+    local_exploration_post_gain_cooldown_steps: int = 0
     branch_commit_steps: int = 4
     fail_fast_no_durable_gain_steps: int = 10
     fail_fast_same_cluster_movement_steps: int = 6
@@ -456,6 +461,7 @@ class ExperimentConfig(StrictModel):
         "max_replay_attempts",
         "frontier_refresh_cadence",
         "local_exploration_cadence",
+        "local_exploration_post_gain_cooldown_steps",
         "branch_commit_steps",
         "fail_fast_no_durable_gain_steps",
         "fail_fast_same_cluster_movement_steps",
@@ -465,7 +471,7 @@ class ExperimentConfig(StrictModel):
     def validate_nonnegative_values(cls, value: int, info) -> int:
         """Validate core experiment budgets."""
 
-        minimum = 0 if info.field_name in {"seed", "max_replay_attempts"} else 1
+        minimum = 0 if info.field_name in {"seed", "max_replay_attempts", "local_exploration_post_gain_cooldown_steps"} else 1
         if value < minimum:
             raise ValueError(f"experiment.{info.field_name} must be >= {minimum}.")
         return value

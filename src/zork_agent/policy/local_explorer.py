@@ -175,6 +175,7 @@ class LocalExplorer:
             effective_branch_count = 1
 
         branches: list[LocalBranchOutcome] = []
+        post_score_stale_branch_count = 0
         for branch_index in range(effective_branch_count):
             outcome = self._run_branch(
                 branch_index=branch_index,
@@ -187,6 +188,25 @@ class LocalExplorer:
                 recent_trajectory_context=recent_trajectory_context,
             )
             branches.append(outcome)
+            if self._is_post_score_stale_branch(base_state=restored_state, branch=outcome):
+                post_score_stale_branch_count += 1
+            else:
+                post_score_stale_branch_count = 0
+
+            if (
+                restored_state.score > 0
+                and post_score_stale_branch_count
+                >= self.action_generator.config.policy.post_score_scene_branch_patience
+            ):
+                comparison_notes = (
+                    "Local exploration stopped early after repeated no-progress branches in a "
+                    "post-score scene."
+                )
+                self.logger.info(
+                    "Stopping local exploration early for post-score scene after %s stale branches.",
+                    post_score_stale_branch_count,
+                )
+                break
 
         best_branch_index = None
         branch_commit_allowed = False
@@ -221,7 +241,7 @@ class LocalExplorer:
 
         return LocalExplorationResult(
             base_state=restored_state,
-            branch_count=effective_branch_count,
+            branch_count=len(branches),
             branch_horizon=effective_branch_horizon,
             temperature=effective_temperature,
             action_candidate_count=effective_action_candidate_count,
@@ -1341,10 +1361,45 @@ class LocalExplorer:
         ):
             return True
 
+        if (
+            base_state.score > 0
+            and not durable_progress
+            and action_cluster_history.no_progress_steps
+            >= self.action_generator.config.policy.branch_fail_fast_post_score_no_progress_steps
+            and (
+                post_gain_churn_action_count > 0
+                or current_state.state_cluster_id == base_state.state_cluster_id
+            )
+        ):
+            return True
+
         return (
             not durable_progress
             and current_state.state_cluster_id == base_state.state_cluster_id
             and action_cluster_history.movement_no_progress_steps >= self.action_generator.config.policy.object_family_no_progress_threshold
+        )
+
+    def _is_post_score_stale_branch(
+        self,
+        *,
+        base_state: TextGameState,
+        branch: LocalBranchOutcome,
+    ) -> bool:
+        """Return whether a post-score branch is just re-proving a stale local scene."""
+
+        if base_state.score <= 0:
+            return False
+        return (
+            branch.score_change <= 0
+            and branch.persistent_inventory_gain_count <= 0
+            and branch.persistent_exit_gain_count <= 0
+            and branch.persistent_affordance_gain <= 0
+            and (
+                branch.post_gain_churn_action_count > 0
+                or branch.ended_in_same_cluster
+                or branch.termination_reason is BranchTerminationReason.LOOP_ABORTED
+                or branch.appears_stuck
+            )
         )
 
     def _is_low_value_movement_branch(

@@ -122,6 +122,7 @@ class EpisodeRunner:
         consecutive_same_cluster_movement_steps = 0
         recent_stalled_movement_clusters: list[str] = []
         episode_fail_fast_reason = ""
+        local_exploration_cooldown_steps = 0
         last_selection_result: StateSelectionResult | None = None
         last_local_exploration = None
 
@@ -179,7 +180,11 @@ class EpisodeRunner:
                 # Revisit a saved frontier node periodically, then probe it locally before committing.
                 if (
                     not pending_branch_actions
-                    and self._should_run_local_exploration(episode_step_index, replay_attempt_count)
+                    and self._should_run_local_exploration(
+                        episode_step_index,
+                        replay_attempt_count,
+                        local_exploration_cooldown_steps,
+                    )
                 ):
                     last_selection_result = self.state_selector.select_with_details(
                         self.frontier,
@@ -587,6 +592,15 @@ class EpisodeRunner:
                 )
                 step.metadata["durable_progress"] = durable_progress
 
+                score_gain = next_state.score - pre_step_state.score
+                if durable_progress and score_gain > 0:
+                    local_exploration_cooldown_steps = max(
+                        local_exploration_cooldown_steps,
+                        self.config.experiment.local_exploration_post_gain_cooldown_steps,
+                    )
+                elif local_exploration_cooldown_steps > 0:
+                    local_exploration_cooldown_steps -= 1
+
                 self.logger.info(
                     "Episode %s step %s action=%s source=%s score=%s reward=%.2f frontier=%s loop_penalty=%.2f "
                     "movement_penalty=%.2f cluster=%s region_novelty=%.2f affordance_gain=%s room_text_only_gain=%.2f "
@@ -726,6 +740,7 @@ class EpisodeRunner:
             "max_replay_attempts": self.config.experiment.max_replay_attempts,
             "frontier_refresh_cadence": self.config.experiment.frontier_refresh_cadence,
             "local_exploration_cadence": self.config.experiment.local_exploration_cadence,
+            "local_exploration_post_gain_cooldown_steps": self.config.experiment.local_exploration_post_gain_cooldown_steps,
             "branch_commit_steps": self.config.experiment.branch_commit_steps,
             "rollout_count": self.config.policy.rollout_count,
             "rollout_depth": self.config.policy.rollout_depth,
@@ -991,13 +1006,20 @@ class EpisodeRunner:
         seen_world_hashes.add(state.world_state_hash)
         seen_observation_signatures.add(observation_signature)
 
-    def _should_run_local_exploration(self, episode_step_index: int, replay_attempt_count: int) -> bool:
+    def _should_run_local_exploration(
+        self,
+        episode_step_index: int,
+        replay_attempt_count: int,
+        local_exploration_cooldown_steps: int,
+    ) -> bool:
         """Return whether the loop should revisit a saved node before the next real step."""
 
         cadence = max(1, self.config.experiment.local_exploration_cadence)
         if self.config.experiment.max_replay_attempts <= replay_attempt_count:
             return False
         if episode_step_index <= 0:
+            return False
+        if local_exploration_cooldown_steps > 0:
             return False
         return episode_step_index % cadence == 0 and len(self.frontier) > 0
 
