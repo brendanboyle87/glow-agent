@@ -164,6 +164,8 @@ class PolicyConfig(StrictModel):
     movement_repeat_penalty: float = 1.25
     same_cluster_movement_penalty: float = 1.0
     reflection_supported_avoid_penalty: float = 1.25
+    other_action_penalty: float = 1.25
+    escape_mode_other_action_penalty: float = 1.5
     action_untried_bonus: float = 2.0
     action_new_noun_bonus: float = 1.0
     action_new_noun_interaction_bonus: float = 1.25
@@ -183,16 +185,23 @@ class PolicyConfig(StrictModel):
     object_family_success_bonus: float = 0.5
     object_family_no_progress_threshold: int = 2
     object_family_exhaustion_penalty: float = 2.0
+    post_score_scene_exhaustion_penalty: float = 2.5
+    stale_reflection_try_penalty: float = 0.75
     escape_mode_exit_bonus: float = 1.5
     discard_inventory_penalty: float = 2.0
+    bulk_inventory_action_penalty: float = 2.5
     branch_progress_score_weight: float = 1.0
     branch_progress_inventory_weight: float = 1.0
     branch_progress_inventory_loss_penalty: float = 1.25
+    branch_inventory_churn_penalty: float = 2.0
     branch_progress_affordance_weight: float = 0.35
     branch_progress_exit_weight: float = 1.0
     branch_progress_location_weight: float = 1.0
     branch_progress_object_weight: float = 0.25
     branch_progress_loop_reduction_weight: float = 0.5
+    branch_post_gain_churn_penalty: float = 1.25
+    branch_aggressive_action_penalty: float = 1.5
+    branch_speculative_action_penalty: float = 0.75
     room_text_only_weight: float = 0.1
     movement_progress_cap: float = 0.5
     min_affordance_gain_for_movement_commit: int = 1
@@ -201,6 +210,8 @@ class PolicyConfig(StrictModel):
     branch_fail_fast_penalty_threshold: float = 3.0
     branch_fail_fast_movement_ratio_threshold: float = 0.75
     branch_fail_fast_min_movement_actions: int = 3
+    branch_fail_fast_bulk_no_progress_steps: int = 2
+    branch_fail_fast_post_gain_churn_actions: int = 2
     frontier_loop_penalty_weight: float = 1.0
     frontier_movement_penalty_weight: float = 1.0
     frontier_room_text_only_penalty_weight: float = 0.75
@@ -264,13 +275,17 @@ class PolicyConfig(StrictModel):
             raise ValueError(f"policy.{info.field_name} must be between 0.0 and 1.0.")
         return value
 
-    @field_validator("branch_fail_fast_min_movement_actions")
+    @field_validator(
+        "branch_fail_fast_min_movement_actions",
+        "branch_fail_fast_bulk_no_progress_steps",
+        "branch_fail_fast_post_gain_churn_actions",
+    )
     @classmethod
-    def validate_branch_fail_fast_min_movement_actions(cls, value: int) -> int:
-        """Require a positive branch fail-fast movement count."""
+    def validate_positive_branch_policy_counts(cls, value: int, info) -> int:
+        """Require positive branch-policy counters and thresholds."""
 
         if value <= 0:
-            raise ValueError("policy.branch_fail_fast_min_movement_actions must be greater than 0.")
+            raise ValueError(f"policy.{info.field_name} must be greater than 0.")
         return value
 
     @field_validator("inverse_action_pairs")
@@ -302,21 +317,30 @@ class PolicyConfig(StrictModel):
         "movement_repeat_penalty",
         "same_cluster_movement_penalty",
         "reflection_supported_avoid_penalty",
+        "other_action_penalty",
+        "escape_mode_other_action_penalty",
         "action_untried_bonus",
         "action_new_noun_bonus",
         "action_new_noun_interaction_bonus",
         "action_repeated_no_gain_penalty",
         "object_family_exhaustion_penalty",
+        "post_score_scene_exhaustion_penalty",
+        "stale_reflection_try_penalty",
         "escape_mode_exit_bonus",
         "discard_inventory_penalty",
+        "bulk_inventory_action_penalty",
         "branch_progress_score_weight",
         "branch_progress_inventory_weight",
         "branch_progress_inventory_loss_penalty",
+        "branch_inventory_churn_penalty",
         "branch_progress_affordance_weight",
         "branch_progress_exit_weight",
         "branch_progress_location_weight",
         "branch_progress_object_weight",
         "branch_progress_loop_reduction_weight",
+        "branch_post_gain_churn_penalty",
+        "branch_aggressive_action_penalty",
+        "branch_speculative_action_penalty",
         "room_text_only_weight",
         "movement_progress_cap",
         "branch_commit_min_progress_score",

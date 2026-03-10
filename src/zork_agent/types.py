@@ -322,6 +322,16 @@ _MOVEMENT_MACRO_PREFIXES = (
     "go down ",
     "go up ",
 )
+_BULK_INVENTORY_ACTION_PREFIXES = (
+    "take all",
+    "take everything",
+    "get all",
+    "get everything",
+    "drop all",
+    "drop everything",
+    "put down all",
+    "put down everything",
+)
 _MOVEMENT_DIRECTION_OPPOSITES = {
     "north": "south",
     "south": "north",
@@ -492,6 +502,32 @@ def action_uses_inventory_object(
     if not inventory_tokens:
         return False
     return bool(action_target_tokens(action, inverse_pairs) & inventory_tokens)
+
+
+def is_bulk_inventory_action(action: str) -> bool:
+    """Return whether an action is a generic bulk inventory command."""
+
+    normalized = normalize_parser_action(action)
+    if not normalized:
+        return False
+    if normalized in _BULK_INVENTORY_ACTION_PREFIXES:
+        return True
+    if any(normalized.startswith(prefix + " ") for prefix in _BULK_INVENTORY_ACTION_PREFIXES):
+        return True
+    return normalized.endswith(" all") or normalized.endswith(" everything")
+
+
+def is_discard_like_action(action: str) -> bool:
+    """Return whether an action primarily discards or sheds inventory/state."""
+
+    normalized = normalize_parser_action(action)
+    return (
+        normalized.startswith("drop ")
+        or normalized.startswith("put ")
+        or normalized.startswith("insert ")
+        or normalized.startswith("throw ")
+        or normalized.startswith("put down ")
+    )
 
 
 def target_is_container_or_openable_candidate(
@@ -1310,6 +1346,8 @@ class ActionAttemptStats:
     valid_actions_change_count: int = 0
     valid_actions_improvement_count: int = 0
     revealed_object_count: int = 0
+    bulk_inventory_count: int = 0
+    discard_like_count: int = 0
     durable_gain_count: int = 0
     no_gain_count: int = 0
     no_durable_gain_count: int = 0
@@ -1331,6 +1369,8 @@ class ActionAttemptStats:
         valid_actions_changed: bool,
         valid_actions_improved: bool = False,
         revealed_new_object: bool = False,
+        bulk_inventory_action: bool = False,
+        discard_like_action: bool = False,
     ) -> None:
         """Accumulate one observed action outcome."""
 
@@ -1351,9 +1391,20 @@ class ActionAttemptStats:
             self.valid_actions_improvement_count += 1
         if revealed_new_object:
             self.revealed_object_count += 1
+        if bulk_inventory_action:
+            self.bulk_inventory_count += 1
+        if discard_like_action:
+            self.discard_like_count += 1
         if not any((score_changed, inventory_changed, observation_changed, valid_actions_changed)):
             self.no_gain_count += 1
-        durable_progress = any((score_changed, inventory_gained, valid_actions_improved, revealed_new_object))
+        durable_progress = any(
+            (
+                score_changed,
+                valid_actions_improved,
+                revealed_new_object,
+                inventory_gained and not bulk_inventory_action and not discard_like_action,
+            )
+        )
         if durable_progress:
             self.durable_gain_count += 1
         else:
@@ -1380,6 +1431,7 @@ class ActionClusterHistory:
     recent_cluster_sequence: list[str] = field(default_factory=list)
     no_progress_steps: int = 0
     movement_no_progress_steps: int = 0
+    bulk_inventory_no_progress_steps: int = 0
 
     def stats_for(self, action: str) -> ActionAttemptStats:
         """Return mutable stats for an action within this cluster."""
@@ -1422,6 +1474,8 @@ class ActionClusterHistory:
         target_tokens: set[str] | None = None,
         movement_only_action: bool = False,
         inverse_pairs: Mapping[str, str] | None = None,
+        bulk_inventory_action: bool = False,
+        discard_like_action: bool = False,
     ) -> None:
         """Record one attempted action and its observed effect."""
 
@@ -1435,6 +1489,8 @@ class ActionClusterHistory:
             valid_actions_changed=valid_actions_changed,
             valid_actions_improved=valid_actions_improved,
             revealed_new_object=revealed_new_object,
+            bulk_inventory_action=bulk_inventory_action,
+            discard_like_action=discard_like_action,
         )
         verb_family = canonical_if_verb_family(action, inverse_pairs)
         self.stats_for_verb_family(verb_family).record_attempt(
@@ -1446,8 +1502,17 @@ class ActionClusterHistory:
             valid_actions_changed=valid_actions_changed,
             valid_actions_improved=valid_actions_improved,
             revealed_new_object=revealed_new_object,
+            bulk_inventory_action=bulk_inventory_action,
+            discard_like_action=discard_like_action,
         )
-        durable_progress = any((score_changed, inventory_gained, valid_actions_improved, revealed_new_object))
+        durable_progress = any(
+            (
+                score_changed,
+                valid_actions_improved,
+                revealed_new_object,
+                inventory_gained and not bulk_inventory_action and not discard_like_action,
+            )
+        )
         normalized_targets = {normalize_parser_action(token) for token in (target_tokens or set()) if normalize_parser_action(token)}
         for token in normalized_targets:
             self.stats_for_object_noun(token).record_attempt(
@@ -1459,17 +1524,22 @@ class ActionClusterHistory:
                 valid_actions_changed=valid_actions_changed,
                 valid_actions_improved=valid_actions_improved,
                 revealed_new_object=revealed_new_object,
+                bulk_inventory_action=bulk_inventory_action,
+                discard_like_action=discard_like_action,
             )
         if durable_progress:
             self.no_progress_steps = 0
             if movement_only_action:
                 self.movement_no_progress_steps = 0
+            self.bulk_inventory_no_progress_steps = 0
             for token in normalized_targets:
                 self.object_family_no_progress_counts.pop(token, None)
         else:
             self.no_progress_steps += 1
             if movement_only_action:
                 self.movement_no_progress_steps += 1
+            if bulk_inventory_action:
+                self.bulk_inventory_no_progress_steps += 1
             for token in normalized_targets:
                 self.object_family_no_progress_counts[token] = self.object_family_no_progress_counts.get(token, 0) + 1
 
@@ -1547,6 +1617,11 @@ class ActionClusterHistory:
 
         return self.verb_family_stats.get(normalize_parser_action(family), ActionAttemptStats(action="")).durable_gain_count
 
+    def prior_score_success_for_verb_family(self, family: str) -> int:
+        """Return score-gain count for one verb family."""
+
+        return self.verb_family_stats.get(normalize_parser_action(family), ActionAttemptStats(action="")).score_change_count
+
     def prior_failure_for_verb_family(self, family: str) -> int:
         """Return durable-failure count for one verb family."""
 
@@ -1559,6 +1634,16 @@ class ActionClusterHistory:
             return 0
         return max(
             self.object_noun_stats.get(normalize_parser_action(noun), ActionAttemptStats(action="")).durable_gain_count
+            for noun in nouns
+        )
+
+    def prior_score_success_for_object_nouns(self, nouns: set[str]) -> int:
+        """Return the highest score-gain count among the provided object nouns."""
+
+        if not nouns:
+            return 0
+        return max(
+            self.object_noun_stats.get(normalize_parser_action(noun), ActionAttemptStats(action="")).score_change_count
             for noun in nouns
         )
 
@@ -1825,6 +1910,8 @@ class ActionCandidateFeatures:
     object_count: int = 0
     is_movement_action: bool = False
     is_reversible_toggle: bool = False
+    is_bulk_inventory_action: bool = False
+    is_discard_like_action: bool = False
     uses_inventory_object: bool = False
     target_is_new_salient_object: bool = False
     target_is_container_or_openable: bool = False
@@ -1836,9 +1923,11 @@ class ActionCandidateFeatures:
     produced_score_gain_before: bool = False
     produced_inventory_gain_before: bool = False
     produced_affordance_gain_before: bool = False
+    prior_score_success_for_verb_family: bool = False
     prior_success_for_verb_family: bool = False
     prior_success_for_exact_action: bool = False
     prior_failure_for_exact_action: bool = False
+    prior_score_success_for_object_family: bool = False
     prior_success_for_object_family: bool = False
     prior_failure_for_object_family: bool = False
     touches_newly_salient_object: bool = False
@@ -1849,6 +1938,9 @@ class ActionCandidateFeatures:
     touches_exhausted_family: bool = False
     exhausted_family_count: int = 0
     max_family_no_progress_count: int = 0
+    scene_has_score_harvested: bool = False
+    scene_score_success_count: int = 0
+    local_scene_post_score_stale: bool = False
     matches_supported_try_action: bool = False
     matches_supported_avoid_action: bool = False
     plausibility_score: float = 0.0
@@ -2005,7 +2097,15 @@ class LocalBranchOutcome:
     movement_only_action_count: int = 0
     movement_action_ratio: float = 0.0
     movement_repeat_count: int = 0
+    bulk_inventory_action_count: int = 0
+    inventory_churn_penalty: float = 0.0
+    discard_like_action_count: int = 0
+    aggressive_action_count: int = 0
+    speculative_tool_use_action_count: int = 0
+    post_gain_churn_action_count: int = 0
     loop_event_count: int = 0
+    first_durable_gain_action_index: int | None = None
+    first_durable_gain_action: str = ""
     notable_observation_changes: list[str] = field(default_factory=list)
     final_state: TextGameState | None = None
     restore_result: ReplayResult | None = None

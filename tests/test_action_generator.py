@@ -329,6 +329,98 @@ def test_action_generator_prefers_take_leaflet_over_repeated_close_mailbox_with_
     assert close_candidate.loop_penalty > 0.0
 
 
+def test_action_generator_demotes_stale_toggle_even_with_reflection_support(tmp_path: Path) -> None:
+    """Reflection support should not rescue a stale toggle with only affordance-deep history."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. close mailbox | confidence=0.95 | keep working the mailbox"),
+    )
+    history = ActionClusterHistory(cluster_label="mailbox-cluster")
+    history.observe_state_nouns(
+        observation="You are west of the house near a small mailbox.",
+        valid_actions=["open mailbox", "look"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="close mailbox",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=False,
+        revealed_new_object=False,
+        target_tokens={"mailbox"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="Opening the small mailbox reveals a leaflet.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["close mailbox", "take leaflet", "north"],
+        score=0,
+        moves=2,
+        recent_actions=["open mailbox"],
+        state_action_history=history,
+        supported_try_actions=["close mailbox"],
+        supported_reflection_objects=["mailbox", "leaflet"],
+    )
+
+    assert result.candidates[0].action == "take leaflet"
+    close_candidate = next(candidate for candidate in result.candidates if candidate.action == "close mailbox")
+    assert close_candidate.features is not None
+    assert close_candidate.features.matches_supported_try_action is True
+    assert "stale_toggle_without_durable_gain" in close_candidate.ranking_reason
+    assert "reflection_supported_try" not in close_candidate.ranking_reason
+
+
+def test_action_generator_does_not_promote_movement_from_affordance_only_history(
+    tmp_path: Path,
+) -> None:
+    """Movement should not inherit try/history bonuses when it only changed affordances before."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. east | confidence=0.90 | keep exploring"),
+    )
+    history = ActionClusterHistory(cluster_label="house-cluster")
+    history.record_attempt(
+        action="east",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=False,
+        revealed_new_object=False,
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_state_cluster(cluster_id="region:house", observation="East of House.")
+    history.record_state_cluster(cluster_id="region:house", observation="East of House.")
+
+    result = generator.generate(
+        observation="The window is open and the brass lamp is visible.",
+        inventory_text="leaflet",
+        valid_actions=["east", "examine lamp", "take lamp", "close window"],
+        score=0,
+        moves=7,
+        candidate_count=4,
+        state_action_history=history,
+        supported_try_actions=["east"],
+        supported_reflection_objects=["lamp", "window"],
+    )
+
+    assert result.candidates[0].action in {"take lamp", "examine lamp"}
+    east_candidate = next(candidate for candidate in result.candidates if candidate.action == "east")
+    assert "historical_gain" not in east_candidate.ranking_reason
+    assert "reflection_supported_try" not in east_candidate.ranking_reason
+
+
 def test_action_generator_prefers_untried_object_interaction_over_stale_toggle(tmp_path: Path) -> None:
     """Untried salient object interactions should beat repeated no-gain toggle actions."""
 
@@ -621,6 +713,99 @@ def test_action_generator_demotes_exhausted_mailbox_family_actions_after_leaflet
     assert "discard_inventory" in put_leaflet.ranking_reason
 
 
+def test_action_generator_prefers_exit_after_local_scene_already_paid_off(
+    tmp_path: Path,
+) -> None:
+    """After a local object scene already yielded score, exits should beat stale same-scene churn."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. take nest\n2. throw egg at nest\n3. west"),
+    )
+    history = ActionClusterHistory(cluster_label="egg-cluster")
+    history.observe_state_nouns(
+        observation="A jeweled egg rests in a nest.",
+        valid_actions=["take egg", "take nest", "west"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="take egg",
+        score_changed=True,
+        inventory_changed=True,
+        inventory_gained=True,
+        observation_changed=True,
+        valid_actions_changed=False,
+        target_tokens={"egg"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="You are in the tree. A nest is here.",
+        inventory_text="You are carrying a jeweled egg and a leaflet.",
+        valid_actions=["take nest", "throw egg at nest", "west", "down"],
+        score=5,
+        moves=8,
+        recent_actions=["take egg"],
+        state_action_history=history,
+        supported_try_actions=["take nest", "throw egg at nest"],
+        supported_reflection_objects=["egg", "nest"],
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] in {"west", "down"}
+    take_nest = next(candidate for candidate in result.candidates if candidate.action == "take nest")
+    throw_egg = next(candidate for candidate in result.candidates if candidate.action == "throw egg at nest")
+    assert take_nest.features is not None
+    assert take_nest.features.scene_has_score_harvested is True
+    assert take_nest.features.local_scene_post_score_stale is True
+    assert "post_score_scene_exhausted" in take_nest.ranking_reason
+    assert "stale_reflection_try" in take_nest.ranking_reason
+    assert "post_score_scene_exhausted" in throw_egg.ranking_reason
+
+
+def test_action_generator_penalizes_jump_against_plain_exits(tmp_path: Path) -> None:
+    """Ungrounded generic actions should lose to simple exits even without extra history support."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. jump\n2. west\n3. east"),
+    )
+    history = ActionClusterHistory(cluster_label="forest-cluster")
+    history.record_attempt(
+        action="go around trees",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=False,
+        valid_actions_changed=False,
+    )
+
+    result = generator.generate(
+        observation="This is a forest, with trees in all directions. To the east, there appears to be sunlight.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["west", "east", "jump", "put down leaflet", "northwest"],
+        score=0,
+        moves=5,
+        candidate_count=4,
+        recent_actions=["north", "go around trees", "go around trees"],
+        state_action_history=history,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] in {"west", "east", "northwest"}
+    assert ranked_actions.index("jump") > ranked_actions.index("west")
+    jump_candidate = next(candidate for candidate in result.candidates if candidate.action == "jump")
+    assert jump_candidate.features is not None
+    assert jump_candidate.features.verb_family == "other"
+    assert "ungrounded_other_action" in jump_candidate.ranking_reason
+    assert jump_candidate.selection_score < 0.0
+
+
 def test_action_generator_top_k_keeps_object_centric_action_when_salient_objects_exist(
     tmp_path: Path,
 ) -> None:
@@ -772,6 +957,39 @@ def test_action_generator_prefers_read_leaflet_over_throw_leaflet_at_egg(tmp_pat
     assert read_candidate.features is not None
     assert read_candidate.features.target_is_readable_candidate is True
     assert "readable_candidate" in read_candidate.ranking_reason
+
+
+def test_action_generator_demotes_bulk_inventory_commands_without_score_evidence(tmp_path: Path) -> None:
+    """Bulk inventory commands should lose to specific object interactions when nothing supports them."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. take all\n2. take nest\n3. put down all"),
+    )
+
+    result = generator.generate(
+        observation="A jeweled egg and a nest are here.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["take all", "take nest", "put down all", "north"],
+        score=0,
+        moves=5,
+        candidate_count=4,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "take nest"
+
+    take_all = next(candidate for candidate in result.candidates if candidate.action == "take all")
+    put_down_all = next(candidate for candidate in result.candidates if candidate.action == "put down all")
+    assert take_all.features is not None
+    assert take_all.features.is_bulk_inventory_action is True
+    assert "bulk_inventory_action" in take_all.ranking_reason
+    assert "bulk_inventory_action" in put_down_all.ranking_reason
+    assert ranked_actions.index("take nest") < ranked_actions.index("take all")
+    assert ranked_actions.index("take nest") < ranked_actions.index("put down all")
 
 
 def test_action_generator_keeps_speculative_tool_use_available_but_low_ranked_without_evidence(

@@ -36,6 +36,8 @@ from zork_agent.types import (
     estimate_candidate_loop_penalty,
     extract_salient_nouns,
     inventory_item_tokens,
+    is_bulk_inventory_action,
+    is_discard_like_action,
     is_movement_action,
     normalize_parser_action,
     split_action_command,
@@ -47,7 +49,23 @@ _LOGGER = logging.getLogger("zork_agent.action_generator")
 
 _OBJECT_PRIORITY_VERBS = {"take", "get", "read", "open", "examine", "enter", "look in", "look at"}
 _OBJECT_PRIORITY_PREFIXES = ("look in ", "look inside ", "look at ")
-_LOW_VALUE_GENERIC_ACTIONS = {"inventory", "look", "quit", "restart", "restore", "save", "undo", "wait"}
+_LOW_VALUE_GENERIC_ACTIONS = {
+    "dance",
+    "inventory",
+    "jump",
+    "look",
+    "pray",
+    "quit",
+    "restart",
+    "restore",
+    "save",
+    "shout",
+    "sing",
+    "sleep",
+    "undo",
+    "wait",
+    "yell",
+}
 _CANONICAL_HIGH_VALUE_FAMILIES = {"inspect", "acquire", "access"}
 _SPECULATIVE_TRANSITIVE_PREFIXES = ("throw ", "use ", "put ", "insert ", "attack ", "break ", "kick ")
 
@@ -681,6 +699,11 @@ class ActionGenerator:
             else set()
         )
         cluster_repeat_count = state_action_history.cluster_visit_count() if state_action_history is not None else 0
+        scene_score_success_count = (
+            state_action_history.prior_score_success_for_object_nouns(visible_nouns)
+            if state_action_history is not None
+            else 0
+        )
 
         llm_rank_map = {
             normalize_parser_action(action): rank
@@ -703,6 +726,7 @@ class ActionGenerator:
                 normalized_try_actions=normalized_try_actions,
                 normalized_avoid_actions=normalized_avoid_actions,
                 cluster_repeat_count=cluster_repeat_count,
+                scene_score_success_count=scene_score_success_count,
             )
             candidate.features = features
             candidate.movement_only_action = features.is_movement_action
@@ -742,6 +766,13 @@ class ActionGenerator:
                     candidate.ranking_reason = self._append_reason(
                         candidate.ranking_reason,
                         "escape_mode_exit",
+                    )
+                elif self._is_ungrounded_other_action(candidate.features):
+                    candidate.heuristic_penalty += self.config.policy.escape_mode_other_action_penalty
+                    candidate.selection_score -= self.config.policy.escape_mode_other_action_penalty
+                    candidate.ranking_reason = self._append_reason(
+                        candidate.ranking_reason,
+                        "escape_mode_other_action",
                     )
 
         if object_centric_candidates_exist:
@@ -817,6 +848,7 @@ class ActionGenerator:
         normalized_try_actions: set[str],
         normalized_avoid_actions: set[str],
         cluster_repeat_count: int,
+        scene_score_success_count: int,
     ) -> ActionCandidateFeatures:
         """Build the explicit feature vector for one candidate action."""
 
@@ -831,6 +863,16 @@ class ActionGenerator:
         )
         prior_success_for_verb_family = (
             state_action_history.prior_success_for_verb_family(verb_family) > 0
+            if state_action_history is not None
+            else False
+        )
+        prior_score_success_for_verb_family = (
+            state_action_history.prior_score_success_for_verb_family(verb_family) > 0
+            if state_action_history is not None
+            else False
+        )
+        prior_score_success_for_object_family = (
+            state_action_history.prior_score_success_for_object_nouns(set(noun_targets)) > 0
             if state_action_history is not None
             else False
         )
@@ -853,6 +895,8 @@ class ActionGenerator:
             object_count=action_object_count(candidate.action, self.config.policy.inverse_action_pairs),
             is_movement_action=is_movement_action(candidate.action, self.config.policy.inverse_action_pairs),
             is_reversible_toggle=verb in self.config.policy.inverse_action_pairs,
+            is_bulk_inventory_action=is_bulk_inventory_action(candidate.action),
+            is_discard_like_action=is_discard_like_action(candidate.action),
             uses_inventory_object=action_uses_inventory_object(
                 candidate.action,
                 inventory_tokens,
@@ -884,9 +928,11 @@ class ActionGenerator:
             produced_score_gain_before=bool(stats is not None and stats.score_change_count > 0),
             produced_inventory_gain_before=bool(stats is not None and stats.inventory_gain_count > 0),
             produced_affordance_gain_before=produced_affordance_gain_before,
+            prior_score_success_for_verb_family=prior_score_success_for_verb_family,
             prior_success_for_verb_family=prior_success_for_verb_family,
             prior_success_for_exact_action=bool(stats is not None and stats.durable_gain_count > 0),
             prior_failure_for_exact_action=bool(stats is not None and stats.no_durable_gain_count > 0),
+            prior_score_success_for_object_family=prior_score_success_for_object_family,
             prior_success_for_object_family=prior_success_for_object_family,
             prior_failure_for_object_family=prior_failure_for_object_family,
             touches_newly_salient_object=bool(set(noun_targets) & new_visible_nouns),
@@ -918,11 +964,17 @@ class ActionGenerator:
                 if state_action_history is not None
                 else 0
             ),
+            scene_has_score_harvested=scene_score_success_count > 0,
+            scene_score_success_count=scene_score_success_count,
             matches_supported_try_action=normalized_action in normalized_try_actions,
             matches_supported_avoid_action=normalized_action in normalized_avoid_actions,
         )
         if not features.target_is_new_salient_object:
             features.target_is_new_salient_object = bool(set(noun_targets) & visible_nouns and set(noun_targets) & new_visible_nouns)
+        features.local_scene_post_score_stale = self._is_local_scene_post_score_stale(
+            features,
+            strong_prior_gain=self._has_strong_prior_gain(features),
+        )
         return features
 
     def _candidate_evidence_score(
@@ -942,8 +994,24 @@ class ActionGenerator:
         normalized_action = normalize_parser_action(candidate.action)
         is_put_action = normalized_action.startswith("put ")
         is_drop_action = normalized_action.startswith("drop ")
-        is_discard_action = is_put_action or is_drop_action
+        is_discard_action = is_put_action or is_drop_action or features.is_discard_like_action
         strong_prior_gain = self._has_strong_prior_gain(features)
+        stale_movement_without_durable_gain = self._is_stale_movement_without_durable_gain(
+            features,
+            strong_prior_gain=strong_prior_gain,
+        )
+        stale_toggle_without_durable_gain = self._is_stale_toggle_without_durable_gain(
+            features,
+            strong_prior_gain=strong_prior_gain,
+        )
+        trustworthy_soft_support = self._soft_support_is_trustworthy(
+            features,
+            strong_prior_gain=strong_prior_gain,
+        )
+        scene_stale_after_score = self._is_local_scene_post_score_stale(
+            features,
+            strong_prior_gain=strong_prior_gain,
+        )
         canonical_prior_contribution = 0.0
         object_family_evidence_contribution = 0.0
         plausibility_score = 0.0
@@ -966,7 +1034,9 @@ class ActionGenerator:
         if (
             not features.was_tried_before_in_local_cluster
             and not features.is_movement_action
+            and not features.is_bulk_inventory_action
             and (features.noun_targets or normalized_action not in _LOW_VALUE_GENERIC_ACTIONS)
+            and not self._is_ungrounded_other_action(features)
             and not (
                 features.touches_exhausted_family
                 and (features.is_reversible_toggle or is_discard_action or not strong_prior_gain)
@@ -976,6 +1046,7 @@ class ActionGenerator:
                 and target_tokens & inventory_tokens
                 and not strong_prior_gain
             )
+            and not scene_stale_after_score
         ):
             positive += self.config.policy.untried_action_bonus
             plausibility_score += self.config.policy.untried_action_bonus
@@ -1001,17 +1072,30 @@ class ActionGenerator:
             reasons.append("new_object")
 
         if (
-            features.produced_inventory_gain_before
+            (
+                features.produced_inventory_gain_before
+                and not features.is_bulk_inventory_action
+                and not features.is_discard_like_action
+            )
             or features.produced_affordance_gain_before
             or features.produced_score_gain_before
         ) and (
             strong_prior_gain
-            or not features.touches_exhausted_family
+            or (
+                not stale_movement_without_durable_gain
+                and
+                not features.touches_exhausted_family
+                and not stale_toggle_without_durable_gain
+                and not scene_stale_after_score
+            )
         ):
             positive += self.config.policy.inventory_affordance_bonus
             plausibility_score += self.config.policy.inventory_affordance_bonus
             reasons.append("historical_gain")
-        elif features.produced_affordance_gain_before and features.touches_exhausted_family:
+        elif features.produced_affordance_gain_before and (
+            features.touches_exhausted_family
+            or stale_toggle_without_durable_gain
+        ):
             negative += self.config.policy.object_family_exhaustion_penalty
             plausibility_score -= self.config.policy.object_family_exhaustion_penalty
             reasons.append("stale_affordance_history")
@@ -1020,21 +1104,45 @@ class ActionGenerator:
             features.target_is_new_salient_object
             or features.touches_supported_reflection_object
             or strong_prior_gain
-            or (features.produced_affordance_gain_before and not features.touches_exhausted_family)
+            or (
+                features.produced_affordance_gain_before
+                and not features.touches_exhausted_family
+                and not stale_toggle_without_durable_gain
+            )
         ):
             positive += self.config.policy.examine_read_take_bonus
             plausibility_score += self.config.policy.examine_read_take_bonus
             reasons.append("object_centric_priority")
 
-        if features.matches_supported_try_action or features.touches_supported_reflection_object:
+        if trustworthy_soft_support and (
+            features.matches_supported_try_action or features.touches_supported_reflection_object
+        ):
             positive += self.config.policy.reflection_supported_try_bonus
             plausibility_score += self.config.policy.reflection_supported_try_bonus
             reasons.append("reflection_supported_try")
+        elif (
+            scene_stale_after_score
+            and (features.matches_supported_try_action or features.touches_supported_reflection_object)
+            and not strong_prior_gain
+        ):
+            negative += self.config.policy.stale_reflection_try_penalty
+            plausibility_score -= self.config.policy.stale_reflection_try_penalty
+            reasons.append("stale_reflection_try")
 
         if features.matches_supported_avoid_action:
             negative += self.config.policy.reflection_supported_avoid_penalty
             plausibility_score -= self.config.policy.reflection_supported_avoid_penalty
             reasons.append("reflection_supported_avoid")
+
+        if self._is_ungrounded_other_action(features):
+            negative += self.config.policy.other_action_penalty
+            plausibility_score -= self.config.policy.other_action_penalty
+            reasons.append("ungrounded_other_action")
+
+        if features.is_bulk_inventory_action and not strong_prior_gain:
+            negative += self.config.policy.bulk_inventory_action_penalty
+            plausibility_score -= self.config.policy.bulk_inventory_action_penalty
+            reasons.append("bulk_inventory_action")
 
         if features.inverse_of_previous_action and not self._has_prior_gain(features):
             negative += self.config.policy.inverse_action_penalty
@@ -1063,6 +1171,16 @@ class ActionGenerator:
                 0.5 * self.config.policy.object_family_exhaustion_penalty
             )
             reasons.append("post_inventory_toggle")
+
+        if stale_toggle_without_durable_gain:
+            stale_toggle_penalty = self.config.policy.reversible_toggle_penalty + (
+                0.5 * self.config.policy.object_family_exhaustion_penalty
+            )
+            if features.verb == "close":
+                stale_toggle_penalty += 0.5 * self.config.policy.object_family_exhaustion_penalty
+            negative += stale_toggle_penalty
+            plausibility_score -= stale_toggle_penalty
+            reasons.append("stale_toggle_without_durable_gain")
 
         if features.is_movement_action:
             if features.movement_repeat_count > 0:
@@ -1099,6 +1217,16 @@ class ActionGenerator:
             negative += exhaustion_penalty
             plausibility_score -= exhaustion_penalty
             reasons.append("exhausted_family:" + ",".join(sorted(target_tokens & exhausted_families)))
+
+        if scene_stale_after_score:
+            scene_penalty = self.config.policy.post_score_scene_exhaustion_penalty
+            if features.is_discard_like_action or features.action_shape_is_complex_transitive:
+                scene_penalty += 0.5 * self.config.policy.post_score_scene_exhaustion_penalty
+            if features.verb_family == "aggressive":
+                scene_penalty += 0.5 * self.config.policy.post_score_scene_exhaustion_penalty
+            negative += scene_penalty
+            plausibility_score -= scene_penalty
+            reasons.append("post_score_scene_exhausted")
 
         if (
             is_put_action
@@ -1160,12 +1288,26 @@ class ActionGenerator:
             plausibility_score += self.config.policy.simple_action_shape_bonus
             reasons.append("simple_action_shape")
 
-        if features.prior_success_for_verb_family:
+        if features.prior_success_for_verb_family and (
+            strong_prior_gain
+            or (
+                not stale_movement_without_durable_gain
+                and not stale_toggle_without_durable_gain
+                and not scene_stale_after_score
+            )
+        ):
             positive += self.config.policy.verb_family_success_bonus
             plausibility_score += self.config.policy.verb_family_success_bonus
             reasons.append("verb_family_success")
 
-        if features.prior_success_for_exact_action:
+        if features.prior_success_for_exact_action and (
+            strong_prior_gain
+            or (
+                not stale_movement_without_durable_gain
+                and not stale_toggle_without_durable_gain
+                and not scene_stale_after_score
+            )
+        ):
             positive += self.config.policy.exact_action_success_bonus
             plausibility_score += self.config.policy.exact_action_success_bonus
             reasons.append("exact_action_success")
@@ -1175,7 +1317,14 @@ class ActionGenerator:
             plausibility_score -= self.config.policy.exact_action_failure_penalty
             reasons.append("exact_action_failure")
 
-        if features.prior_success_for_object_family:
+        if features.prior_success_for_object_family and (
+            strong_prior_gain
+            or (
+                not stale_movement_without_durable_gain
+                and not stale_toggle_without_durable_gain
+                and not scene_stale_after_score
+            )
+        ):
             positive += self.config.policy.object_family_success_bonus
             object_family_evidence_contribution += self.config.policy.object_family_success_bonus
             plausibility_score += self.config.policy.object_family_success_bonus
@@ -1302,7 +1451,11 @@ class ActionGenerator:
 
         return (
             features.produced_score_gain_before
-            or features.produced_inventory_gain_before
+            or (
+                features.produced_inventory_gain_before
+                and not features.is_bulk_inventory_action
+                and not features.is_discard_like_action
+            )
             or features.produced_affordance_gain_before
             or features.touches_supported_reflection_object
         )
@@ -1312,8 +1465,11 @@ class ActionGenerator:
 
         return (
             features.produced_score_gain_before
-            or features.produced_inventory_gain_before
-            or features.produced_affordance_gain_before
+            or (
+                features.produced_inventory_gain_before
+                and not features.is_bulk_inventory_action
+                and not features.is_discard_like_action
+            )
         )
 
     def _has_prior_gain(self, features: ActionCandidateFeatures) -> bool:
@@ -1321,7 +1477,11 @@ class ActionGenerator:
 
         return (
             features.produced_score_gain_before
-            or features.produced_inventory_gain_before
+            or (
+                features.produced_inventory_gain_before
+                and not features.is_bulk_inventory_action
+                and not features.is_discard_like_action
+            )
             or features.produced_affordance_gain_before
         )
 
@@ -1330,7 +1490,77 @@ class ActionGenerator:
 
         return (
             features.produced_score_gain_before
-            or features.produced_inventory_gain_before
+            or (
+                features.produced_inventory_gain_before
+                and not features.is_bulk_inventory_action
+                and not features.is_discard_like_action
+            )
+        )
+
+    def _soft_support_is_trustworthy(
+        self,
+        features: ActionCandidateFeatures,
+        *,
+        strong_prior_gain: bool,
+    ) -> bool:
+        """Return whether reflection/history soft support should influence reranking."""
+
+        return not (
+            self._is_stale_toggle_without_durable_gain(
+                features,
+                strong_prior_gain=strong_prior_gain,
+            )
+            or self._is_stale_movement_without_durable_gain(
+                features,
+                strong_prior_gain=strong_prior_gain,
+            )
+            or self._is_local_scene_post_score_stale(
+                features,
+                strong_prior_gain=strong_prior_gain,
+            )
+            or (features.is_bulk_inventory_action and not strong_prior_gain)
+            or (features.is_discard_like_action and not strong_prior_gain)
+        )
+
+    def _is_stale_movement_without_durable_gain(
+        self,
+        features: ActionCandidateFeatures,
+        *,
+        strong_prior_gain: bool,
+    ) -> bool:
+        """Return whether movement soft support is only affordance-deep and should be ignored."""
+
+        if not features.is_movement_action or strong_prior_gain:
+            return False
+        return (
+            features.produced_affordance_gain_before
+            or features.matches_supported_try_action
+            or features.prior_success_for_verb_family
+            or features.prior_success_for_exact_action
+        )
+
+    def _is_stale_toggle_without_durable_gain(
+        self,
+        features: ActionCandidateFeatures,
+        *,
+        strong_prior_gain: bool,
+    ) -> bool:
+        """Return whether a reversible toggle should be treated as stale local churn."""
+
+        if not features.is_reversible_toggle or strong_prior_gain:
+            return False
+        if features.verb == "close":
+            return True
+        if features.target_is_new_salient_object and features.verb == "open":
+            return False
+        return (
+            features.touches_exhausted_family
+            or features.was_tried_before_in_local_cluster
+            or features.produced_affordance_gain_before
+            or (
+                features.max_family_no_progress_count
+                >= self.config.policy.object_family_no_progress_threshold
+            )
         )
 
     def _should_prefer_exit_escape(
@@ -1356,11 +1586,49 @@ class ActionGenerator:
             normalized_action = normalize_parser_action(candidate.action)
             if (
                 candidate.features.is_reversible_toggle
+                or candidate.features.is_bulk_inventory_action
                 or normalized_action.startswith("put ")
                 or candidate.features.touches_exhausted_family
+                or candidate.features.local_scene_post_score_stale
             ):
                 has_stale_local_churn = True
         return has_exit and has_stale_local_churn and not has_new_object_priority
+
+    def _is_local_scene_post_score_stale(
+        self,
+        features: ActionCandidateFeatures,
+        *,
+        strong_prior_gain: bool,
+    ) -> bool:
+        """Return whether the current visible object scene already paid off and should be de-emphasized."""
+
+        if strong_prior_gain or features.is_movement_action:
+            return False
+        if not features.scene_has_score_harvested:
+            return False
+        if features.target_is_new_salient_object:
+            return False
+        if not features.noun_targets:
+            return False
+        return True
+
+    def _is_ungrounded_other_action(self, features: ActionCandidateFeatures) -> bool:
+        """Return whether a generic non-object action lacks enough grounding to rank highly."""
+
+        if features.verb_family != "other":
+            return False
+        if features.noun_targets:
+            return False
+        if self._has_strong_prior_gain(features):
+            return False
+        if (
+            features.matches_supported_try_action
+            or features.touches_supported_reflection_object
+            or features.prior_success_for_exact_action
+            or features.prior_success_for_verb_family
+        ):
+            return False
+        return True
 
     def _is_object_centric_priority_action(
         self,
@@ -1372,6 +1640,8 @@ class ActionGenerator:
         normalized = normalize_parser_action(action)
         if normalized.startswith(_OBJECT_PRIORITY_PREFIXES):
             return bool(features.noun_targets)
+        if features.is_bulk_inventory_action or features.is_discard_like_action:
+            return False
         if features.verb == "close":
             return False
         return (
@@ -1420,7 +1690,11 @@ class ActionGenerator:
 
         return (
             features.produced_score_gain_before
-            or features.produced_inventory_gain_before
+            or (
+                features.produced_inventory_gain_before
+                and not features.is_bulk_inventory_action
+                and not features.is_discard_like_action
+            )
             or features.prior_success_for_exact_action
             or features.prior_success_for_verb_family
             or features.prior_success_for_object_family

@@ -213,6 +213,71 @@ def test_episode_runner_commits_multiple_actions_from_best_local_branch(tmp_path
     ]
 
 
+def test_episode_runner_extends_branch_commit_through_first_durable_gain(tmp_path: Path) -> None:
+    """A winning branch should commit through the first durable gain even past the nominal prefix size."""
+
+    config = _build_config(tmp_path)
+    config.ensure_output_directories()
+    config.experiment.max_steps = 7
+    config.experiment.local_exploration_cadence = 2
+    config.experiment.max_replay_attempts = 1
+    config.experiment.branch_commit_steps = 2
+    runner = EpisodeRunner(config=config, llm_client=None)
+
+    def fake_propose_actions(*args, **kwargs) -> list[ActionProposal]:
+        return [ActionProposal(action="look", source="stub")]
+
+    def fake_explore_from_state(*args, **kwargs) -> LocalExplorationResult:
+        base_state = args[0]
+        return LocalExplorationResult(
+            base_state=base_state,
+            branch_count=1,
+            branch_horizon=5,
+            temperature=0.2,
+            action_candidate_count=3,
+            branches=[
+                LocalBranchOutcome(
+                    branch_index=0,
+                    actions_taken=["north", "up", "open egg", "shake egg", "take canary"],
+                    total_reward=0.0,
+                    score_change=0,
+                    final_score=0,
+                    final_observation="A jeweled canary is now in your inventory.",
+                    terminated=False,
+                    termination_reason=BranchTerminationReason.HORIZON_REACHED,
+                    new_room_or_object_detected=True,
+                    appears_stuck=False,
+                    persistent_inventory_gain_count=1,
+                    branch_progress_score=3.0,
+                    branch_commit_allowed=True,
+                    first_durable_gain_action_index=4,
+                    first_durable_gain_action="take canary",
+                )
+            ],
+            best_branch_index=0,
+            branch_commit_allowed=True,
+            comparison_notes="forced durable gain late in the branch",
+        )
+
+    runner.action_generator.propose_actions = fake_propose_actions  # type: ignore[method-assign]
+    runner.local_explorer.explore_from_state = fake_explore_from_state  # type: ignore[method-assign]
+
+    result = runner.run_episode(episode_id="episode-runner-branch-commit-gain")
+    stored_trajectory = TrajectoryStore(config.paths.trajectory_dir).read_episode("episode-runner-branch-commit-gain")
+
+    assert result.step_count == 7
+    assert [step.action for step in stored_trajectory.steps] == [
+        "look",
+        "look",
+        "north",
+        "up",
+        "open egg",
+        "shake egg",
+        "take canary",
+    ]
+    assert stored_trajectory.steps[-1].metadata["action_source"] == "best_local_branch_plan"
+
+
 def test_episode_runner_rejects_zero_value_local_branch_commit(tmp_path: Path) -> None:
     """Local branches below the progress threshold should never be promoted into the main episode."""
 

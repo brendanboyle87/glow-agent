@@ -261,6 +261,58 @@ def test_reflection_engine_keeps_episode_runner_trajectory_path_working(tmp_path
     assert engine.reflect(steps) == result.normalized_guidance_text
 
 
+def test_reflection_engine_does_not_promote_bulk_inventory_commands(tmp_path: Path) -> None:
+    """Bulk inventory churn should not survive into grounded try-actions."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    engine = ReflectionEngine(config, prompt_manager, llm_client=None)
+
+    result = engine.reflect_rollouts(
+        LocalExplorationResult(
+            base_state=TextGameState(observation="A room.", inventory_text="", valid_actions=["take all", "look"]),
+            branch_count=1,
+            branch_horizon=3,
+            temperature=0.1,
+            action_candidate_count=3,
+            branches=[
+                LocalBranchOutcome(
+                    branch_index=0,
+                    actions_taken=["take all", "put down all", "take all"],
+                    total_reward=0.0,
+                    score_change=0,
+                    final_score=0,
+                    final_observation="You are carrying a pile of objects.",
+                    terminated=False,
+                    termination_reason=BranchTerminationReason.HORIZON_REACHED,
+                    inventory_changed=True,
+                    persistent_inventory_gain_count=2,
+                    persistent_inventory_loss_count=1,
+                    branch_progress_score=0.0,
+                    metadata={
+                        "action_events": [
+                            {
+                                "action": "take all",
+                                "score_delta": 0,
+                                "inventory_gained": True,
+                                "persistent_affordance_gain": 0,
+                                "persistent_exit_gain_count": 0,
+                                "revealed_new_object": False,
+                                "loop_detected": False,
+                                "loop_penalty": 0.0,
+                                "movement_penalty": 0.0,
+                            }
+                        ]
+                    },
+                )
+            ],
+            best_branch_index=0,
+        )
+    )
+
+    assert "take all" not in result.guidance.try_actions
+
+
 def test_reflection_engine_strips_meta_template_leakage(tmp_path: Path) -> None:
     """Prompt/template leakage should be removed before guidance enters memory."""
 
@@ -397,6 +449,160 @@ def test_reflection_engine_keeps_take_leaflet_in_try_and_out_of_avoid(tmp_path: 
     assert "take leaflet" not in result.guidance.avoid_actions
     assert "go around trees" in result.guidance.avoid_actions
     assert "take leaflet" in result.guidance.unsupported_items_removed
+
+
+def test_reflection_engine_drops_close_mailbox_from_try_when_it_only_reflects_local_churn(
+    tmp_path: Path,
+) -> None:
+    """A close-toggle should not survive as a try-action when only reveal/carry actions were productive."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    llm_client = FakeLLMClient(
+        "try_actions: close mailbox; take leaflet\n"
+        "avoid_actions: repeated look\n"
+        "salient_objects: mailbox; leaflet\n"
+        "discovered_affordances: mailbox -> open; leaflet -> take\n"
+        "short_guidance_text: keep working the mailbox before leaving"
+    )
+    engine = ReflectionEngine(config, prompt_manager, llm_client)
+    base_state = TextGameState(
+        observation="West of House.",
+        inventory_text="",
+        valid_actions=["open mailbox", "close mailbox", "look"],
+        score=0,
+        moves=0,
+        world_state_hash="hash-west",
+    )
+    exploration = LocalExplorationResult(
+        base_state=base_state,
+        branch_count=1,
+        branch_horizon=3,
+        temperature=0.1,
+        action_candidate_count=3,
+        branches=[
+            LocalBranchOutcome(
+                branch_index=0,
+                actions_taken=["open mailbox", "take leaflet", "close mailbox"],
+                total_reward=0.0,
+                score_change=0,
+                final_score=0,
+                final_observation="The mailbox is closed.",
+                terminated=False,
+                termination_reason=BranchTerminationReason.HORIZON_REACHED,
+                inventory_changed=True,
+                persistent_inventory_gain_count=1,
+                persistent_affordance_gain=1,
+                affordance_gain=1,
+                new_room_or_object_detected=True,
+                novel_object_count=1,
+                appears_stuck=False,
+                durable_progress=True,
+                metadata={
+                    "movement_results": [],
+                    "action_events": [
+                        {
+                            "action": "open mailbox",
+                            "score_delta": 0,
+                            "inventory_gained": False,
+                            "persistent_affordance_gain": 1,
+                            "persistent_exit_gain_count": 0,
+                            "revealed_new_object": True,
+                            "loop_detected": False,
+                            "loop_penalty": 0.0,
+                            "movement_penalty": 0.0,
+                        },
+                        {
+                            "action": "take leaflet",
+                            "score_delta": 0,
+                            "inventory_gained": True,
+                            "persistent_affordance_gain": 0,
+                            "persistent_exit_gain_count": 0,
+                            "revealed_new_object": False,
+                            "loop_detected": False,
+                            "loop_penalty": 0.0,
+                            "movement_penalty": 0.0,
+                        },
+                        {
+                            "action": "close mailbox",
+                            "score_delta": 0,
+                            "inventory_gained": False,
+                            "persistent_affordance_gain": 1,
+                            "persistent_exit_gain_count": 0,
+                            "revealed_new_object": False,
+                            "loop_detected": False,
+                            "loop_penalty": 0.0,
+                            "movement_penalty": 0.0,
+                        },
+                    ],
+                },
+            )
+        ],
+        best_branch_index=0,
+        branch_commit_allowed=True,
+    )
+
+    result = engine.reflect_rollouts(exploration)
+
+    assert "take leaflet" in result.guidance.try_actions
+    assert "close mailbox" not in result.guidance.try_actions
+    assert "close mailbox" in result.guidance.unsupported_items_removed
+
+
+def test_reflection_engine_does_not_promote_movement_that_only_changed_affordances(tmp_path: Path) -> None:
+    """Movement should not enter try-actions when it only exposed text/affordances without durable gain."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    llm_client = FakeLLMClient(
+        "try_actions: east; take lamp\n"
+        "avoid_actions: repeated west\n"
+        "salient_objects: lamp; window\n"
+        "discovered_affordances: window -> open; lamp -> take\n"
+        "short_guidance_text: go east to keep exploring"
+    )
+    engine = ReflectionEngine(config, prompt_manager, llm_client)
+    steps = [
+        TrajectoryStep(
+            episode_id="episode-002",
+            step_index=0,
+            action="east",
+            observation="The window is open and a brass lamp is visible.",
+            reward=0.0,
+            done=False,
+            score=0,
+            moves=1,
+            world_state_hash="hash-east-house",
+            metadata={
+                "durable_progress": True,
+                "persistent_affordance_gain": 1,
+                "persistent_exit_gain_count": 0,
+                "revealed_new_object": True,
+            },
+        ),
+        TrajectoryStep(
+            episode_id="episode-002",
+            step_index=1,
+            action="take lamp",
+            observation="Taken.",
+            reward=0.0,
+            done=False,
+            score=0,
+            moves=2,
+            world_state_hash="hash-lamp",
+            inventory_text="lamp",
+            metadata={
+                "inventory_gained": True,
+                "durable_progress": True,
+            },
+        ),
+    ]
+
+    result = engine.reflect_trajectory(steps)
+
+    assert "take lamp" in result.guidance.try_actions
+    assert "east" not in result.guidance.try_actions
+    assert "east" in result.guidance.unsupported_items_removed
 
 
 def test_reflection_engine_fallback_promotes_salient_objects_and_demotes_wandering(tmp_path: Path) -> None:

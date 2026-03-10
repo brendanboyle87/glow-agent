@@ -27,6 +27,7 @@ from zork_agent.policy.state_selector import StateSelector
 from zork_agent.types import (
     ActionClusterHistory,
     EpisodeResult,
+    LocalBranchOutcome,
     LoopHeuristicResult,
     MovementHeuristicResult,
     ReflectionGuidance,
@@ -42,6 +43,8 @@ from zork_agent.types import (
     evaluate_movement_action,
     extract_salient_nouns,
     inventory_item_tokens,
+    is_bulk_inventory_action,
+    is_discard_like_action,
     is_movement_action,
     valid_actions_materially_different,
 )
@@ -287,8 +290,13 @@ class EpisodeRunner:
                                     episode_state_history = [current_state]
                                     episode_loop_results = []
                                     episode_movement_results = []
-                                    pending_branch_actions = list(
-                                        best_branch.actions_taken[: self.config.experiment.branch_commit_steps]
+                                    pending_branch_actions = self._branch_commit_actions(best_branch)
+                                    self.logger.info(
+                                        "Committing branch %s with actions=%s first_durable_gain_index=%s first_durable_gain_action=%s",
+                                        best_branch.branch_index,
+                                        pending_branch_actions,
+                                        best_branch.first_durable_gain_action_index,
+                                        best_branch.first_durable_gain_action or "none",
                                     )
                                     loaded_branch_plan_this_step = bool(pending_branch_actions)
                                 else:
@@ -444,6 +452,8 @@ class EpisodeRunner:
                     ),
                     movement_only_action=movement_only_action,
                     inverse_pairs=self.config.policy.inverse_action_pairs,
+                    bulk_inventory_action=is_bulk_inventory_action(chosen_action),
+                    discard_like_action=is_discard_like_action(chosen_action),
                 )
                 loop_result = evaluate_reversible_action_loop(
                     action=chosen_action,
@@ -767,6 +777,22 @@ class EpisodeRunner:
             notes=reflection_context,
             metadata=episode_metadata,
         )
+
+    def _branch_commit_actions(self, branch: LocalBranchOutcome) -> list[str]:
+        """Return the branch prefix that should be committed into the main episode.
+
+        The baseline behavior used a fixed prefix length, which can truncate the
+        actual gain event from an otherwise strong branch. We now extend the commit
+        prefix through the first durable gain action when needed.
+        """
+
+        if not branch.actions_taken:
+            return []
+
+        commit_length = min(len(branch.actions_taken), self.config.experiment.branch_commit_steps)
+        if branch.first_durable_gain_action_index is not None:
+            commit_length = max(commit_length, branch.first_durable_gain_action_index + 1)
+        return list(branch.actions_taken[:commit_length])
 
     def _build_frontier(self) -> FrontierQueue:
         """Construct a new frontier queue from config."""

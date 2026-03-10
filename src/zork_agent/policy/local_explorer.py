@@ -30,12 +30,16 @@ from zork_agent.types import (
     SavedNode,
     TextGameState,
     action_target_tokens,
+    action_shape_is_complex_transitive,
+    canonical_if_verb_family,
     compute_region_novelty_score,
     derive_state_cluster_id,
     evaluate_reversible_action_loop,
     evaluate_movement_action,
     extract_salient_nouns,
     inventory_item_tokens,
+    is_bulk_inventory_action,
+    is_discard_like_action,
     is_movement_action,
     valid_actions_materially_different,
 )
@@ -321,7 +325,14 @@ class LocalExplorer:
         movement_results: list[MovementHeuristicResult] = []
         oscillation_penalty_total = 0.0
         movement_penalty_total = 0.0
+        bulk_inventory_action_count = 0
+        discard_like_action_count = 0
+        aggressive_action_count = 0
+        speculative_tool_use_action_count = 0
+        post_gain_churn_action_count = 0
         total_reward = 0.0
+        first_durable_gain_action_index: int | None = None
+        first_durable_gain_action = ""
         termination_reason = BranchTerminationReason.HORIZON_REACHED
         terminated = False
 
@@ -350,6 +361,12 @@ class LocalExplorer:
             )
             pre_step_actions = list(actions_taken)
             pre_step_states = list(visited_states)
+            gain_already_established = first_durable_gain_action_index is not None
+            verb_family = canonical_if_verb_family(
+                action,
+                self.action_generator.config.policy.inverse_action_pairs,
+            )
+            aggressive_action = verb_family == "aggressive"
             transition = env.step(action)
             total_reward += transition.reward
             raw_state = transition.to_state()
@@ -361,16 +378,38 @@ class LocalExplorer:
                 base_state=pre_step_states[-1],
                 final_state=raw_state,
             ) > 0
+            persistent_inventory_gained_vs_base = self._count_inventory_gain(
+                base_state=base_state,
+                final_state=raw_state,
+            ) > 0
+            persistent_inventory_lost_vs_base = self._count_inventory_loss(
+                base_state=base_state,
+                final_state=raw_state,
+            ) > 0
             persistent_affordance_gain = self._count_persistent_affordances(
+                base_state=base_state,
+                final_state=raw_state,
+            )
+            step_affordance_gain = self._count_persistent_affordances(
                 base_state=pre_step_states[-1],
                 final_state=raw_state,
             )
             persistent_exit_gain = self._count_new_exit_actions(
+                base_state=base_state,
+                final_state=raw_state,
+            )
+            step_exit_gain = self._count_new_exit_actions(
                 base_state=pre_step_states[-1],
                 final_state=raw_state,
             )
-            affordance_gain = persistent_affordance_gain + persistent_exit_gain
+            affordance_gain = step_affordance_gain + step_exit_gain
             movement_only_action = self._is_movement_action(action)
+            bulk_inventory_action = is_bulk_inventory_action(action)
+            discard_like_action = is_discard_like_action(action)
+            speculative_tool_use_action = aggressive_action or action_shape_is_complex_transitive(
+                action,
+                self.action_generator.config.policy.inverse_action_pairs,
+            )
             novel_object_tokens = (
                 extract_salient_nouns(
                     observation=raw_state.observation,
@@ -385,12 +424,29 @@ class LocalExplorer:
                     inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
                 )
             )
+            persistent_novel_object_tokens = (
+                extract_salient_nouns(
+                    observation=raw_state.observation,
+                    inventory_text=raw_state.inventory_text,
+                    valid_actions=[],
+                    inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+                )
+                - extract_salient_nouns(
+                    observation=base_state.observation,
+                    inventory_text=base_state.inventory_text,
+                    valid_actions=[],
+                    inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+                )
+            )
             materially_new_actions = valid_actions_materially_different(
                 pre_step_states[-1].valid_actions,
                 raw_state.valid_actions,
             )
             revealed_new_object = bool(novel_object_tokens) and (
                 not movement_only_action or affordance_gain > 0 or materially_new_actions
+            )
+            persistent_revealed_new_object = bool(persistent_novel_object_tokens) and (
+                not movement_only_action or persistent_affordance_gain > 0 or persistent_exit_gain > 0
             )
             current_state = self._annotate_branch_state(
                 raw_state,
@@ -409,8 +465,8 @@ class LocalExplorer:
                 score_changed=current_state.score != pre_step_states[-1].score,
                 inventory_changed=self._normalize_text(current_state.inventory_text)
                 != self._normalize_text(pre_step_states[-1].inventory_text),
-                inventory_gained=inventory_gained,
-                inventory_lost=inventory_lost,
+                inventory_gained=persistent_inventory_gained_vs_base,
+                inventory_lost=persistent_inventory_lost_vs_base,
                 observation_changed=self._normalize_text(current_state.observation)
                 != self._normalize_text(pre_step_states[-1].observation),
                 valid_actions_changed={
@@ -419,12 +475,8 @@ class LocalExplorer:
                 != {
                     self._normalize_text(candidate) for candidate in pre_step_states[-1].valid_actions
                 },
-                valid_actions_improved=self._count_persistent_affordances(
-                    base_state=pre_step_states[-1],
-                    final_state=current_state,
-                ) > 0
-                or self._count_new_exit_actions(base_state=pre_step_states[-1], final_state=current_state) > 0,
-                revealed_new_object=revealed_new_object,
+                valid_actions_improved=persistent_affordance_gain > 0 or persistent_exit_gain > 0,
+                revealed_new_object=persistent_revealed_new_object,
                 target_tokens=extract_salient_nouns(
                     observation="",
                     inventory_text="",
@@ -434,6 +486,8 @@ class LocalExplorer:
                 or action_target_tokens(action, self.action_generator.config.policy.inverse_action_pairs),
                 movement_only_action=movement_only_action,
                 inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
+                bulk_inventory_action=bulk_inventory_action,
+                discard_like_action=discard_like_action,
             )
             action_cluster_history.observe_state_nouns(
                 observation=current_state.observation,
@@ -455,6 +509,20 @@ class LocalExplorer:
             visited_states.append(current_state)
             loop_results.append(loop_result)
             oscillation_penalty_total += loop_result.total_penalty
+            if bulk_inventory_action:
+                bulk_inventory_action_count += 1
+            if discard_like_action:
+                discard_like_action_count += 1
+            if aggressive_action:
+                aggressive_action_count += 1
+            if speculative_tool_use_action:
+                speculative_tool_use_action_count += 1
+            if gain_already_established and (
+                discard_like_action
+                or aggressive_action
+                or speculative_tool_use_action
+            ):
+                post_gain_churn_action_count += 1
             movement_result = evaluate_movement_action(
                 action=action,
                 recent_actions=pre_step_actions,
@@ -471,17 +539,31 @@ class LocalExplorer:
                 {
                     "action": action,
                     "score_delta": current_state.score - pre_step_states[-1].score,
-                    "inventory_gained": inventory_gained,
-                    "inventory_lost": inventory_lost,
-                    "revealed_new_object": revealed_new_object,
+                    "inventory_gained": persistent_inventory_gained_vs_base,
+                    "inventory_lost": persistent_inventory_lost_vs_base,
+                    "revealed_new_object": persistent_revealed_new_object,
                     "persistent_affordance_gain": persistent_affordance_gain,
                     "persistent_exit_gain_count": persistent_exit_gain,
+                    "bulk_inventory_action": bulk_inventory_action,
+                    "discard_like_action": discard_like_action,
                     "loop_detected": loop_result.loop_detected,
                     "loop_penalty": loop_result.total_penalty,
                     "movement_penalty": movement_result.total_penalty,
                     "state_cluster_id": current_state.state_cluster_id,
                 }
             )
+            if (
+                first_durable_gain_action_index is None
+                and (
+                    current_state.score > base_state.score
+                    or (
+                        persistent_inventory_gained_vs_base
+                        and not persistent_inventory_lost_vs_base
+                    )
+                )
+            ):
+                first_durable_gain_action_index = len(actions_taken) - 1
+                first_durable_gain_action = action
             if loop_result.loop_detected:
                 self.logger.info(
                     "Local branch %s detected reversible loop for action=%s penalty=%.2f reason=%s",
@@ -504,14 +586,20 @@ class LocalExplorer:
                 movement_penalty_total=movement_penalty_total,
                 base_state=base_state,
                 current_state=current_state,
+                persistent_inventory_gained=persistent_inventory_gained_vs_base,
+                persistent_affordance_gain=persistent_affordance_gain,
+                persistent_exit_gain_count=persistent_exit_gain,
+                post_gain_churn_action_count=post_gain_churn_action_count,
             ):
                 termination_reason = BranchTerminationReason.LOOP_ABORTED
                 self.logger.info(
                     "Local branch %s aborted early after low-value loop accumulation. "
-                    "loop_penalty=%.2f movement_penalty=%.2f exhausted_families=%s",
+                    "loop_penalty=%.2f movement_penalty=%.2f bulk_inventory=%s post_gain_churn=%s exhausted_families=%s",
                     branch_index,
                     oscillation_penalty_total,
                     movement_penalty_total,
+                    bulk_inventory_action_count,
+                    post_gain_churn_action_count,
                     sorted(
                         action_cluster_history.exhausted_families(
                             self.action_generator.config.policy.object_family_no_progress_threshold
@@ -555,8 +643,14 @@ class LocalExplorer:
         durable_progress = self._branch_has_durable_progress(
             score_change=score_change,
             persistent_inventory_gain_count=persistent_inventory_gain_count,
+            persistent_inventory_loss_count=persistent_inventory_loss_count,
             persistent_affordance_gain=persistent_affordance_gain,
             persistent_exit_gain_count=persistent_exit_gain_count,
+            bulk_inventory_action_count=bulk_inventory_action_count,
+            discard_like_action_count=discard_like_action_count,
+            aggressive_action_count=aggressive_action_count,
+            speculative_tool_use_action_count=speculative_tool_use_action_count,
+            post_gain_churn_action_count=post_gain_churn_action_count,
         )
         novel_object_count = min(len(novel_tokens), 4)
         landmark_gain = 1 if (
@@ -592,12 +686,36 @@ class LocalExplorer:
             oscillation_penalty_total=oscillation_penalty_total,
             movement_penalty_total=movement_penalty_total,
         )
+        commit_anchor = self._branch_has_commit_anchor(
+            score_change=score_change,
+            persistent_inventory_gain_count=persistent_inventory_gain_count,
+            persistent_inventory_loss_count=persistent_inventory_loss_count,
+        )
         low_value_movement_branch = self._is_low_value_movement_branch(
             score_change=score_change,
             persistent_inventory_gain_count=persistent_inventory_gain_count,
             persistent_affordance_gain=persistent_affordance_gain,
             movement_action_ratio=movement_action_ratio,
         )
+        low_value_object_churn_branch = self._is_low_value_object_churn_branch(
+            score_change=score_change,
+            persistent_inventory_gain_count=persistent_inventory_gain_count,
+            persistent_exit_gain_count=persistent_exit_gain_count,
+            persistent_affordance_gain=persistent_affordance_gain,
+            novel_object_count=novel_object_count,
+        )
+        inventory_churn_penalty = self._inventory_churn_penalty(
+            score_change=score_change,
+            persistent_inventory_gain_count=persistent_inventory_gain_count,
+            persistent_inventory_loss_count=persistent_inventory_loss_count,
+            persistent_exit_gain_count=persistent_exit_gain_count,
+            bulk_inventory_action_count=bulk_inventory_action_count,
+            discard_like_action_count=discard_like_action_count,
+            aggressive_action_count=aggressive_action_count,
+            speculative_tool_use_action_count=speculative_tool_use_action_count,
+            post_gain_churn_action_count=post_gain_churn_action_count,
+        )
+        branch_progress_score -= inventory_churn_penalty
         if (
             exhausted_family_count > 0
             and not durable_progress
@@ -608,6 +726,28 @@ class LocalExplorer:
                 self.action_generator.config.policy.movement_progress_cap,
             )
         if low_value_movement_branch:
+            branch_progress_score = min(branch_progress_score, 0.0)
+        if low_value_object_churn_branch:
+            branch_progress_score = min(branch_progress_score, 0.0)
+        if inventory_churn_penalty > 0.0:
+            branch_progress_score = min(branch_progress_score, 0.0)
+        if (
+            score_change <= 0
+            and persistent_inventory_gain_count > 0
+            and not self._branch_has_simple_inventory_progress(
+                score_change=score_change,
+                persistent_inventory_gain_count=persistent_inventory_gain_count,
+                persistent_inventory_loss_count=persistent_inventory_loss_count,
+                persistent_affordance_gain=persistent_affordance_gain,
+                persistent_exit_gain_count=persistent_exit_gain_count,
+                discard_like_action_count=discard_like_action_count,
+                aggressive_action_count=aggressive_action_count,
+                speculative_tool_use_action_count=speculative_tool_use_action_count,
+                post_gain_churn_action_count=post_gain_churn_action_count,
+            )
+        ):
+            branch_progress_score = min(branch_progress_score, 0.0)
+        if not commit_anchor:
             branch_progress_score = min(branch_progress_score, 0.0)
         if (
             score_change <= 0
@@ -636,6 +776,10 @@ class LocalExplorer:
             notable_changes.append(f"oscillation penalty {oscillation_penalty_total:.2f}")
         if movement_penalty_total > 0.0:
             notable_changes.append(f"movement penalty {movement_penalty_total:.2f}")
+        if low_value_object_churn_branch:
+            notable_changes.append("local object churn without durable gain")
+        if inventory_churn_penalty > 0.0:
+            notable_changes.append(f"inventory churn penalty {inventory_churn_penalty:.2f}")
         if inventory_changed:
             notable_changes.append("inventory changed")
         if new_affordance_count > 0:
@@ -649,7 +793,8 @@ class LocalExplorer:
 
         self.logger.info(
             "Local branch %s finished: actions=%s score_change=%s reward=%.2f terminated=%s stuck=%s "
-            "loop_penalty=%.2f movement_penalty=%.2f progress_score=%.2f",
+            "loop_penalty=%.2f movement_penalty=%.2f bulk_inventory=%s discard_like=%s aggressive=%s "
+            "post_gain_churn=%s inventory_churn_penalty=%.2f progress_score=%.2f",
             branch_index,
             actions_taken,
             score_change,
@@ -658,6 +803,11 @@ class LocalExplorer:
             appears_stuck,
             oscillation_penalty_total,
             movement_penalty_total,
+            bulk_inventory_action_count,
+            discard_like_action_count,
+            aggressive_action_count,
+            post_gain_churn_action_count,
+            inventory_churn_penalty,
             branch_progress_score,
         )
         return LocalBranchOutcome(
@@ -692,7 +842,15 @@ class LocalExplorer:
             movement_only_action_count=sum(1 for result in movement_results if result.movement_only_action),
             movement_action_ratio=movement_action_ratio,
             movement_repeat_count=max((result.movement_repeat_count for result in movement_results), default=0),
+            bulk_inventory_action_count=bulk_inventory_action_count,
+            inventory_churn_penalty=inventory_churn_penalty,
+            discard_like_action_count=discard_like_action_count,
+            aggressive_action_count=aggressive_action_count,
+            speculative_tool_use_action_count=speculative_tool_use_action_count,
+            post_gain_churn_action_count=post_gain_churn_action_count,
             loop_event_count=sum(1 for loop_result in loop_results if loop_result.loop_detected),
+            first_durable_gain_action_index=first_durable_gain_action_index,
+            first_durable_gain_action=first_durable_gain_action,
             notable_observation_changes=notable_changes,
             final_state=current_state,
             restore_result=restore_result,
@@ -703,6 +861,12 @@ class LocalExplorer:
                 "movement_results": [movement_result.to_record() for movement_result in movement_results],
                 "movement_action_ratio": movement_action_ratio,
                 "low_value_movement_branch": low_value_movement_branch,
+                "inventory_churn_penalty": inventory_churn_penalty,
+                "bulk_inventory_action_count": bulk_inventory_action_count,
+                "discard_like_action_count": discard_like_action_count,
+                "aggressive_action_count": aggressive_action_count,
+                "speculative_tool_use_action_count": speculative_tool_use_action_count,
+                "post_gain_churn_action_count": post_gain_churn_action_count,
             },
         )
 
@@ -885,8 +1049,8 @@ class LocalExplorer:
             float(branch.branch_progress_score),
             float(branch.score_change),
             int(branch.persistent_inventory_gain_count),
-            int(branch.persistent_exit_gain_count),
             int(branch.persistent_affordance_gain),
+            int(branch.persistent_exit_gain_count),
             -int(branch.persistent_inventory_loss_count),
             float(branch.total_reward - branch.oscillation_penalty_total - branch.movement_penalty_total),
             -float(branch.movement_penalty_total),
@@ -894,22 +1058,53 @@ class LocalExplorer:
             -len(branch.actions_taken),
         )
 
+    def _branch_has_commit_anchor(
+        self,
+        *,
+        score_change: int,
+        persistent_inventory_gain_count: int,
+        persistent_inventory_loss_count: int,
+    ) -> bool:
+        """Return whether a branch ended with a durable outcome strong enough to score."""
+
+        return any(
+            (
+                score_change > 0,
+                persistent_inventory_gain_count > 0 and persistent_inventory_loss_count <= 0,
+            )
+        )
+
     def _branch_has_durable_progress(
         self,
         *,
         score_change: int,
         persistent_inventory_gain_count: int,
+        persistent_inventory_loss_count: int,
         persistent_affordance_gain: int,
         persistent_exit_gain_count: int,
+        bulk_inventory_action_count: int,
+        discard_like_action_count: int,
+        aggressive_action_count: int,
+        speculative_tool_use_action_count: int,
+        post_gain_churn_action_count: int,
     ) -> bool:
         """Return whether a branch ended with durable, reusable progress."""
 
         return any(
             (
                 score_change > 0,
-                persistent_inventory_gain_count > 0,
-                persistent_affordance_gain > 0,
-                persistent_exit_gain_count > 0,
+                self._branch_has_simple_inventory_progress(
+                    score_change=score_change,
+                    persistent_inventory_gain_count=persistent_inventory_gain_count,
+                    persistent_inventory_loss_count=persistent_inventory_loss_count,
+                    persistent_affordance_gain=persistent_affordance_gain,
+                    persistent_exit_gain_count=persistent_exit_gain_count,
+                    discard_like_action_count=discard_like_action_count,
+                    aggressive_action_count=aggressive_action_count,
+                    speculative_tool_use_action_count=speculative_tool_use_action_count,
+                    post_gain_churn_action_count=post_gain_churn_action_count,
+                )
+                and bulk_inventory_action_count <= 0,
             )
         )
 
@@ -930,33 +1125,46 @@ class LocalExplorer:
                 "best branch was movement-dominated with no durable score, inventory, or affordance gain",
             )
 
+        if self._branch_is_local_object_churn_reject(branch):
+            return (
+                False,
+                "best branch only changed local affordances without score, inventory, exit, or new-object gain",
+            )
+
+        if self._branch_is_inventory_churn_reject(branch):
+            return (
+                False,
+                "best branch relied on bulk or transient inventory churn without score or exit gain",
+            )
+
         if branch.score_change > 0:
             return True, ""
 
-        if branch.persistent_exit_gain_count > 0 and (
-            branch.persistent_affordance_gain >= policy.min_affordance_gain_for_movement_commit
-            or branch.novel_object_count > 0
-            or not branch.ended_in_same_cluster
-        ):
-            return True, ""
-
         if branch.persistent_inventory_gain_count > 0 and branch.persistent_inventory_loss_count <= 0:
+            if not self._branch_has_simple_inventory_progress(
+                score_change=branch.score_change,
+                persistent_inventory_gain_count=branch.persistent_inventory_gain_count,
+                persistent_inventory_loss_count=branch.persistent_inventory_loss_count,
+                persistent_affordance_gain=branch.persistent_affordance_gain,
+                persistent_exit_gain_count=branch.persistent_exit_gain_count,
+                discard_like_action_count=branch.discard_like_action_count,
+                aggressive_action_count=branch.aggressive_action_count,
+                speculative_tool_use_action_count=branch.speculative_tool_use_action_count,
+                post_gain_churn_action_count=branch.post_gain_churn_action_count,
+            ):
+                return (
+                    False,
+                    "best branch gained inventory only through low-value local object churn",
+                )
             return True, ""
 
-        if branch.persistent_affordance_gain >= policy.min_affordance_gain_for_movement_commit and (
-            not branch.ended_in_same_cluster or branch.novel_object_count > 0 or branch.new_room_location_signal
-        ):
-            return True, ""
+        if branch.persistent_exit_gain_count > 0:
+            return False, "best branch only changed reachable exits without score or inventory gain"
 
-        if (
-            branch.score_change <= 0
-            and branch.persistent_inventory_gain_count <= 0
-            and branch.persistent_exit_gain_count <= 0
-            and branch.persistent_affordance_gain < policy.min_affordance_gain_for_movement_commit
-        ):
+        if branch.score_change <= 0 and branch.persistent_inventory_gain_count <= 0:
             return (
                 False,
-                "best branch had no score gain, inventory gain, exit gain, or sufficient affordance gain",
+                "best branch had no score gain or durable inventory gain",
             )
 
         if branch.ended_in_same_cluster and branch.persistent_exit_gain_count <= 0 and branch.score_change <= 0:
@@ -1074,6 +1282,10 @@ class LocalExplorer:
         movement_penalty_total: float,
         base_state: TextGameState,
         current_state: TextGameState,
+        persistent_inventory_gained: bool,
+        persistent_affordance_gain: int,
+        persistent_exit_gain_count: int,
+        post_gain_churn_action_count: int,
     ) -> bool:
         """Return whether a local branch should fail fast due to low-value looping."""
 
@@ -1112,6 +1324,23 @@ class LocalExplorer:
             if recent_clusters and len(set(recent_clusters)) <= 2:
                 return True
 
+        if (
+            action_cluster_history.bulk_inventory_no_progress_steps
+            >= self.action_generator.config.policy.branch_fail_fast_bulk_no_progress_steps
+            and not durable_progress
+        ):
+            return True
+
+        if (
+            post_gain_churn_action_count
+            >= self.action_generator.config.policy.branch_fail_fast_post_gain_churn_actions
+            and persistent_inventory_gained
+            and current_state.score <= base_state.score
+            and persistent_affordance_gain <= 0
+            and persistent_exit_gain_count <= 0
+        ):
+            return True
+
         return (
             not durable_progress
             and current_state.state_cluster_id == base_state.state_cluster_id
@@ -1145,6 +1374,113 @@ class LocalExplorer:
             persistent_affordance_gain=branch.persistent_affordance_gain,
             movement_action_ratio=branch.movement_action_ratio,
         )
+
+    def _is_low_value_object_churn_branch(
+        self,
+        *,
+        score_change: int,
+        persistent_inventory_gain_count: int,
+        persistent_exit_gain_count: int,
+        persistent_affordance_gain: int,
+        novel_object_count: int,
+    ) -> bool:
+        """Return whether a branch only churned local affordances without durable gain."""
+
+        return (
+            score_change <= 0
+            and persistent_inventory_gain_count <= 0
+            and persistent_exit_gain_count <= 0
+            and persistent_affordance_gain > 0
+            and novel_object_count <= 0
+        )
+
+    def _branch_is_local_object_churn_reject(self, branch: LocalBranchOutcome) -> bool:
+        """Return whether a branch should be rejected as non-movement local object churn."""
+
+        return self._is_low_value_object_churn_branch(
+            score_change=branch.score_change,
+            persistent_inventory_gain_count=branch.persistent_inventory_gain_count,
+            persistent_exit_gain_count=branch.persistent_exit_gain_count,
+            persistent_affordance_gain=branch.persistent_affordance_gain,
+            novel_object_count=branch.novel_object_count,
+        )
+
+    def _inventory_churn_penalty(
+        self,
+        *,
+        score_change: int,
+        persistent_inventory_gain_count: int,
+        persistent_inventory_loss_count: int,
+        persistent_exit_gain_count: int,
+        bulk_inventory_action_count: int,
+        discard_like_action_count: int,
+        aggressive_action_count: int,
+        speculative_tool_use_action_count: int,
+        post_gain_churn_action_count: int,
+    ) -> float:
+        """Penalize branches whose apparent value mostly comes from bulk inventory churn."""
+
+        if score_change > 0 or persistent_exit_gain_count > 0:
+            return 0.0
+        policy = self.action_generator.config.policy
+        penalty = 0.0
+        if bulk_inventory_action_count > 0:
+            penalty += float(bulk_inventory_action_count) * policy.branch_inventory_churn_penalty
+        if persistent_inventory_gain_count > 0 and persistent_inventory_loss_count > 0:
+            penalty += policy.branch_inventory_churn_penalty
+        if persistent_inventory_gain_count > 1:
+            penalty += float(persistent_inventory_gain_count - 1) * policy.branch_inventory_churn_penalty
+        penalty += float(discard_like_action_count) * policy.branch_post_gain_churn_penalty
+        penalty += float(aggressive_action_count) * policy.branch_aggressive_action_penalty
+        penalty += float(speculative_tool_use_action_count) * policy.branch_speculative_action_penalty
+        penalty += float(post_gain_churn_action_count) * policy.branch_post_gain_churn_penalty
+        return penalty
+
+    def _branch_is_inventory_churn_reject(self, branch: LocalBranchOutcome) -> bool:
+        """Return whether a branch should be rejected as bulk/transient inventory churn."""
+
+        return (
+            branch.score_change <= 0
+            and branch.persistent_exit_gain_count <= 0
+            and (
+                branch.bulk_inventory_action_count > 0
+                or branch.discard_like_action_count > 0
+                or branch.aggressive_action_count > 0
+                or branch.post_gain_churn_action_count > 0
+            )
+            and branch.inventory_churn_penalty > 0.0
+        )
+
+    def _branch_has_simple_inventory_progress(
+        self,
+        *,
+        score_change: int,
+        persistent_inventory_gain_count: int,
+        persistent_inventory_loss_count: int,
+        persistent_affordance_gain: int,
+        persistent_exit_gain_count: int,
+        discard_like_action_count: int,
+        aggressive_action_count: int,
+        speculative_tool_use_action_count: int,
+        post_gain_churn_action_count: int,
+    ) -> bool:
+        """Return whether a zero-score inventory branch ended in a clean, durable state.
+
+        This is intentionally conservative. Zero-score inventory gain only counts when the
+        branch keeps the new item(s) without immediately degenerating into local object churn.
+        """
+
+        if score_change > 0:
+            return True
+        if persistent_inventory_gain_count <= 0 or persistent_inventory_loss_count > 0:
+            return False
+        if discard_like_action_count > 0 or aggressive_action_count > 0:
+            return False
+        if speculative_tool_use_action_count > 0 or post_gain_churn_action_count > 0:
+            return False
+        if persistent_inventory_gain_count > 1 and persistent_affordance_gain <= 0 and persistent_exit_gain_count <= 0:
+            return False
+        return True
 
     def _looks_like_location_signal(self, observation: str) -> bool:
         """Return whether an observation looks like a room/location transition."""

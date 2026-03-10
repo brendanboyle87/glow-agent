@@ -21,8 +21,10 @@ If valid actions are listed, rank only from that list.
 Prefer short canonical parser actions.
 Prefer examining, taking, reading, or opening newly revealed objects before speculative tool use.
 Prefer direct object interaction before movement unless movement already showed progress.
+If a local object family already produced a real gain, prefer leaving or trying a different object family before more churn on the same scene.
 Avoid repeated movement unless it previously changed score, inventory, or useful affordances.
 Avoid reversible toggles unless they previously unlocked something.
+Avoid bulk inventory commands like take all or put down all unless observed evidence strongly supports them.
 Avoid speculative tool-use or aggressive actions unless grounded by observed evidence.
 
 Return up to {action_candidates} short parser commands, one per line.

@@ -28,6 +28,7 @@ from zork_agent.types import (
     TrajectoryStep,
     action_target_tokens,
     extract_salient_nouns,
+    is_bulk_inventory_action,
     is_movement_action,
     normalize_parser_action,
     split_action_command,
@@ -81,6 +82,34 @@ _ACTION_PREFIX_STRIP = (
     "dont ",
     "repeated ",
     "repeat ",
+)
+
+_NON_OBJECT_REFLECTION_TOKENS = {
+    "all",
+    "broken",
+    "certainly",
+    "close",
+    "closed",
+    "closing",
+    "look",
+    "open",
+    "opened",
+    "opening",
+    "shut",
+}
+
+_LOW_VALUE_REFLECTION_ACTION_PREFIXES = (
+    "close ",
+    "drop ",
+    "get all",
+    "put ",
+    "put down all",
+    "insert ",
+    "take all",
+    "throw ",
+    "attack ",
+    "break ",
+    "kick ",
 )
 
 
@@ -418,13 +447,6 @@ class ReflectionEngine:
             for event in productive_events
             if event.get("action")
         )[:4]
-        if not try_actions:
-            try_actions = self._dedupe_preserve_order(
-                action
-                for branch in sorted(productive_branches, key=self._branch_sort_key, reverse=True)
-                for action in branch.actions_taken
-                if action
-            )[:4]
         productive_action_keys = {normalize_parser_action(action) for action in try_actions}
         avoid_action_counts: Counter[str] = Counter()
         avoid_action_labels: dict[str, str] = {}
@@ -476,15 +498,7 @@ class ReflectionEngine:
         for step in steps:
             score_delta = step.score - previous_score
             inventory_changed = normalize_parser_action(step.inventory_text) != normalize_parser_action(previous_inventory)
-            had_progress = bool(
-                step.metadata.get("durable_progress", False)
-                or step.reward > 0.0
-                or score_delta > 0
-                or bool(step.metadata.get("inventory_gained", False))
-                or int(step.metadata.get("persistent_affordance_gain", 0)) > 0
-                or int(step.metadata.get("persistent_exit_gain_count", 0)) > 0
-                or bool(step.metadata.get("revealed_new_object", False))
-            )
+            had_progress = self._trajectory_step_has_progress(step, score_delta=score_delta)
             if had_progress:
                 productive_steps.append(step)
             if step.loop_penalty > 0.0 or step.movement_penalty > 0.0:
@@ -534,8 +548,12 @@ class ReflectionEngine:
             (
                 branch.score_change > 0,
                 branch.total_reward > 0.0,
-                branch.persistent_inventory_gain_count > 0,
-                branch.persistent_affordance_gain > 0,
+                (
+                    branch.persistent_inventory_gain_count > 0
+                    and branch.persistent_inventory_loss_count <= 0
+                    and branch.bulk_inventory_action_count <= 0
+                ),
+                branch.persistent_affordance_gain > 0 and branch.novel_object_count > 0,
                 branch.persistent_exit_gain_count > 0,
             )
         )
@@ -550,13 +568,7 @@ class ReflectionEngine:
         for event in events:
             if not isinstance(event, dict):
                 continue
-            if (
-                int(event.get("score_delta", 0)) > 0
-                or bool(event.get("inventory_gained", False))
-                or int(event.get("persistent_affordance_gain", 0)) > 0
-                or int(event.get("persistent_exit_gain_count", 0)) > 0
-                or bool(event.get("revealed_new_object", False))
-            ):
+            if self._event_supports_try_action(event):
                 productive_events.append(event)
         return productive_events
 
@@ -579,13 +591,7 @@ class ReflectionEngine:
             normalized = normalize_parser_action(action)
             if not normalized:
                 continue
-            is_productive = (
-                int(event.get("score_delta", 0)) > 0
-                or bool(event.get("inventory_gained", False))
-                or int(event.get("persistent_affordance_gain", 0)) > 0
-                or int(event.get("persistent_exit_gain_count", 0)) > 0
-                or bool(event.get("revealed_new_object", False))
-            )
+            is_productive = self._event_supports_try_action(event)
             if is_productive:
                 continue
             if (
@@ -657,36 +663,42 @@ class ReflectionEngine:
             token
             for action in actions
             for token in sorted(action_target_tokens(action, self.config.policy.inverse_action_pairs))
+            if token not in _NON_OBJECT_REFLECTION_TOKENS
         )
 
     def _objects_from_step(self, step: TrajectoryStep) -> list[str]:
         """Extract grounded object tokens from one trajectory step."""
 
+        tokens = [
+            *sorted(action_target_tokens(step.action, self.config.policy.inverse_action_pairs)),
+            *sorted(
+                extract_salient_nouns(
+                    observation=step.observation,
+                    inventory_text=step.inventory_text,
+                    valid_actions=[],
+                    inverse_pairs=self.config.policy.inverse_action_pairs,
+                )
+            ),
+        ]
         return self._dedupe_preserve_order(
-            [
-                *sorted(action_target_tokens(step.action, self.config.policy.inverse_action_pairs)),
-                *sorted(
-                    extract_salient_nouns(
-                        observation=step.observation,
-                        inventory_text=step.inventory_text,
-                        valid_actions=[],
-                        inverse_pairs=self.config.policy.inverse_action_pairs,
-                    )
-                ),
-            ]
+            token for token in tokens if token not in _NON_OBJECT_REFLECTION_TOKENS
         )
 
     def _objects_from_text(self, text: str) -> list[str]:
         """Extract grounded object tokens from observation text."""
 
-        return sorted(
-            extract_salient_nouns(
-                observation=text,
-                inventory_text="",
-                valid_actions=[],
-                inverse_pairs=self.config.policy.inverse_action_pairs,
+        return [
+            token
+            for token in sorted(
+                extract_salient_nouns(
+                    observation=text,
+                    inventory_text="",
+                    valid_actions=[],
+                    inverse_pairs=self.config.policy.inverse_action_pairs,
+                )
             )
-        )
+            if token not in _NON_OBJECT_REFLECTION_TOKENS
+        ]
 
     def _branch_hypotheses(self, branch: LocalBranchOutcome) -> list[str]:
         """Infer short grounded hypotheses from productive branch outcomes."""
@@ -940,6 +952,69 @@ class ReflectionEngine:
         """Return whether an action looks like a room-transition command."""
 
         return is_movement_action(action, self.config.policy.inverse_action_pairs)
+
+    def _event_supports_try_action(self, event: dict[str, object]) -> bool:
+        """Return whether an action event has enough grounded evidence to seed try-actions."""
+
+        action = str(event.get("action", ""))
+        if not action.strip():
+            return False
+        if is_bulk_inventory_action(action):
+            return int(event.get("score_delta", 0)) > 0 or int(event.get("persistent_exit_gain_count", 0)) > 0
+        is_movement = self._is_direction_action(action)
+        if int(event.get("score_delta", 0)) > 0:
+            return True
+        if bool(event.get("inventory_gained", False)):
+            return True
+        if int(event.get("persistent_exit_gain_count", 0)) > 0:
+            return True
+        if is_movement:
+            return False
+        if bool(event.get("revealed_new_object", False)) and not self._is_low_value_toggle_or_use(action):
+            return True
+        return (
+            int(event.get("persistent_affordance_gain", 0)) > 0
+            and bool(event.get("revealed_new_object", False))
+            and not self._is_low_value_toggle_or_use(action)
+        )
+
+    def _trajectory_step_has_progress(self, step: TrajectoryStep, *, score_delta: int) -> bool:
+        """Return whether a trajectory step exposed grounded forward progress."""
+
+        is_movement = self._is_direction_action(step.action)
+        if is_bulk_inventory_action(step.action):
+            return step.reward > 0.0 or score_delta > 0 or int(step.metadata.get("persistent_exit_gain_count", 0)) > 0
+        if bool(step.metadata.get("durable_progress", False)) and not is_movement:
+            return True
+        if step.reward > 0.0 or score_delta > 0:
+            return True
+        if bool(step.metadata.get("inventory_gained", False)):
+            return True
+        if int(step.metadata.get("persistent_exit_gain_count", 0)) > 0:
+            return True
+        if is_movement:
+            return False
+        revealed_new_object = bool(step.metadata.get("revealed_new_object", False))
+        if revealed_new_object and not self._is_low_value_toggle_or_use(step.action):
+            return True
+        return (
+            int(step.metadata.get("persistent_affordance_gain", 0)) > 0
+            and revealed_new_object
+            and not self._is_low_value_toggle_or_use(step.action)
+        )
+
+    def _is_low_value_toggle_or_use(self, action: str) -> bool:
+        """Return whether an action looks like low-value local churn for reflection memory."""
+
+        normalized = normalize_parser_action(action)
+        if not normalized:
+            return False
+        if is_bulk_inventory_action(action):
+            return True
+        if normalized.startswith(_LOW_VALUE_REFLECTION_ACTION_PREFIXES):
+            return True
+        verb, _obj = split_action_command(action, self.config.policy.inverse_action_pairs)
+        return verb in {"close", "drop", "put", "insert", "throw", "attack", "break", "kick"}
 
 
 ReflectionPolicy = ReflectionEngine

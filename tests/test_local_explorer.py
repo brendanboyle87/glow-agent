@@ -21,7 +21,7 @@ from zork_agent.env.jericho_env import JerichoEnv
 from zork_agent.llm.prompts import PromptManager
 from zork_agent.policy.action_generator import ActionGenerator
 from zork_agent.policy.local_explorer import LocalExplorer
-from zork_agent.types import ActionProposal, BranchTerminationReason, TextGameState
+from zork_agent.types import ActionProposal, BranchTerminationReason, LocalBranchOutcome, TextGameState
 
 
 class _FakeInventoryItem:
@@ -488,3 +488,143 @@ def test_local_explorer_aborts_low_value_movement_cycle_early(tmp_path: Path) ->
     assert len(result.best_branch.actions_taken) < 8
     assert result.best_branch.movement_action_ratio == 1.0
     assert result.branch_commit_allowed is False
+
+
+def test_local_explorer_rejects_zero_score_local_object_churn_branch(tmp_path: Path) -> None:
+    """Affordance-only local churn without score, inventory, exit, or new-object gain should not commit."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=OscillatingBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    allowed, reason = explorer._branch_clears_commit_gate(  # type: ignore[attr-defined]
+        LocalBranchOutcome(
+            branch_index=0,
+            actions_taken=["open egg", "close egg"],
+            total_reward=0.0,
+            score_change=0,
+            final_score=0,
+            final_observation="The egg is closed.",
+            terminated=False,
+            termination_reason=BranchTerminationReason.HORIZON_REACHED,
+            persistent_inventory_gain_count=0,
+            persistent_affordance_gain=2,
+            persistent_exit_gain_count=0,
+            novel_object_count=0,
+            branch_progress_score=1.5,
+        )
+    )
+
+    assert allowed is False
+
+
+def test_local_explorer_rejects_bulk_inventory_churn_branch(tmp_path: Path) -> None:
+    """Bulk inventory churn should not clear the commit gate without score or exit gain."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=OscillatingBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    allowed, reason = explorer._branch_clears_commit_gate(  # type: ignore[attr-defined]
+        LocalBranchOutcome(
+            branch_index=0,
+            actions_taken=["take all", "put down all", "take all"],
+            total_reward=0.0,
+            score_change=0,
+            final_score=0,
+            final_observation="You are carrying a collection of objects.",
+            terminated=False,
+            termination_reason=BranchTerminationReason.HORIZON_REACHED,
+            persistent_inventory_gain_count=2,
+            persistent_inventory_loss_count=1,
+            persistent_affordance_gain=0,
+            persistent_exit_gain_count=0,
+            bulk_inventory_action_count=3,
+            inventory_churn_penalty=6.0,
+            branch_progress_score=2.5,
+        )
+    )
+
+    assert allowed is False
+    assert "inventory churn" in reason
+
+
+def test_local_explorer_rejects_zero_score_inventory_churn_branch(tmp_path: Path) -> None:
+    """Zero-score inventory-only branches should fail if they devolve into local object churn."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=OscillatingBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    allowed, reason = explorer._branch_clears_commit_gate(  # type: ignore[attr-defined]
+        LocalBranchOutcome(
+            branch_index=0,
+            actions_taken=[
+                "take nest",
+                "throw egg at ground",
+                "take egg",
+                "throw leaflet at ground",
+                "take leaflet",
+                "throw nest at ground",
+            ],
+            total_reward=0.0,
+            score_change=0,
+            final_score=5,
+            final_observation="The nest and egg are here.",
+            terminated=False,
+            termination_reason=BranchTerminationReason.HORIZON_REACHED,
+            persistent_inventory_gain_count=2,
+            persistent_inventory_loss_count=0,
+            persistent_affordance_gain=0,
+            persistent_exit_gain_count=0,
+            branch_progress_score=1.5,
+            discard_like_action_count=3,
+            aggressive_action_count=3,
+            speculative_tool_use_action_count=3,
+            post_gain_churn_action_count=3,
+            inventory_churn_penalty=8.25,
+        )
+    )
+
+    assert allowed is False
+    assert (
+        "inventory only through low-value local object churn" in reason
+        or "inventory churn" in reason
+    )
+
+
+def test_local_explorer_rejects_exit_only_branch_without_score_or_inventory(tmp_path: Path) -> None:
+    """Pure exit discovery should not be committed from local exploration without durable gain."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=OscillatingBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    allowed, reason = explorer._branch_clears_commit_gate(  # type: ignore[attr-defined]
+        LocalBranchOutcome(
+            branch_index=0,
+            actions_taken=["west", "north", "east"],
+            total_reward=0.0,
+            score_change=0,
+            final_score=0,
+            final_observation="A new region is visible.",
+            terminated=False,
+            termination_reason=BranchTerminationReason.HORIZON_REACHED,
+            persistent_inventory_gain_count=0,
+            persistent_affordance_gain=1,
+            persistent_exit_gain_count=2,
+            novel_object_count=1,
+            branch_progress_score=3.0,
+        )
+    )
+
+    assert allowed is False
+    assert "changed reachable exits without score or inventory gain" in reason
