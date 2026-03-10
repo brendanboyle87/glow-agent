@@ -187,12 +187,14 @@ class PolicyConfig(StrictModel):
     object_family_exhaustion_penalty: float = 2.0
     post_score_scene_exhaustion_penalty: float = 2.5
     post_score_local_churn_penalty: float = 1.75
+    post_score_inventory_object_penalty: float = 3.0
     stale_reflection_try_penalty: float = 0.75
     escape_mode_exit_bonus: float = 1.5
     explore_mode_exit_bonus: float = 1.0
     strategic_try_bonus: float = 1.25
     strategic_object_bonus: float = 1.0
     strategic_avoid_penalty: float = 1.0
+    min_strategic_opportunity_priority: float = 0.5
     landmark_movement_bonus: float = 1.25
     fresh_affordance_followup_bonus: float = 1.5
     discard_inventory_penalty: float = 2.0
@@ -339,12 +341,14 @@ class PolicyConfig(StrictModel):
         "action_repeated_no_gain_penalty",
         "object_family_exhaustion_penalty",
         "post_score_scene_exhaustion_penalty",
+        "post_score_inventory_object_penalty",
         "stale_reflection_try_penalty",
         "escape_mode_exit_bonus",
         "explore_mode_exit_bonus",
         "strategic_try_bonus",
         "strategic_object_bonus",
         "strategic_avoid_penalty",
+        "min_strategic_opportunity_priority",
         "discard_inventory_penalty",
         "bulk_inventory_action_penalty",
         "branch_progress_score_weight",

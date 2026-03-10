@@ -851,7 +851,14 @@ class ActionGenerator:
             if llm_rank_map and normalize_parser_action(candidate.action) in llm_rank_map:
                 candidate.rank = llm_rank
             candidate.ranking_reason = ", ".join(reasons)
-            if self._is_object_centric_priority_action(candidate.action, features):
+            if self._is_object_centric_priority_action(candidate.action, features) and not (
+                features.local_scene_post_score_stale
+                and not (
+                    features.touches_recent_affordance_object
+                    or features.touches_strategic_object
+                    or features.matches_strategic_try_action
+                )
+            ):
                 object_centric_candidates_exist = True
             base_scored.append(candidate)
 
@@ -1105,7 +1112,22 @@ class ActionGenerator:
             matches_strategic_avoid_action=normalized_action in normalized_strategic_avoid_actions,
             current_mode=strategic_mode.value,
         )
-        if not features.target_is_new_salient_object:
+        if features.target_is_new_salient_object and (
+            features.prior_score_success_for_object_family
+            or features.prior_inventory_gain_for_object_family > 0
+            or (set(noun_targets) & inventory_tokens)
+        ):
+            features.target_is_new_salient_object = False
+        if features.touches_newly_salient_object and not features.target_is_new_salient_object:
+            features.touches_newly_salient_object = False
+        if (
+            not features.target_is_new_salient_object
+            and not (
+                features.prior_score_success_for_object_family
+                or features.prior_inventory_gain_for_object_family > 0
+                or (set(noun_targets) & inventory_tokens)
+            )
+        ):
             features.target_is_new_salient_object = bool(set(noun_targets) & visible_nouns and set(noun_targets) & new_visible_nouns)
         features.local_scene_post_score_stale = self._is_local_scene_post_score_stale(
             features,
@@ -1160,6 +1182,11 @@ class ActionGenerator:
             features,
             strong_prior_gain=strong_prior_gain,
         )
+        post_score_low_value_new_object_acquire = self._is_post_score_low_value_new_object_acquire(
+            features,
+            inventory_tokens=inventory_tokens,
+            strong_prior_gain=strong_prior_gain,
+        )
         canonical_prior_contribution = 0.0
         object_family_evidence_contribution = 0.0
         plausibility_score = 0.0
@@ -1201,6 +1228,7 @@ class ActionGenerator:
                 and not strong_prior_gain
             )
             and not scene_stale_after_score
+            and not post_score_low_value_new_object_acquire
         ):
             positive += self.config.policy.untried_action_bonus
             plausibility_score += self.config.policy.untried_action_bonus
@@ -1220,19 +1248,40 @@ class ActionGenerator:
             plausibility_score -= repeated_penalty
             reasons.append(f"repeated_no_gain={features.previous_attempt_count}")
 
-        if features.touches_newly_salient_object and self._is_object_centric_priority_action(candidate.action, features):
+        if (
+            features.touches_newly_salient_object
+            and self._is_object_centric_priority_action(candidate.action, features)
+            and not post_score_low_value_new_object_acquire
+        ):
             positive += self.config.policy.new_object_bonus * float(max(len(features.noun_targets), 1))
             plausibility_score += self.config.policy.new_object_bonus * float(max(len(features.noun_targets), 1))
             reasons.append("new_object")
 
-        if (
-            (
+        durable_history_signal = (
+            features.produced_score_gain_before
+            or (
                 features.produced_inventory_gain_before
                 and not features.is_bulk_inventory_action
                 and not features.is_discard_like_action
             )
-            or features.produced_affordance_gain_before
-            or features.produced_score_gain_before
+        )
+        transferable_affordance_history = (
+            features.produced_affordance_gain_before
+            and not features.is_discard_like_action
+            and not stale_toggle_without_durable_gain
+            and not stale_reacquire_inventory_churn
+            and not stale_reexpose_container
+            and not scene_stale_after_score
+            and not self._is_stale_nonnew_acquire_in_inventory_scene(
+                features,
+                inventory_tokens=inventory_tokens,
+                strong_prior_gain=strong_prior_gain,
+            )
+        )
+
+        if (
+            durable_history_signal
+            or transferable_affordance_history
         ) and (
             strong_prior_gain
             or (
@@ -1258,24 +1307,28 @@ class ActionGenerator:
             plausibility_score -= self.config.policy.object_family_exhaustion_penalty
             reasons.append("stale_affordance_history")
 
-        if self._is_object_centric_priority_action(candidate.action, features) and (
-            features.target_is_new_salient_object
-            or features.touches_recent_affordance_object
-            or strong_prior_gain
-            or features.prior_score_success_for_object_family
-            or (
-                features.produced_affordance_gain_before
-                and not features.touches_exhausted_family
-                and not stale_toggle_without_durable_gain
-                and not stale_reacquire_inventory_churn
-                and not stale_reexpose_container
-            )
-            or (
-                trustworthy_soft_support
-                and features.matches_supported_try_action
-                and self._reflection_try_has_durable_support(
-                    features,
-                    strong_prior_gain=strong_prior_gain,
+        if (
+            self._is_object_centric_priority_action(candidate.action, features)
+            and not post_score_low_value_new_object_acquire
+            and (
+                features.target_is_new_salient_object
+                or features.touches_recent_affordance_object
+                or strong_prior_gain
+                or features.prior_score_success_for_object_family
+                or (
+                    features.produced_affordance_gain_before
+                    and not features.touches_exhausted_family
+                    and not stale_toggle_without_durable_gain
+                    and not stale_reacquire_inventory_churn
+                    and not stale_reexpose_container
+                )
+                or (
+                    trustworthy_soft_support
+                    and features.matches_supported_try_action
+                    and self._reflection_try_has_durable_support(
+                        features,
+                        strong_prior_gain=strong_prior_gain,
+                    )
                 )
             )
         ):
@@ -1347,6 +1400,10 @@ class ActionGenerator:
             strategic_mode is StrategicMode.EXPLOIT
             and not features.is_movement_action
             and (features.matches_strategic_try_action or features.touches_strategic_object)
+            and not features.is_discard_like_action
+            and not stale_toggle_without_durable_gain
+            and not stale_reacquire_inventory_churn
+            and not scene_stale_after_score
         ):
             positive += 0.5 * self.config.policy.strategic_try_bonus
             plausibility_score += 0.5 * self.config.policy.strategic_try_bonus
@@ -1471,6 +1528,23 @@ class ActionGenerator:
             plausibility_score -= local_churn_penalty
             reasons.append("post_score_local_churn")
 
+        if post_score_low_value_new_object_acquire:
+            negative += self.config.policy.post_score_local_churn_penalty
+            plausibility_score -= self.config.policy.post_score_local_churn_penalty
+            reasons.append("post_score_low_value_new_object")
+
+        if self._is_post_score_inventory_object_disruption(
+            features,
+            inventory_tokens=inventory_tokens,
+            strong_prior_gain=strong_prior_gain,
+        ):
+            scored_object_penalty = self.config.policy.post_score_inventory_object_penalty
+            if features.action_shape_is_complex_transitive or features.verb_family in {"use", "aggressive"}:
+                scored_object_penalty += 0.5 * self.config.policy.post_score_inventory_object_penalty
+            negative += scored_object_penalty
+            plausibility_score -= scored_object_penalty
+            reasons.append("post_score_inventory_object_preserve")
+
         if stale_reexpose_container:
             negative += self.config.policy.object_family_exhaustion_penalty
             plausibility_score -= self.config.policy.object_family_exhaustion_penalty
@@ -1522,7 +1596,7 @@ class ActionGenerator:
             plausibility_score -= self.config.policy.discard_inventory_penalty
             reasons.append("discard_inventory")
 
-        if features.target_is_new_salient_object:
+        if features.target_is_new_salient_object and not post_score_low_value_new_object_acquire:
             canonical_bonus = self._canonical_new_object_bonus(features)
             if canonical_bonus != 0.0:
                 positive += max(canonical_bonus, 0.0)
@@ -1562,7 +1636,11 @@ class ActionGenerator:
             plausibility_score += self.config.policy.simple_action_shape_bonus
             reasons.append("simple_action_shape")
 
-        if features.prior_success_for_verb_family and (
+        if (
+            features.prior_success_for_verb_family
+            and not features.is_discard_like_action
+            and not post_score_low_value_new_object_acquire
+        ) and (
             strong_prior_gain
             or (
                 not stale_movement_without_durable_gain
@@ -1576,7 +1654,10 @@ class ActionGenerator:
             plausibility_score += self.config.policy.verb_family_success_bonus
             reasons.append("verb_family_success")
 
-        if features.prior_success_for_exact_action and (
+        if (
+            features.prior_success_for_exact_action
+            and not features.is_discard_like_action
+        ) and (
             strong_prior_gain
             or (
                 not stale_movement_without_durable_gain
@@ -1923,12 +2004,19 @@ class ActionGenerator:
             return False
         if not inventory_tokens:
             return False
+        if features.touches_recent_affordance_object:
+            return False
         if features.prior_score_success_for_object_family or features.prior_success_for_exact_action:
             return False
         return (
-            features.touches_supported_reflection_object
+            features.prior_inventory_gain_for_object_family > 0
+            or features.prior_inventory_loss_for_object_family > 0
+            or features.touches_exhausted_family
+            or features.max_family_no_progress_count
+            >= self.config.policy.object_family_no_progress_threshold
+            or features.target_is_container_or_openable
+            or features.touches_supported_reflection_object
             or features.matches_supported_try_action
-            or features.object_count > 0
         )
 
     def _is_stale_reacquire_inventory_churn(
@@ -2012,9 +2100,37 @@ class ActionGenerator:
             if candidate.features.is_movement_action:
                 has_exit = True
                 continue
-            if candidate.features.touches_newly_salient_object:
+            if candidate.features.touches_newly_salient_object and not (
+                candidate.features.local_scene_post_score_stale
+                and not (
+                    candidate.features.touches_recent_affordance_object
+                    or candidate.features.touches_strategic_object
+                    or candidate.features.matches_strategic_try_action
+                )
+            ) and not self._is_post_score_low_value_new_object_acquire(
+                candidate.features,
+                inventory_tokens=inventory_tokens,
+                strong_prior_gain=self._has_strong_prior_gain(candidate.features),
+            ):
                 has_new_object_priority = True
-            if candidate.features.touches_recent_affordance_object:
+            if (
+                candidate.features.touches_recent_affordance_object
+                and not candidate.features.is_discard_like_action
+                and not self._is_stale_toggle_without_durable_gain(
+                    candidate.features,
+                    strong_prior_gain=self._has_strong_prior_gain(candidate.features),
+                )
+                and not self._is_stale_reacquire_inventory_churn(
+                    candidate.features,
+                    inventory_tokens=inventory_tokens,
+                    strong_prior_gain=self._has_strong_prior_gain(candidate.features),
+                )
+                and not self._is_stale_nonnew_acquire_in_inventory_scene(
+                    candidate.features,
+                    inventory_tokens=inventory_tokens,
+                    strong_prior_gain=self._has_strong_prior_gain(candidate.features),
+                )
+            ):
                 has_recent_affordance_followup = True
             normalized_action = normalize_parser_action(candidate.action)
             if (
@@ -2047,6 +2163,66 @@ class ActionGenerator:
         if features.target_is_new_salient_object:
             return False
         if not features.noun_targets:
+            return False
+        return True
+
+    def _is_post_score_inventory_object_disruption(
+        self,
+        features: ActionCandidateFeatures,
+        *,
+        inventory_tokens: set[str],
+        strong_prior_gain: bool,
+    ) -> bool:
+        """Return whether an action risks churning a newly valuable carried object after scoring.
+
+        This is intentionally narrow: once a scene already yielded score through an inventory
+        object family, follow-on manipulation of that same carried object should lose to exits
+        or broader mapping unless there is specific evidence that the exact action is valuable.
+        """
+
+        if strong_prior_gain or features.is_movement_action:
+            return False
+        if not features.scene_has_score_harvested or not features.prior_score_success_for_object_family:
+            return False
+        if not features.noun_targets or not inventory_tokens:
+            return False
+        if not (set(features.noun_targets) & inventory_tokens):
+            return False
+        if features.target_is_new_salient_object or features.touches_recent_affordance_object:
+            return False
+        if features.prior_success_for_exact_action and features.produced_score_gain_before:
+            return False
+        if features.verb_family == "inspect" and not features.action_shape_is_complex_transitive:
+            return False
+        return (
+            features.verb_family in {"acquire", "use", "aggressive"}
+            or features.is_reversible_toggle
+            or features.action_shape_is_complex_transitive
+            or features.uses_inventory_object
+        )
+
+    def _is_post_score_low_value_new_object_acquire(
+        self,
+        features: ActionCandidateFeatures,
+        *,
+        inventory_tokens: set[str],
+        strong_prior_gain: bool,
+    ) -> bool:
+        """Return whether a new-looking local acquire should yield to leaving a scored scene.
+
+        This targets cases like grabbing nearby container clutter after already securing a
+        higher-value inventory state. Truly fresh payoff objects still bypass this rule.
+        """
+
+        if strong_prior_gain or not features.scene_has_score_harvested:
+            return False
+        if not features.target_is_new_salient_object or features.verb_family != "acquire":
+            return False
+        if not inventory_tokens or not features.target_is_container_or_openable:
+            return False
+        if features.touches_recent_affordance_object or features.touches_strategic_object:
+            return False
+        if features.matches_strategic_try_action or features.prior_score_success_for_object_family:
             return False
         return True
 

@@ -191,6 +191,7 @@ class EpisodeRunner:
                     current_state=current_state,
                     frontier_entries=self.frontier.top_k(6),
                     cluster_visit_exhaustion_threshold=self.config.policy.region_visit_exhaustion_threshold,
+                    min_opportunity_priority=self.config.policy.min_strategic_opportunity_priority,
                 )
                 latest_strategic_guidance = self._apply_stall_recovery_guidance_override(
                     strategic_guidance=latest_strategic_guidance,
@@ -475,6 +476,7 @@ class EpisodeRunner:
                     inverse_pairs=self.config.policy.inverse_action_pairs,
                     bulk_inventory_action=is_bulk_inventory_action(chosen_action),
                     discard_like_action=is_discard_like_action(chosen_action),
+                    revealed_object_tokens=novel_object_tokens if revealed_new_object else set(),
                 )
                 loop_result = evaluate_reversible_action_loop(
                     action=chosen_action,
@@ -930,16 +932,23 @@ class EpisodeRunner:
 
         episode_map_memory.record_state(state, step_index=step_index)
         state.strategic_cluster_score = episode_map_memory.cluster_strategic_score(state.state_cluster_id)
-        state.unresolved_opportunity_count = episode_map_memory.unresolved_opportunity_count(state.state_cluster_id)
+        state.unresolved_opportunity_count = len(
+            episode_map_memory.opportunities_for_cluster(
+                state.state_cluster_id,
+                min_priority=self.config.policy.min_strategic_opportunity_priority,
+            )
+        )
         state.metadata["strategic_cluster_score"] = state.strategic_cluster_score
         state.metadata["unresolved_opportunity_count"] = state.unresolved_opportunity_count
         state.metadata["strategic_objects"] = episode_map_memory.suggested_objects_for_cluster(
             state.state_cluster_id,
             limit=6,
+            min_priority=self.config.policy.min_strategic_opportunity_priority,
         )
         state.metadata["strategic_actions"] = episode_map_memory.suggested_actions_for_cluster(
             state.state_cluster_id,
             limit=6,
+            min_priority=self.config.policy.min_strategic_opportunity_priority,
         )
         return state
 

@@ -904,6 +904,54 @@ def test_action_generator_prefers_take_canary_when_canary_is_freshly_revealed(
     assert "take nest" not in ranked_actions or ranked_actions.index("take canary") < ranked_actions.index("take nest")
 
 
+def test_action_generator_demotes_post_score_inventory_object_churn(
+    tmp_path: Path,
+) -> None:
+    """After scoring with a carried object, exits should outrank destructive local follow-ups."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. take on egg\n2. close egg\n3. down"),
+    )
+    history = ActionClusterHistory(cluster_label="egg-cluster")
+    history.observe_state_nouns(
+        observation="Up a Tree. You are carrying a jewel-encrusted egg beside a nest.",
+        inventory_text="jewel-encrusted egg",
+        valid_actions=["down", "take on egg", "close egg", "take nest"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="take egg",
+        score_changed=True,
+        inventory_changed=True,
+        inventory_gained=True,
+        observation_changed=True,
+        valid_actions_changed=False,
+        target_tokens={"egg"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="Up a Tree. Beside you is a nest, and you are carrying a jewel-encrusted egg.",
+        inventory_text="jewel-encrusted egg",
+        valid_actions=["down", "take on egg", "close egg", "take nest"],
+        score=5,
+        moves=7,
+        recent_actions=["take egg"],
+        state_action_history=history,
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "down"
+    take_on_egg = next(candidate for candidate in result.candidates if candidate.action == "take on egg")
+    assert "post_score_inventory_object_preserve" in take_on_egg.ranking_reason
+    assert ranked_actions.index("down") < ranked_actions.index("take on egg")
+    assert "close egg" not in ranked_actions
+
+
 def test_action_generator_does_not_let_reflection_try_rescue_stale_nonnew_acquire(
     tmp_path: Path,
 ) -> None:
@@ -1446,3 +1494,114 @@ def test_action_generator_demotes_stale_leaflet_retake_after_local_inventory_chu
     assert retake.features.prior_inventory_gain_for_object_family > 0
     assert retake.features.prior_inventory_loss_for_object_family > 0
     assert "stale_reacquire_churn" in retake.ranking_reason
+
+
+def test_action_generator_prefers_exit_after_secure_leaflet_pickup(tmp_path: Path) -> None:
+    """Once the leaflet is secured, exits should beat stale mailbox-scene churn."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. close mailbox\n2. north\n3. put down leaflet"),
+    )
+    history = ActionClusterHistory(cluster_label="mailbox-cluster")
+    history.record_state_cluster(cluster_id="region:mailbox", observation="West of House.")
+    history.record_state_cluster(cluster_id="region:mailbox", observation="West of House.")
+    history.observe_state_nouns(
+        observation="Opening the small mailbox reveals a leaflet.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["take leaflet", "close mailbox", "north", "south"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="open mailbox",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=True,
+        revealed_new_object=True,
+        target_tokens={"mailbox"},
+        revealed_object_tokens={"leaflet"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="take leaflet",
+        score_changed=False,
+        inventory_changed=True,
+        inventory_gained=True,
+        observation_changed=False,
+        valid_actions_changed=False,
+        target_tokens={"leaflet"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation="West of House. The small mailbox is open.",
+        inventory_text="You are carrying a leaflet.",
+        valid_actions=["close mailbox", "north", "put down leaflet", "south"],
+        score=0,
+        moves=2,
+        candidate_count=4,
+        state_action_history=history,
+        strategic_mode=StrategicMode.EXPLOIT,
+        strategic_try_actions=["north"],
+    )
+
+    ranked_actions = [candidate.action for candidate in result.candidates]
+    assert ranked_actions[0] == "north"
+    close_mailbox = next(candidate for candidate in result.candidates if candidate.action == "close mailbox")
+    put_down_leaflet = next(candidate for candidate in result.candidates if candidate.action == "put down leaflet")
+    assert ranked_actions.index("north") < ranked_actions.index("close mailbox")
+    assert ranked_actions.index("north") < ranked_actions.index("put down leaflet")
+    assert result.top_selection_reason
+    assert "escape_mode_exit" in result.top_selection_reason
+    assert "historical_gain" not in put_down_leaflet.ranking_reason
+
+
+def test_action_generator_does_not_treat_discard_churn_as_exact_success(tmp_path: Path) -> None:
+    """Discard-like local inventory churn should not bootstrap exact-action success."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient("1. put down leaflet\n2. north"),
+    )
+    history = ActionClusterHistory(cluster_label="mailbox-cluster")
+    history.record_state_cluster(cluster_id="region:mailbox", observation="West of House.")
+    history.record_state_cluster(cluster_id="region:mailbox", observation="West of House.")
+    history.record_attempt(
+        action="put down leaflet",
+        score_changed=False,
+        inventory_changed=True,
+        inventory_lost=True,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=True,
+        revealed_new_object=True,
+        target_tokens={"leaflet"},
+        revealed_object_tokens={"leaflet"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+        discard_like_action=True,
+    )
+
+    result = generator.generate(
+        observation="West of House. The leaflet lies here.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["put down leaflet", "north", "south"],
+        score=0,
+        moves=4,
+        candidate_count=3,
+        state_action_history=history,
+        strategic_mode=StrategicMode.EXPLORE,
+        strategic_try_actions=["north", "south"],
+    )
+
+    put_down_leaflet = next(candidate for candidate in result.candidates if candidate.action == "put down leaflet")
+    assert put_down_leaflet.features is not None
+    assert put_down_leaflet.features.prior_success_for_exact_action is False
+    assert "exact_action_success" not in put_down_leaflet.ranking_reason

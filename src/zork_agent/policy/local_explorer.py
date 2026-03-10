@@ -519,6 +519,7 @@ class LocalExplorer:
                 inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
                 bulk_inventory_action=bulk_inventory_action,
                 discard_like_action=discard_like_action,
+                revealed_object_tokens=persistent_novel_object_tokens if persistent_revealed_new_object else set(),
             )
             action_cluster_history.observe_state_nouns(
                 observation=current_state.observation,

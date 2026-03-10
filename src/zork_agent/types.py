@@ -1478,6 +1478,7 @@ class ActionAttemptStats:
         revealed_new_object: bool = False,
         bulk_inventory_action: bool = False,
         discard_like_action: bool = False,
+        durable_progress_override: bool | None = None,
     ) -> None:
         """Accumulate one observed action outcome."""
 
@@ -1504,17 +1505,19 @@ class ActionAttemptStats:
             self.discard_like_count += 1
         if not any((score_changed, inventory_changed, observation_changed, valid_actions_changed)):
             self.no_gain_count += 1
-        durable_progress = any(
-            (
-                score_changed,
-                valid_actions_improved,
-                revealed_new_object,
-                inventory_gained and not bulk_inventory_action and not discard_like_action,
+        durable_progress = (
+            durable_progress_override
+            if durable_progress_override is not None
+            else any(
+                (
+                    score_changed,
+                    inventory_gained and not bulk_inventory_action and not discard_like_action,
+                )
             )
         )
         if durable_progress:
             self.durable_gain_count += 1
-        else:
+        elif not (valid_actions_improved or revealed_new_object):
             self.no_durable_gain_count += 1
 
 
@@ -1586,9 +1589,17 @@ class ActionClusterHistory:
         inverse_pairs: Mapping[str, str] | None = None,
         bulk_inventory_action: bool = False,
         discard_like_action: bool = False,
+        revealed_object_tokens: set[str] | None = None,
     ) -> None:
         """Record one attempted action and its observed effect."""
 
+        verb_family = canonical_if_verb_family(action, inverse_pairs)
+        durable_progress = any(
+            (
+                score_changed,
+                inventory_gained and not bulk_inventory_action and not discard_like_action,
+            )
+        )
         exact_stats = self.stats_for(action)
         exact_stats.record_attempt(
             score_changed=score_changed,
@@ -1601,8 +1612,8 @@ class ActionClusterHistory:
             revealed_new_object=revealed_new_object,
             bulk_inventory_action=bulk_inventory_action,
             discard_like_action=discard_like_action,
+            durable_progress_override=durable_progress,
         )
-        verb_family = canonical_if_verb_family(action, inverse_pairs)
         self.stats_for_verb_family(verb_family).record_attempt(
             score_changed=score_changed,
             inventory_changed=inventory_changed,
@@ -1614,16 +1625,14 @@ class ActionClusterHistory:
             revealed_new_object=revealed_new_object,
             bulk_inventory_action=bulk_inventory_action,
             discard_like_action=discard_like_action,
-        )
-        durable_progress = any(
-            (
-                score_changed,
-                valid_actions_improved,
-                revealed_new_object,
-                inventory_gained and not bulk_inventory_action and not discard_like_action,
-            )
+            durable_progress_override=durable_progress,
         )
         normalized_targets = {normalize_parser_action(token) for token in (target_tokens or set()) if normalize_parser_action(token)}
+        normalized_revealed_targets = {
+            normalize_parser_action(token)
+            for token in (revealed_object_tokens or set())
+            if normalize_parser_action(token)
+        }
         for token in normalized_targets:
             self.stats_for_object_noun(token).record_attempt(
                 score_changed=score_changed,
@@ -1636,13 +1645,18 @@ class ActionClusterHistory:
                 revealed_new_object=revealed_new_object,
                 bulk_inventory_action=bulk_inventory_action,
                 discard_like_action=discard_like_action,
+                durable_progress_override=durable_progress,
             )
+        affordance_targets = set(normalized_targets) | set(normalized_revealed_targets)
         if valid_actions_improved or revealed_new_object:
-            self.recent_affordance_targets = set(normalized_targets)
-        elif normalized_targets & self.recent_affordance_targets:
+            self.recent_affordance_targets = set(affordance_targets)
+        elif affordance_targets & self.recent_affordance_targets:
             # Once we have attempted a follow-up on the freshly revealed object family,
             # stop treating it as "just revealed" for subsequent ranking steps.
-            self.recent_affordance_targets.difference_update(normalized_targets)
+            self.recent_affordance_targets.difference_update(affordance_targets)
+        if inventory_gained and affordance_targets:
+            # Carrying the object means the immediate local reveal has already been cashed in.
+            self.recent_affordance_targets.difference_update(affordance_targets)
         if durable_progress:
             self.no_progress_steps = 0
             if movement_only_action:
@@ -1986,13 +2000,13 @@ class EpisodeMapMemory:
             return
         node = self.nodes.setdefault(previous_cluster_id, RegionNodeMemory(cluster_id=previous_cluster_id))
         normalized_action = normalize_parser_action(action)
+        # Region "harvest" should only advance on durable payoffs, not on every local
+        # affordance reveal. For example, opening the mailbox should not immediately
+        # mark the mailbox region harvested before the agent has actually taken the leaflet.
         durable_progress = any(
             (
                 score_gain > 0,
                 inventory_gain_count > 0,
-                affordance_gain > 0,
-                novel_object_count > 0 and not is_movement_action(action),
-                materially_new_actions and not is_movement_action(action),
             )
         )
         if durable_progress:
@@ -2056,12 +2070,17 @@ class EpisodeMapMemory:
         current_state: "TextGameState",
         frontier_entries: Sequence["FrontierEntry"] | None = None,
         cluster_visit_exhaustion_threshold: int = 4,
+        min_opportunity_priority: float = 0.0,
     ) -> StrategicGuidance:
         """Return high-level explore/exploit guidance for the current episode step."""
 
         current_cluster_id = normalize_parser_action(current_state.state_cluster_id or current_state.world_state_hash)
         current_node = self.nodes.get(current_cluster_id)
-        current_opportunities = self.opportunities_for_cluster(current_cluster_id, active_only=True)
+        current_opportunities = self.opportunities_for_cluster(
+            current_cluster_id,
+            active_only=True,
+            min_priority=min_opportunity_priority,
+        )
         current_structural_opportunities = [
             opportunity
             for opportunity in current_opportunities
@@ -2075,7 +2094,10 @@ class EpisodeMapMemory:
         current_exit_actions = self._unexplored_exit_actions(current_cluster_id)
         current_cluster_score = self.cluster_strategic_score(current_cluster_id)
         current_region_harvested = bool(current_node is not None and current_node.durable_progress_count > 0)
-        current_object_actions = self._cluster_object_action_hints(current_cluster_id)
+        current_object_actions = self._cluster_object_action_hints(
+            current_cluster_id,
+            min_priority=min_opportunity_priority,
+        )
         current_region_exhausted = bool(
             current_region_harvested
             and not current_structural_opportunities
@@ -2097,7 +2119,11 @@ class EpisodeMapMemory:
                 best_frontier_cluster = cluster_id
                 best_frontier_has_structural_access = any(
                     opportunity.kind is RegionOpportunityKind.STRUCTURAL_ACCESS
-                    for opportunity in self.opportunities_for_cluster(cluster_id, active_only=True)
+                    for opportunity in self.opportunities_for_cluster(
+                        cluster_id,
+                        active_only=True,
+                        min_priority=min_opportunity_priority,
+                    )
                 )
 
         if current_structural_opportunities and current_cluster_score > 0.0 and (
@@ -2107,8 +2133,14 @@ class EpisodeMapMemory:
                 mode=StrategicMode.EXPLOIT,
                 reason="Current region still has grounded structural access opportunities.",
                 preferred_cluster_id=current_cluster_id,
-                try_actions=self.suggested_actions_for_cluster(current_cluster_id),
-                salient_objects=self.suggested_objects_for_cluster(current_cluster_id),
+                try_actions=self.suggested_actions_for_cluster(
+                    current_cluster_id,
+                    min_priority=min_opportunity_priority,
+                ),
+                salient_objects=self.suggested_objects_for_cluster(
+                    current_cluster_id,
+                    min_priority=min_opportunity_priority,
+                ),
                 opportunity_labels=[opportunity.token for opportunity in current_structural_opportunities[:4]],
             )
 
@@ -2131,10 +2163,16 @@ class EpisodeMapMemory:
                 preferred_cluster_id=best_frontier_cluster,
                 try_actions=[],
                 avoid_actions=current_object_actions[:6],
-                salient_objects=self.suggested_objects_for_cluster(best_frontier_cluster),
+                salient_objects=self.suggested_objects_for_cluster(
+                    best_frontier_cluster,
+                    min_priority=min_opportunity_priority,
+                ),
                 opportunity_labels=[
                     opportunity.token
-                    for opportunity in self.opportunities_for_cluster(best_frontier_cluster)[:4]
+                    for opportunity in self.opportunities_for_cluster(
+                        best_frontier_cluster,
+                        min_priority=min_opportunity_priority,
+                    )[:4]
                 ],
             )
 
@@ -2149,8 +2187,14 @@ class EpisodeMapMemory:
                 mode=StrategicMode.EXPLOIT,
                 reason="Current region still has unresolved object interactions worth probing.",
                 preferred_cluster_id=current_cluster_id,
-                try_actions=self.suggested_actions_for_cluster(current_cluster_id),
-                salient_objects=self.suggested_objects_for_cluster(current_cluster_id),
+                try_actions=self.suggested_actions_for_cluster(
+                    current_cluster_id,
+                    min_priority=min_opportunity_priority,
+                ),
+                salient_objects=self.suggested_objects_for_cluster(
+                    current_cluster_id,
+                    min_priority=min_opportunity_priority,
+                ),
                 opportunity_labels=[opportunity.token for opportunity in current_object_opportunities[:4]],
             )
 
@@ -2165,7 +2209,10 @@ class EpisodeMapMemory:
                 preferred_cluster_id=current_cluster_id,
                 try_actions=current_exit_actions[:4],
                 avoid_actions=current_object_actions[:6] if current_region_exhausted else [],
-                salient_objects=self.suggested_objects_for_cluster(current_cluster_id),
+                salient_objects=self.suggested_objects_for_cluster(
+                    current_cluster_id,
+                    min_priority=min_opportunity_priority,
+                ),
                 opportunity_labels=["route:" + action for action in current_exit_actions[:4]],
             )
 
@@ -2176,8 +2223,17 @@ class EpisodeMapMemory:
                 preferred_cluster_id=best_frontier_cluster,
                 try_actions=[],
                 avoid_actions=current_object_actions[:6] if current_region_exhausted else [],
-                salient_objects=self.suggested_objects_for_cluster(best_frontier_cluster),
-                opportunity_labels=[opportunity.token for opportunity in self.opportunities_for_cluster(best_frontier_cluster)[:4]],
+                salient_objects=self.suggested_objects_for_cluster(
+                    best_frontier_cluster,
+                    min_priority=min_opportunity_priority,
+                ),
+                opportunity_labels=[
+                    opportunity.token
+                    for opportunity in self.opportunities_for_cluster(
+                        best_frontier_cluster,
+                        min_priority=min_opportunity_priority,
+                    )[:4]
+                ],
             )
 
         return StrategicGuidance(
@@ -2229,12 +2285,22 @@ class EpisodeMapMemory:
 
         return len(self.opportunities_for_cluster(cluster_id, active_only=True))
 
-    def suggested_actions_for_cluster(self, cluster_id: str | None, *, limit: int = 6) -> list[str]:
+    def suggested_actions_for_cluster(
+        self,
+        cluster_id: str | None,
+        *,
+        limit: int = 6,
+        min_priority: float = 0.0,
+    ) -> list[str]:
         """Return compact action hints for the strongest unresolved opportunities in one cluster."""
 
         suggestions: list[str] = []
         seen: set[str] = set()
-        for opportunity in self.opportunities_for_cluster(cluster_id, active_only=True):
+        for opportunity in self.opportunities_for_cluster(
+            cluster_id,
+            active_only=True,
+            min_priority=min_priority,
+        ):
             for action in opportunity.action_hints:
                 normalized = normalize_parser_action(action)
                 if not normalized or normalized in seen:
@@ -2245,12 +2311,22 @@ class EpisodeMapMemory:
                     return suggestions
         return suggestions
 
-    def _cluster_object_action_hints(self, cluster_id: str | None, *, limit: int = 6) -> list[str]:
+    def _cluster_object_action_hints(
+        self,
+        cluster_id: str | None,
+        *,
+        limit: int = 6,
+        min_priority: float = 0.0,
+    ) -> list[str]:
         """Return object-followup action hints for one cluster."""
 
         suggestions: list[str] = []
         seen: set[str] = set()
-        for opportunity in self.opportunities_for_cluster(cluster_id, active_only=True):
+        for opportunity in self.opportunities_for_cluster(
+            cluster_id,
+            active_only=True,
+            min_priority=min_priority,
+        ):
             if opportunity.kind is not RegionOpportunityKind.OBJECT_FOLLOWUP:
                 continue
             for action in opportunity.action_hints:
@@ -2263,12 +2339,22 @@ class EpisodeMapMemory:
                     return suggestions
         return suggestions
 
-    def suggested_objects_for_cluster(self, cluster_id: str | None, *, limit: int = 6) -> list[str]:
+    def suggested_objects_for_cluster(
+        self,
+        cluster_id: str | None,
+        *,
+        limit: int = 6,
+        min_priority: float = 0.0,
+    ) -> list[str]:
         """Return the top unresolved object tokens for one cluster."""
 
         tokens: list[str] = []
         seen: set[str] = set()
-        for opportunity in self.opportunities_for_cluster(cluster_id, active_only=True):
+        for opportunity in self.opportunities_for_cluster(
+            cluster_id,
+            active_only=True,
+            min_priority=min_priority,
+        ):
             token = normalize_parser_action(opportunity.token)
             if not token or token in seen:
                 continue
@@ -2283,6 +2369,7 @@ class EpisodeMapMemory:
         cluster_id: str | None,
         *,
         active_only: bool = True,
+        min_priority: float = 0.0,
     ) -> list[RegionOpportunity]:
         """Return opportunities linked to a cluster, ordered by current priority."""
 
@@ -2295,6 +2382,12 @@ class EpisodeMapMemory:
             for opportunity_id in node.opportunity_ids
             if opportunity_id in self.opportunities and (not active_only or not self.opportunities[opportunity_id].resolved)
         ]
+        if min_priority > 0.0:
+            opportunities = [
+                opportunity
+                for opportunity in opportunities
+                if opportunity.current_priority() >= min_priority
+            ]
         opportunities.sort(
             key=lambda opportunity: (
                 -opportunity.current_priority(),

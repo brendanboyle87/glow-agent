@@ -152,6 +152,87 @@ def test_structural_access_is_not_resolved_by_affordance_gain_alone() -> None:
     assert resolved is False
 
 
+def test_strategic_guidance_ignores_stale_low_priority_structural_opportunity() -> None:
+    """Repeated no-progress structural opportunities should stop forcing exploit mode."""
+
+    memory = EpisodeMapMemory()
+    memory.nodes["house"] = RegionNodeMemory(
+        cluster_id="house",
+        visit_count=5,
+        durable_progress_count=1,
+        exit_actions={"west"},
+        explored_exit_actions=set(),
+        opportunity_ids={"structural:house:window"},
+    )
+    memory.opportunities["structural:house:window"] = RegionOpportunity(
+        opportunity_id="structural:house:window",
+        cluster_id="house",
+        kind=RegionOpportunityKind.STRUCTURAL_ACCESS,
+        token="window",
+        action_hints=["open window", "enter window"],
+        base_priority=2.0,
+        no_progress_attempt_count=3,
+    )
+
+    guidance = memory.recommend_guidance(
+        current_state=TextGameState(
+            observation="Behind House. There is a window here.",
+            valid_actions=["open window", "enter window", "west"],
+            state_cluster_id="house",
+            world_state_hash="house",
+        ),
+        frontier_entries=[],
+        min_opportunity_priority=0.5,
+    )
+
+    assert guidance.mode is StrategicMode.EXPLORE
+    assert guidance.try_actions == ["west"]
+    assert "window" not in guidance.opportunity_labels
+
+
+def test_affordance_reveal_does_not_mark_region_harvested_before_inventory_gain() -> None:
+    """Pure affordance reveal should not count as durable regional harvest."""
+
+    memory = EpisodeMapMemory()
+    previous_state = TextGameState(
+        observation="West of House.\nThere is a small mailbox here.",
+        valid_actions=["open mailbox", "north", "south", "west"],
+        state_cluster_id="region:mailbox",
+        world_state_hash="mailbox-closed",
+    )
+    current_state = TextGameState(
+        observation="Opening the small mailbox reveals a leaflet.",
+        valid_actions=["take leaflet", "close mailbox", "north", "south", "west"],
+        state_cluster_id="region:mailbox",
+        world_state_hash="mailbox-open",
+    )
+
+    memory.record_state(previous_state, step_index=0)
+    memory.record_state(current_state, step_index=1)
+    memory.record_transition(
+        previous_state=previous_state,
+        action="open mailbox",
+        current_state=current_state,
+        step_index=1,
+        score_gain=0,
+        inventory_gain_count=0,
+        affordance_gain=1,
+        novel_object_count=1,
+        materially_new_actions=True,
+    )
+
+    node = memory.nodes["region:mailbox"]
+    guidance = memory.recommend_guidance(
+        current_state=current_state,
+        frontier_entries=[],
+    )
+
+    assert node.durable_progress_count == 0
+    assert guidance.mode is StrategicMode.EXPLOIT
+    assert "take leaflet" in guidance.try_actions
+    assert "take leaflet" not in guidance.avoid_actions
+
+
 def test_state_cluster_prefers_room_title_over_local_object_nouns() -> None:
     """Region clustering should stay anchored to room/location text instead of transient objects."""
 
