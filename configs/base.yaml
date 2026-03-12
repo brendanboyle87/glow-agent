@@ -20,12 +20,20 @@ llm:
   max_tokens: 256
   request_timeout_seconds: 60.0
   offline_stub: true
+  analysis_debug_mode: false
+  frontier_analysis_max_tokens: 3000
+  frontier_analysis_debug_max_tokens: 5000
+  state_selection_max_tokens: 1500
+  state_selection_debug_max_tokens: 2500
+  mar_max_tokens: 1800
+  mar_debug_max_tokens: 3000
 
 prompts:
   directory: prompts
   system_file: system.txt
   action_proposal_file: action_proposal.txt
   trajectory_analysis_file: trajectory_analysis.txt
+  frontier_analysis_file: frontier_analysis.txt
   local_reflection_file: local_reflection.txt
   state_selection_file: state_selection.txt
 
@@ -37,6 +45,16 @@ policy:
   archive_top_k: 8
   action_candidates: 4
   state_selection_mode: heuristic
+  archive_state_selection_mode: archive_balanced
+  state_selection_prompt_candidate_limit: 6
+  state_selection_achieved_value_weight: 1.0
+  state_selection_potential_value_weight: 1.5
+  state_selection_selection_penalty: 0.25
+  state_selection_visit_penalty: 0.1
+  state_selection_direct_match_bonus: 1.0
+  state_selection_supporting_match_bonus: 0.75
+  state_selection_source_trajectory_bonus: 0.35
+  state_selection_native_snapshot_bonus: 0.2
   inverse_action_pairs:
     open: close
     take: drop
@@ -112,12 +130,17 @@ policy:
   branch_progress_location_weight: 1.0
   branch_progress_object_weight: 0.25
   branch_progress_loop_reduction_weight: 0.5
+  branch_root_replay_saturation_penalty_weight: 0.75
+  branch_root_novelty_bonus_weight: 0.75
+  branch_root_depth_bonus_weight: 0.5
+  branch_root_prefix_horizon: 3
   branch_post_gain_churn_penalty: 1.25
   branch_aggressive_action_penalty: 1.5
   branch_speculative_action_penalty: 0.75
   room_text_only_weight: 0.1
   movement_progress_cap: 0.5
   min_affordance_gain_for_movement_commit: 1
+  state_selection_root_replay_saturation_penalty_weight: 0.75
   branch_commit_min_progress_score: 1.0
   branch_commit_movement_ratio_threshold: 0.75
   branch_fail_fast_penalty_threshold: 3.0
@@ -149,6 +172,7 @@ paths:
   archive_dir: artifacts/archive
   log_dir: artifacts/logs
   summary_dir: artifacts/summaries
+  metrics_dir: artifacts/metrics
 
 logging:
   level: INFO
@@ -156,12 +180,19 @@ logging:
 
 experiment:
   game_id: zork1
+  runner_mode: glow_faithful
   seed: 7
   batch_size: 3
-  max_steps: 8
-  max_replay_attempts: 2
+  max_steps: 64
+  max_replay_attempts: 8
   frontier_refresh_cadence: 1
   local_exploration_cadence: 3
+  glow_frontier_size: 12
+  glow_local_branches_per_root: 4
+  glow_frontier_analysis_frequency: 1
+  enable_global_frontier_analysis: true
+  enable_mar: true
+  enable_potential_value_selection: true
   local_exploration_post_gain_cooldown_steps: 0
   branch_commit_steps: 4
   fail_fast_no_durable_gain_steps: 10

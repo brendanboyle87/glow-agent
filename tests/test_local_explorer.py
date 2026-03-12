@@ -28,7 +28,9 @@ from zork_agent.types import (
     BranchTerminationReason,
     LocalBranchOutcome,
     LocalWorldModel,
+    RootDepthProgressionProfile,
     TextGameState,
+    TrajectoryStep,
     WorldStateSnapshot,
 )
 
@@ -550,6 +552,143 @@ def test_local_explorer_decays_repeated_score_replay_branch_progress(tmp_path: P
 
     assert fresh_score == 5.0
     assert repeated_score == 0.0
+
+
+def test_local_explorer_applies_root_replay_saturation_penalty_for_productive_root(tmp_path: Path) -> None:
+    """A productive root should penalize exact committed-prefix replays with no new expansion."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=InventoryGainBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+    profile = RootDepthProgressionProfile(
+        root_state_id="productive-root",
+        productive_root=True,
+        productive_commit_count=1,
+        materially_distinct_commit_count=1,
+        committed_prefix_counts={"open mailbox": 1},
+        committed_branch_history=[
+            {
+                "prefix_signature": "open mailbox",
+                "actions": ["open mailbox"],
+                "final_cluster_id": "region:mailbox",
+                "final_world_state_hash": "hash-mailbox",
+                "visited_clusters": ["region:mailbox"],
+                "visited_world_hashes": ["hash-mailbox"],
+            }
+        ],
+        committed_seen_clusters=["region:mailbox"],
+        committed_final_clusters=["region:mailbox"],
+        committed_seen_world_hashes=["hash-mailbox"],
+    )
+
+    features = explorer._branch_root_progression_features(  # type: ignore[attr-defined]
+        root_depth_profile=profile,
+        actions_taken=["open mailbox"],
+        last_meaningful_progress_action_index=0,
+        first_durable_gain_action_index=0,
+        final_state=TextGameState(
+            observation="Opening the small mailbox reveals a leaflet.",
+            world_state_hash="hash-mailbox",
+            state_cluster_id="region:mailbox",
+        ),
+        trajectory_steps=[
+            TrajectoryStep(
+                episode_id="branch-0",
+                step_index=0,
+                action="open mailbox",
+                observation="Opening the small mailbox reveals a leaflet.",
+                reward=0.0,
+                cumulative_reward=0.0,
+                done=False,
+                score=0,
+                moves=1,
+                world_state_hash="hash-mailbox",
+                state_cluster_id="region:mailbox",
+            )
+        ],
+    )
+
+    assert features["replay_saturation_penalty"] > 0.0
+    assert features["within_root_novelty_bonus"] == 0.0
+    assert features["within_root_depth_bonus"] == 0.0
+    assert features["within_root_frontier_expansion"] is False
+
+
+def test_local_explorer_rewards_within_root_depth_expansion_from_productive_root(tmp_path: Path) -> None:
+    """A deeper continuation beyond a committed productive prefix should earn novelty/depth credit."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=InventoryGainBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+    profile = RootDepthProgressionProfile(
+        root_state_id="productive-root",
+        productive_root=True,
+        productive_commit_count=1,
+        materially_distinct_commit_count=1,
+        committed_prefix_counts={"open mailbox": 1},
+        committed_branch_history=[
+            {
+                "prefix_signature": "open mailbox",
+                "actions": ["open mailbox"],
+                "final_cluster_id": "region:mailbox",
+                "final_world_state_hash": "hash-mailbox",
+                "visited_clusters": ["region:mailbox"],
+                "visited_world_hashes": ["hash-mailbox"],
+            }
+        ],
+        committed_seen_clusters=["region:mailbox"],
+        committed_final_clusters=["region:mailbox"],
+        committed_seen_world_hashes=["hash-mailbox"],
+    )
+
+    features = explorer._branch_root_progression_features(  # type: ignore[attr-defined]
+        root_depth_profile=profile,
+        actions_taken=["open mailbox", "north"],
+        last_meaningful_progress_action_index=1,
+        first_durable_gain_action_index=0,
+        final_state=TextGameState(
+            observation="North of House.",
+            world_state_hash="hash-north-house",
+            state_cluster_id="region:north-house",
+        ),
+        trajectory_steps=[
+            TrajectoryStep(
+                episode_id="branch-0",
+                step_index=0,
+                action="open mailbox",
+                observation="Opening the small mailbox reveals a leaflet.",
+                reward=0.0,
+                cumulative_reward=0.0,
+                done=False,
+                score=0,
+                moves=1,
+                world_state_hash="hash-mailbox",
+                state_cluster_id="region:mailbox",
+            ),
+            TrajectoryStep(
+                episode_id="branch-0",
+                step_index=1,
+                action="north",
+                observation="North of House.",
+                reward=0.0,
+                cumulative_reward=0.0,
+                done=False,
+                score=0,
+                moves=2,
+                world_state_hash="hash-north-house",
+                state_cluster_id="region:north-house",
+            ),
+        ],
+    )
+
+    assert features["replay_saturation_penalty"] == 0.0
+    assert features["within_root_novelty_bonus"] > 0.0
+    assert features["within_root_depth_bonus"] > 0.0
+    assert features["within_root_frontier_expansion"] is True
 
 
 def test_local_explorer_rejects_zero_score_movement_only_branch(tmp_path: Path) -> None:

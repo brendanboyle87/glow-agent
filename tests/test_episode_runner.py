@@ -753,6 +753,10 @@ def test_glow_runner_executes_global_local_loop_and_persists_best_trajectory(tmp
             rationale="Initial root selection.",
             selection_mode=config.policy.archive_state_selection_mode,
             artifact_directory=str(tmp_path / "selection-artifact"),
+            metadata={
+                "pre_depth_progression_top_state_id": "root-state-1",
+                "post_depth_progression_top_state_id": "root-state-1",
+            },
         )
 
     def fake_frontier_analysis(trajectory_frontier, *, archive_states=None, top_k=None, analysis_id=None):
@@ -789,6 +793,32 @@ def test_glow_runner_executes_global_local_loop_and_persists_best_trajectory(tmp
             comparison_notes="mocked glow local comparison",
             mar_inference=mar_result,
             updated_local_world_model=local_world_model,
+            metadata={
+                "depth_progression_profile_after": {
+                    "root_state_id": "root-state-1",
+                    "productive_root": True,
+                    "productive_commit_count": 1,
+                    "materially_distinct_commit_count": 1,
+                    "repeated_winning_continuation_count": 0,
+                    "replay_saturation_level": 0,
+                    "unique_committed_prefix_count": 1,
+                    "committed_prefix_counts": {"north": 1},
+                    "committed_branch_history": [
+                        {
+                            "prefix_signature": "north",
+                            "actions": ["north"],
+                        }
+                    ],
+                },
+                "depth_progression_replay_saturation_level": 0,
+                "depth_progression_repeated_winning_continuation_count": 0,
+                "depth_progression_unique_committed_prefix_count": 1,
+                "depth_progression_materially_distinct_commit_count": 1,
+                "depth_progression_best_branch_materially_distinct": True,
+                "depth_progression_best_branch_replay_saturation_penalty": 0.0,
+                "depth_progression_best_branch_within_root_novelty_bonus": 0.75,
+                "depth_progression_best_branch_within_root_depth_bonus": 0.5,
+            },
             branches=[
                 LocalBranchOutcome(
                     branch_index=0,
@@ -841,6 +871,11 @@ def test_glow_runner_executes_global_local_loop_and_persists_best_trajectory(tmp
                     terminated=False,
                     termination_reason=BranchTerminationReason.HORIZON_REACHED,
                     branch_progress_score=2.0,
+                    continuation_prefix_signature="north",
+                    continuation_prefix_actions=["north"],
+                    within_root_novelty_bonus=0.75,
+                    within_root_depth_bonus=0.5,
+                    materially_distinct_from_history=True,
                     trajectory_steps=[
                         TrajectoryStep(
                             episode_id="branch-1",
@@ -935,6 +970,19 @@ def test_glow_runner_executes_global_local_loop_and_persists_best_trajectory(tmp
     assert metrics_payload["metadata"]["shadow_commit_threshold"] == 0.5
     assert metrics_payload["metadata"]["shadow_threshold_would_commit_count"] == 0
     assert metrics_payload["metadata"]["threshold_blocked_exploratory_best_branch_count"] == 0
+    assert metrics_payload["metadata"]["root_reselection_counts_before_depth_progression"] == {
+        "root-state-1": 1
+    }
+    assert metrics_payload["metadata"]["root_reselection_counts_after_depth_progression"] == {
+        "root-state-1": 1
+    }
+    assert metrics_payload["metadata"]["materially_distinct_committed_branch_count"] == 1
+    assert metrics_payload["metadata"]["unique_committed_branch_prefixes_per_root"] == {
+        "root-state-1": ["north"]
+    }
+    model_path = Path(metrics_payload["local_world_model_snapshot_paths"][0])
+    assert model_path.exists()
+    assert model_path.with_name("depth_progression_summary.json").exists()
 
 
 def test_glow_runner_ignores_uncommitted_terminal_branch_for_episode_stop(tmp_path: Path) -> None:

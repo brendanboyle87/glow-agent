@@ -924,6 +924,11 @@ class EpisodeRunner:
         branch_action_counts: Counter[str] = Counter()
         committed_action_counts: Counter[str] = Counter()
         committed_root_counts: Counter[str] = Counter()
+        pre_depth_progression_top_root_counts: Counter[str] = Counter()
+        post_depth_progression_top_root_counts: Counter[str] = Counter()
+        root_replay_saturation_penalty_totals: Counter[str] = Counter()
+        materially_distinct_committed_root_counts: Counter[str] = Counter()
+        unique_committed_branch_prefixes_per_root: dict[str, set[str]] = {}
         action_target_token_counts: Counter[str] = Counter()
         winning_branch_signature_counts: Counter[str] = Counter()
         unique_first_actions_per_root: dict[str, set[str]] = {}
@@ -992,6 +997,16 @@ class EpisodeRunner:
                         generated_episode_id,
                     )
                     break
+                pre_depth_progression_top_state_id = str(
+                    selection_result.metadata.get("pre_depth_progression_top_state_id", "") or ""
+                ).strip()
+                post_depth_progression_top_state_id = str(
+                    selection_result.metadata.get("post_depth_progression_top_state_id", "") or ""
+                ).strip()
+                if pre_depth_progression_top_state_id:
+                    pre_depth_progression_top_root_counts[pre_depth_progression_top_state_id] += 1
+                if post_depth_progression_top_state_id:
+                    post_depth_progression_top_root_counts[post_depth_progression_top_state_id] += 1
 
                 tracked_selected_state = archive_by_state_id.setdefault(
                     selected_archived_state.state_id,
@@ -1031,6 +1046,12 @@ class EpisodeRunner:
                     continue
                 restore_success_count += 1
                 self.archive_updater.note_restore_result(tracked_selected_state, success=True)
+                if isinstance(restore_result.final_state.metadata, dict):
+                    restore_result.final_state.metadata.update(
+                        self._depth_progression_metadata(
+                            tracked_selected_state.metadata.get("depth_progression")
+                        )
+                    )
                 self.logger.info(
                     "Restored archived state %s first_seen=%s via %s.",
                     selected_archived_state.state_id,
@@ -1062,6 +1083,9 @@ class EpisodeRunner:
                     best_known_score=best_known_score_before_cycle,
                 )
                 local_result_metadata = dict(local_result.metadata)
+                depth_progression_profile_after = dict(
+                    local_result_metadata.get("depth_progression_profile_after", {})
+                )
                 root_exploration_counts[local_result.root_state_id] += 1
                 selected_root_ids_over_time.append(local_result.root_state_id)
                 root_summary = self._archived_state_summary(selected_archived_state)
@@ -1120,6 +1144,9 @@ class EpisodeRunner:
                 reuse_status_reason = str(local_result_metadata.get("reuse_status_reason", "")).strip()
                 if reuse_status_reason:
                     mar_reuse_status_reason_counts[reuse_status_reason] += 1
+                root_replay_saturation_penalty_totals[local_result.root_state_id] += float(
+                    local_result_metadata.get("depth_progression_best_branch_replay_saturation_penalty", 0.0)
+                )
                 branch_counts_per_root_state[local_result.root_state_id] += len(local_result.branches)
                 for branch in local_result.branches:
                     branch_action_counts.update(action for action in branch.actions_taken if action.strip())
@@ -1135,12 +1162,24 @@ class EpisodeRunner:
                         unique_first_actions_per_root.setdefault(local_result.root_state_id, set()).add(
                             branch.actions_taken[0]
                         )
+                    if branch.continuation_prefix_signature:
+                        unique_committed_branch_prefixes_per_root.setdefault(
+                            local_result.root_state_id,
+                            set(),
+                        )
                 best_branch = local_result.best_branch
                 if local_result.branch_commit_allowed and best_branch is not None:
                     commit_allowed_count += 1
                     committed_root_counts[local_result.root_state_id] += 1
                     committed_action_counts.update(action for action in best_branch.actions_taken if action.strip())
                     winning_branch_signature_counts[" -> ".join(best_branch.actions_taken)] += 1
+                    if best_branch.continuation_prefix_signature:
+                        unique_committed_branch_prefixes_per_root.setdefault(
+                            local_result.root_state_id,
+                            set(),
+                        ).add(best_branch.continuation_prefix_signature)
+                    if best_branch.materially_distinct_from_history:
+                        materially_distinct_committed_root_counts[local_result.root_state_id] += 1
                     if best_branch.branch_progress_score > 0.0:
                         committed_branch_positive_progress_count += 1
                     if best_branch.score_change > 0:
@@ -1222,6 +1261,19 @@ class EpisodeRunner:
                                 "repeated_known_local_affordance": bool(
                                     branch.metadata.get("repeated_known_local_affordance", False)
                                 ),
+                                "continuation_prefix_signature": branch.continuation_prefix_signature,
+                                "continuation_prefix_actions": list(branch.continuation_prefix_actions),
+                                "replay_saturation_penalty": branch.replay_saturation_penalty,
+                                "within_root_novelty_bonus": branch.within_root_novelty_bonus,
+                                "within_root_depth_bonus": branch.within_root_depth_bonus,
+                                "committed_prefix_replay_count": branch.committed_prefix_replay_count,
+                                "shared_prefix_length_with_history": (
+                                    branch.shared_prefix_length_with_history
+                                ),
+                                "materially_distinct_from_history": (
+                                    branch.materially_distinct_from_history
+                                ),
+                                "within_root_frontier_expansion": branch.within_root_frontier_expansion,
                                 "action_events": list(branch.metadata.get("action_events", [])),
                             }
                             for branch in local_result.branches
@@ -1235,6 +1287,9 @@ class EpisodeRunner:
                     exploratory_progress=bool(revisit_progress["exploratory_progress"]),
                     branch_commit_allowed=local_result.branch_commit_allowed,
                     best_branch_actions=best_branch.actions_taken if best_branch is not None else [],
+                    depth_progression_metadata=self._depth_progression_metadata(
+                        local_result_metadata.get("depth_progression_profile_after")
+                    ),
                 )
                 local_world_model_for_decay = (
                     local_result.updated_local_world_model or local_result.used_local_world_model
@@ -1266,6 +1321,9 @@ class EpisodeRunner:
                             "last_revisit_branch_commit_allowed": local_result.branch_commit_allowed,
                             "last_revisit_best_branch_actions": (
                                 list(best_branch.actions_taken) if best_branch is not None else []
+                            ),
+                            **self._depth_progression_metadata(
+                                local_result_metadata.get("depth_progression_profile_after")
                             ),
                         }
                     )
@@ -1448,6 +1506,53 @@ class EpisodeRunner:
                             "commit_rejection_reason": local_result.commit_rejection_reason,
                             "best_branch_progress_score": local_result.best_branch_progress_score,
                             "best_branch_actions": list(best_branch.actions_taken) if best_branch is not None else [],
+                            "pre_depth_progression_top_state_id": pre_depth_progression_top_state_id,
+                            "post_depth_progression_top_state_id": post_depth_progression_top_state_id,
+                            "depth_progression_replay_saturation_level": int(
+                                local_result_metadata.get("depth_progression_replay_saturation_level", 0)
+                            ),
+                            "depth_progression_repeated_winning_continuation_count": int(
+                                local_result_metadata.get(
+                                    "depth_progression_repeated_winning_continuation_count",
+                                    0,
+                                )
+                            ),
+                            "depth_progression_unique_committed_prefix_count": int(
+                                local_result_metadata.get(
+                                    "depth_progression_unique_committed_prefix_count",
+                                    0,
+                                )
+                            ),
+                            "depth_progression_materially_distinct_commit_count": int(
+                                local_result_metadata.get(
+                                    "depth_progression_materially_distinct_commit_count",
+                                    0,
+                                )
+                            ),
+                            "depth_progression_best_branch_materially_distinct": bool(
+                                local_result_metadata.get(
+                                    "depth_progression_best_branch_materially_distinct",
+                                    False,
+                                )
+                            ),
+                            "depth_progression_best_branch_replay_saturation_penalty": float(
+                                local_result_metadata.get(
+                                    "depth_progression_best_branch_replay_saturation_penalty",
+                                    0.0,
+                                )
+                            ),
+                            "depth_progression_best_branch_within_root_novelty_bonus": float(
+                                local_result_metadata.get(
+                                    "depth_progression_best_branch_within_root_novelty_bonus",
+                                    0.0,
+                                )
+                            ),
+                            "depth_progression_best_branch_within_root_depth_bonus": float(
+                                local_result_metadata.get(
+                                    "depth_progression_best_branch_within_root_depth_bonus",
+                                    0.0,
+                                )
+                            ),
                         },
                     )
                 )
@@ -1573,6 +1678,12 @@ class EpisodeRunner:
                 "local_world_model_read_hit_count": local_world_model_read_hit_count,
                 "reused_local_world_model_root_ids": sorted(reused_local_world_model_root_ids),
                 "root_exploration_counts": dict(root_exploration_counts),
+                "root_reselection_counts_before_depth_progression": dict(
+                    pre_depth_progression_top_root_counts
+                ),
+                "root_reselection_counts_after_depth_progression": dict(
+                    post_depth_progression_top_root_counts
+                ),
                 "same_root_revisit_after_mar_update_count": same_root_revisit_after_mar_update_count,
                 "revisited_roots_after_mar_update": sorted(revisited_roots_after_mar_update),
                 "local_guidance_attached_branch_count": local_guidance_attached_branch_count,
@@ -1609,6 +1720,19 @@ class EpisodeRunner:
                 "commit_allowed_count": commit_allowed_count,
                 "committed_branch_positive_progress_count": committed_branch_positive_progress_count,
                 "committed_branch_score_gain_count": committed_branch_score_gain_count,
+                "materially_distinct_committed_branch_count": sum(
+                    materially_distinct_committed_root_counts.values()
+                ),
+                "materially_distinct_committed_root_counts": dict(
+                    materially_distinct_committed_root_counts
+                ),
+                "replay_saturation_penalty_by_root": {
+                    root_state_id: float(value)
+                    for root_state_id, value in root_replay_saturation_penalty_totals.items()
+                },
+                "total_replay_saturation_penalty": float(
+                    sum(root_replay_saturation_penalty_totals.values())
+                ),
                 "shadow_commit_threshold": shadow_commit_threshold,
                 "shadow_threshold_would_commit_count": shadow_threshold_would_commit_count,
                 "threshold_blocked_exploratory_best_branch_count": (
@@ -1636,6 +1760,10 @@ class EpisodeRunner:
                     key_name="state_id",
                     summaries=selected_root_observation_summaries,
                 ),
+                "unique_committed_branch_prefixes_per_root": {
+                    root_state_id: sorted(prefixes)
+                    for root_state_id, prefixes in unique_committed_branch_prefixes_per_root.items()
+                },
                 "cycles_since_last_new_root": cycles_since_last_new_root,
                 "cycles_since_last_new_score": cycles_since_last_new_score,
                 "repeated_root_local_world_model_summaries": repeated_root_local_world_model_summaries,
@@ -2905,6 +3033,37 @@ class EpisodeRunner:
             "non_egg_critical_regions": sorted(non_egg_regions),
         }
 
+    def _depth_progression_metadata(self, raw_profile: object) -> dict[str, object]:
+        """Normalize one depth-progression profile payload into flat metadata fields."""
+
+        if not isinstance(raw_profile, dict):
+            return {}
+        return {
+            "depth_progression": dict(raw_profile),
+            "depth_progression_productive_root": bool(raw_profile.get("productive_root", False)),
+            "depth_progression_productive_commit_count": int(raw_profile.get("productive_commit_count", 0)),
+            "depth_progression_materially_distinct_commit_count": int(
+                raw_profile.get("materially_distinct_commit_count", 0)
+            ),
+            "depth_progression_repeated_winning_continuation_count": int(
+                raw_profile.get("repeated_winning_continuation_count", 0)
+            ),
+            "depth_progression_replay_saturation_level": int(
+                raw_profile.get("replay_saturation_level", 0)
+            ),
+            "depth_progression_unique_committed_prefix_count": int(
+                raw_profile.get("unique_committed_prefix_count", 0)
+            ),
+            "depth_progression_saturated_try_actions": [
+                str(action)
+                for action in raw_profile.get("saturated_try_actions", [])
+                if str(action).strip()
+            ],
+            "depth_progression_last_committed_prefix_signature": str(
+                raw_profile.get("last_committed_prefix_signature", "")
+            ),
+        }
+
     def _repeated_root_local_world_model_summaries(
         self,
         *,
@@ -2921,6 +3080,7 @@ class EpisodeRunner:
             if local_world_model is None:
                 continue
             root_detail = selected_root_details.get(root_state_id, {})
+            depth_progression = dict(local_world_model.metadata.get("depth_progression", {}))
             summaries.append(
                 {
                     "root_state_id": root_state_id,
@@ -2946,6 +3106,33 @@ class EpisodeRunner:
                         affordance.object_text
                         for affordance in local_world_model.inferred_affordances[:5]
                     ],
+                    "productive_root": bool(depth_progression.get("productive_root", False)),
+                    "repeated_winning_continuation_count": int(
+                        depth_progression.get("repeated_winning_continuation_count", 0)
+                    ),
+                    "replay_saturation_level": int(depth_progression.get("replay_saturation_level", 0)),
+                    "materially_distinct_commit_count": int(
+                        depth_progression.get("materially_distinct_commit_count", 0)
+                    ),
+                    "unique_committed_prefix_count": int(
+                        depth_progression.get("unique_committed_prefix_count", 0)
+                    ),
+                    "saturated_try_actions": [
+                        str(action)
+                        for action in depth_progression.get("saturated_try_actions", [])[:5]
+                    ],
+                    "last_replay_saturation_penalty": float(
+                        depth_progression.get("last_replay_saturation_penalty", 0.0)
+                    ),
+                    "last_within_root_novelty_bonus": float(
+                        depth_progression.get("last_within_root_novelty_bonus", 0.0)
+                    ),
+                    "last_within_root_depth_bonus": float(
+                        depth_progression.get("last_within_root_depth_bonus", 0.0)
+                    ),
+                    "committed_branch_history": list(
+                        depth_progression.get("committed_branch_history", [])[-6:]
+                    ),
                 }
             )
         return summaries

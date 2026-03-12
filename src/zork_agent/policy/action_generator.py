@@ -251,8 +251,20 @@ class ActionGenerator:
             "local_guidance_consumed_by_reranker": local_guidance_available,
             "local_world_model_try_guidance_suppressed": bool(
                 local_world_model is not None
-                and int(local_world_model.metadata.get("no_achievement_revisit_streak", 0))
-                >= self.config.policy.local_guidance_stale_revisit_threshold
+                and (
+                    int(local_world_model.metadata.get("no_achievement_revisit_streak", 0))
+                    >= self.config.policy.local_guidance_stale_revisit_threshold
+                    or (
+                        bool(local_world_model.metadata.get("depth_progression_productive_root", False))
+                        and int(local_world_model.metadata.get("depth_progression_replay_saturation_level", 0)) > 0
+                        and bool(local_world_model.metadata.get("depth_progression_saturated_try_actions", []))
+                    )
+                )
+            ),
+            "local_world_model_depth_progression_replay_saturation_level": (
+                int(local_world_model.metadata.get("depth_progression_replay_saturation_level", 0))
+                if local_world_model is not None
+                else 0
             ),
         }
 
@@ -2554,6 +2566,13 @@ class ActionGenerator:
         if local_world_model is None:
             return summary, [], [], []
         no_achievement_revisit_streak = int(local_world_model.metadata.get("no_achievement_revisit_streak", 0))
+        replay_saturation_level = int(local_world_model.metadata.get("depth_progression_replay_saturation_level", 0))
+        productive_root = bool(local_world_model.metadata.get("depth_progression_productive_root", False))
+        saturated_try_actions = {
+            normalize_parser_action(action)
+            for action in local_world_model.metadata.get("depth_progression_saturated_try_actions", [])
+            if isinstance(action, str) and normalize_parser_action(action)
+        }
         suppress_try_guidance = (
             no_achievement_revisit_streak >= self.config.policy.local_guidance_stale_revisit_threshold
         )
@@ -2580,6 +2599,17 @@ class ActionGenerator:
             summary.recent_advantage_hints = []
             summary.action_priors = []
             try_actions = []
+        elif productive_root and replay_saturation_level > 0 and saturated_try_actions:
+            try_actions = [
+                action
+                for action in try_actions
+                if normalize_parser_action(action) not in saturated_try_actions
+            ]
+            summary.action_priors = [
+                action
+                for action in summary.action_priors
+                if normalize_parser_action(action) not in saturated_try_actions
+            ]
         return (
             summary,
             self._normalize_action_list(try_actions),

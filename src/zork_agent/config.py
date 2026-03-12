@@ -262,6 +262,10 @@ class PolicyConfig(StrictModel):
     branch_progress_location_weight: float = 1.0
     branch_progress_object_weight: float = 0.25
     branch_progress_loop_reduction_weight: float = 0.5
+    branch_root_replay_saturation_penalty_weight: float = 0.75
+    branch_root_novelty_bonus_weight: float = 0.75
+    branch_root_depth_bonus_weight: float = 0.5
+    branch_root_prefix_horizon: int = 3
     branch_post_gain_churn_penalty: float = 1.25
     branch_aggressive_action_penalty: float = 1.5
     branch_speculative_action_penalty: float = 0.75
@@ -269,6 +273,7 @@ class PolicyConfig(StrictModel):
     movement_progress_cap: float = 0.5
     min_affordance_gain_for_movement_commit: int = 1
     local_guidance_stale_revisit_threshold: int = 2
+    state_selection_root_replay_saturation_penalty_weight: float = 0.75
     branch_commit_min_progress_score: float = 1.0
     branch_commit_movement_ratio_threshold: float = 0.75
     branch_fail_fast_penalty_threshold: float = 3.0
@@ -350,6 +355,7 @@ class PolicyConfig(StrictModel):
         "branch_fail_fast_post_gain_churn_actions",
         "branch_fail_fast_post_score_no_progress_steps",
         "post_score_scene_branch_patience",
+        "branch_root_prefix_horizon",
         "region_visit_exhaustion_threshold",
     )
     @classmethod
@@ -427,11 +433,15 @@ class PolicyConfig(StrictModel):
         "branch_progress_location_weight",
         "branch_progress_object_weight",
         "branch_progress_loop_reduction_weight",
+        "branch_root_replay_saturation_penalty_weight",
+        "branch_root_novelty_bonus_weight",
+        "branch_root_depth_bonus_weight",
         "branch_post_gain_churn_penalty",
         "branch_aggressive_action_penalty",
         "branch_speculative_action_penalty",
         "room_text_only_weight",
         "movement_progress_cap",
+        "state_selection_root_replay_saturation_penalty_weight",
         "branch_commit_min_progress_score",
         "branch_fail_fast_penalty_threshold",
         "frontier_loop_penalty_weight",

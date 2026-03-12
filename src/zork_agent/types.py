@@ -3190,6 +3190,15 @@ class LocalBranchOutcome:
     room_text_only_gain: float = 0.0
     loop_penalty_reduction: float = 0.0
     branch_progress_score: float = 0.0
+    continuation_prefix_signature: str = ""
+    continuation_prefix_actions: list[str] = field(default_factory=list)
+    replay_saturation_penalty: float = 0.0
+    within_root_novelty_bonus: float = 0.0
+    within_root_depth_bonus: float = 0.0
+    committed_prefix_replay_count: int = 0
+    shared_prefix_length_with_history: int = 0
+    materially_distinct_from_history: bool = False
+    within_root_frontier_expansion: bool = False
     branch_commit_allowed: bool = False
     commit_rejection_reason: str = ""
     oscillation_penalty_total: float = 0.0
@@ -4639,6 +4648,104 @@ class LocalWorldModel:
         )
         world_model.validate_invariants()
         return world_model
+
+
+@dataclass(slots=True)
+class RootDepthProgressionProfile:
+    """Persisted root-local continuation history for post-breakthrough depth progression."""
+
+    root_state_id: str = ""
+    productive_root: bool = False
+    productive_commit_count: int = 0
+    materially_distinct_commit_count: int = 0
+    repeated_winning_continuation_count: int = 0
+    replay_saturation_level: int = 0
+    unique_committed_prefix_count: int = 0
+    max_committed_final_score: int = 0
+    max_committed_progress_score: float = 0.0
+    last_committed_prefix_signature: str = ""
+    last_committed_materially_distinct: bool = False
+    last_replay_saturation_penalty: float = 0.0
+    last_within_root_novelty_bonus: float = 0.0
+    last_within_root_depth_bonus: float = 0.0
+    committed_prefix_counts: dict[str, int] = field(default_factory=dict)
+    committed_branch_history: list[dict[str, Any]] = field(default_factory=list)
+    committed_seen_clusters: list[str] = field(default_factory=list)
+    committed_final_clusters: list[str] = field(default_factory=list)
+    committed_seen_world_hashes: list[str] = field(default_factory=list)
+    saturated_prefix_signatures: list[str] = field(default_factory=list)
+    saturated_try_actions: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the root-local depth progression profile into a JSON record."""
+
+        return {
+            "root_state_id": self.root_state_id,
+            "productive_root": self.productive_root,
+            "productive_commit_count": self.productive_commit_count,
+            "materially_distinct_commit_count": self.materially_distinct_commit_count,
+            "repeated_winning_continuation_count": self.repeated_winning_continuation_count,
+            "replay_saturation_level": self.replay_saturation_level,
+            "unique_committed_prefix_count": self.unique_committed_prefix_count,
+            "max_committed_final_score": self.max_committed_final_score,
+            "max_committed_progress_score": self.max_committed_progress_score,
+            "last_committed_prefix_signature": self.last_committed_prefix_signature,
+            "last_committed_materially_distinct": self.last_committed_materially_distinct,
+            "last_replay_saturation_penalty": self.last_replay_saturation_penalty,
+            "last_within_root_novelty_bonus": self.last_within_root_novelty_bonus,
+            "last_within_root_depth_bonus": self.last_within_root_depth_bonus,
+            "committed_prefix_counts": dict(self.committed_prefix_counts),
+            "committed_branch_history": [dict(item) for item in self.committed_branch_history],
+            "committed_seen_clusters": list(self.committed_seen_clusters),
+            "committed_final_clusters": list(self.committed_final_clusters),
+            "committed_seen_world_hashes": list(self.committed_seen_world_hashes),
+            "saturated_prefix_signatures": list(self.saturated_prefix_signatures),
+            "saturated_try_actions": list(self.saturated_try_actions),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "RootDepthProgressionProfile":
+        """Construct a root-local depth progression profile from serialized data."""
+
+        prefix_counts = (
+            {
+                str(key): max(0, int(value))
+                for key, value in dict(record.get("committed_prefix_counts", {})).items()
+            }
+            if isinstance(record.get("committed_prefix_counts"), MappingABC)
+            else {}
+        )
+        branch_history = [
+            dict(item)
+            for item in (record.get("committed_branch_history") or [])
+            if isinstance(item, MappingABC)
+        ]
+        return cls(
+            root_state_id=str(record.get("root_state_id", "")),
+            productive_root=bool(record.get("productive_root", False)),
+            productive_commit_count=max(0, int(record.get("productive_commit_count", 0))),
+            materially_distinct_commit_count=max(0, int(record.get("materially_distinct_commit_count", 0))),
+            repeated_winning_continuation_count=max(0, int(record.get("repeated_winning_continuation_count", 0))),
+            replay_saturation_level=max(0, int(record.get("replay_saturation_level", 0))),
+            unique_committed_prefix_count=max(0, int(record.get("unique_committed_prefix_count", 0))),
+            max_committed_final_score=max(0, int(record.get("max_committed_final_score", 0))),
+            max_committed_progress_score=float(record.get("max_committed_progress_score", 0.0)),
+            last_committed_prefix_signature=str(record.get("last_committed_prefix_signature", "")),
+            last_committed_materially_distinct=bool(record.get("last_committed_materially_distinct", False)),
+            last_replay_saturation_penalty=float(record.get("last_replay_saturation_penalty", 0.0)),
+            last_within_root_novelty_bonus=float(record.get("last_within_root_novelty_bonus", 0.0)),
+            last_within_root_depth_bonus=float(record.get("last_within_root_depth_bonus", 0.0)),
+            committed_prefix_counts=prefix_counts,
+            committed_branch_history=branch_history,
+            committed_seen_clusters=_normalize_string_list(record.get("committed_seen_clusters")),
+            committed_final_clusters=_normalize_string_list(record.get("committed_final_clusters")),
+            committed_seen_world_hashes=_normalize_string_list(record.get("committed_seen_world_hashes")),
+            saturated_prefix_signatures=_normalize_string_list(record.get("saturated_prefix_signatures")),
+            saturated_try_actions=_normalize_string_list(record.get("saturated_try_actions")),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
 
 
 @dataclass(slots=True)

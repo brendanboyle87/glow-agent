@@ -9,6 +9,7 @@ TODO: revisit branch diversification once real Jericho runs expose better signal
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 import re
 
@@ -30,6 +31,7 @@ from zork_agent.types import (
     MARInferenceResult,
     MovementHeuristicResult,
     ReplayResult,
+    RootDepthProgressionProfile,
     RestoreMode,
     SavedNode,
     TextGameState,
@@ -202,6 +204,11 @@ class LocalExplorer:
                 "MAR disabled for root=%s; local-world-model reads and guidance are disabled.",
                 root_state_id,
             )
+        root_depth_profile_before = self._root_depth_progression_profile(
+            root_state_id=root_state_id,
+            local_world_model=used_local_world_model,
+            fallback_metadata=restored_state.metadata,
+        )
         local_world_model_read_hit = used_local_world_model is not None
         local_guidance_available = bool(
             used_local_world_model is not None
@@ -234,6 +241,7 @@ class LocalExplorer:
                 recent_trajectory_context=recent_trajectory_context,
                 root_state_id=root_state_id,
                 local_world_model=used_local_world_model,
+                root_depth_profile=root_depth_profile_before,
                 best_known_score=best_known_score,
             )
             branches.append(outcome)
@@ -288,6 +296,17 @@ class LocalExplorer:
                 commit_rejection_reason or "none",
             )
 
+        best_branch = next(
+            (branch for branch in branches if branch.branch_index == best_branch_index),
+            None,
+        )
+        root_depth_profile_after = self._updated_root_depth_progression_profile(
+            root_state_id=root_state_id,
+            existing_profile=root_depth_profile_before,
+            best_branch=best_branch,
+            branch_commit_allowed=branch_commit_allowed,
+        )
+
         mar_inference = None
         updated_local_world_model = None
         if mar_enabled:
@@ -300,6 +319,9 @@ class LocalExplorer:
                 root_state_id=root_state_id,
                 existing_local_world_model=used_local_world_model,
                 inference_result=mar_inference,
+            )
+            updated_local_world_model.metadata.update(
+                self._depth_progression_metadata_payload(root_depth_profile_after)
             )
             mar_artifact_dir = self.local_world_model_store.write_mar_result(
                 mar_inference,
@@ -407,9 +429,36 @@ class LocalExplorer:
                     selected_actions_matching_local_try_guidance_count
                 ),
                 "selected_actions_matching_local_avoid_guidance_count": (
-                    selected_actions_matching_local_avoid_guidance_count
+                selected_actions_matching_local_avoid_guidance_count
                 ),
                 "reuse_status_reason": reuse_status_reason,
+                "depth_progression_profile_before": root_depth_profile_before.to_record(),
+                "depth_progression_profile_after": root_depth_profile_after.to_record(),
+                "depth_progression_productive_root": root_depth_profile_after.productive_root,
+                "depth_progression_repeated_winning_continuation_count": (
+                    root_depth_profile_after.repeated_winning_continuation_count
+                ),
+                "depth_progression_replay_saturation_level": (
+                    root_depth_profile_after.replay_saturation_level
+                ),
+                "depth_progression_unique_committed_prefix_count": (
+                    root_depth_profile_after.unique_committed_prefix_count
+                ),
+                "depth_progression_materially_distinct_commit_count": (
+                    root_depth_profile_after.materially_distinct_commit_count
+                ),
+                "depth_progression_best_branch_materially_distinct": (
+                    best_branch.materially_distinct_from_history if best_branch is not None else False
+                ),
+                "depth_progression_best_branch_replay_saturation_penalty": (
+                    best_branch.replay_saturation_penalty if best_branch is not None else 0.0
+                ),
+                "depth_progression_best_branch_within_root_novelty_bonus": (
+                    best_branch.within_root_novelty_bonus if best_branch is not None else 0.0
+                ),
+                "depth_progression_best_branch_within_root_depth_bonus": (
+                    best_branch.within_root_depth_bonus if best_branch is not None else 0.0
+                ),
             },
         )
 
@@ -449,6 +498,7 @@ class LocalExplorer:
         recent_trajectory_context: str | None,
         root_state_id: str,
         local_world_model: LocalWorldModel | None,
+        root_depth_profile: RootDepthProgressionProfile,
         best_known_score: int | None,
     ) -> LocalBranchOutcome:
         """Restore the base state and run one shallow local rollout."""
@@ -1116,13 +1166,33 @@ class LocalExplorer:
             landmark_gain=landmark_gain,
             ended_in_same_cluster=ended_in_same_cluster,
         )
+        root_progression_features = self._branch_root_progression_features(
+            root_depth_profile=root_depth_profile,
+            actions_taken=actions_taken,
+            last_meaningful_progress_action_index=last_meaningful_progress_action_index,
+            first_durable_gain_action_index=first_durable_gain_action_index,
+            final_state=current_state,
+            trajectory_steps=trajectory_steps,
+        )
+        continuation_prefix_signature = str(root_progression_features["continuation_prefix_signature"])
+        continuation_prefix_actions = list(root_progression_features["continuation_prefix_actions"])
+        replay_saturation_penalty = float(root_progression_features["replay_saturation_penalty"])
+        within_root_novelty_bonus = float(root_progression_features["within_root_novelty_bonus"])
+        within_root_depth_bonus = float(root_progression_features["within_root_depth_bonus"])
+        committed_prefix_replay_count = int(root_progression_features["committed_prefix_replay_count"])
+        shared_prefix_length_with_history = int(root_progression_features["shared_prefix_length_with_history"])
+        materially_distinct_from_history = bool(root_progression_features["materially_distinct_from_history"])
+        within_root_frontier_expansion = bool(root_progression_features["within_root_frontier_expansion"])
         if exploratory_location_progress:
             branch_progress_score += self.action_generator.config.policy.branch_progress_location_weight
+        branch_progress_score += within_root_novelty_bonus + within_root_depth_bonus
+        branch_progress_score -= replay_saturation_penalty
         commit_anchor = self._branch_has_commit_anchor(
             score_change=score_change,
             persistent_inventory_gain_count=persistent_inventory_gain_count,
             persistent_inventory_loss_count=persistent_inventory_loss_count,
             exploratory_location_progress=exploratory_location_progress,
+            within_root_frontier_expansion=within_root_frontier_expansion,
         )
         low_value_movement_branch = self._is_low_value_movement_branch(
             score_change=score_change,
@@ -1238,6 +1308,16 @@ class LocalExplorer:
             notable_changes.append(f"inventory churn penalty {inventory_churn_penalty:.2f}")
         if repeated_known_local_affordance:
             notable_changes.append("repeated known local affordance replay")
+        if replay_saturation_penalty > 0.0:
+            notable_changes.append(f"replay saturation penalty {replay_saturation_penalty:.2f}")
+        if within_root_novelty_bonus > 0.0:
+            notable_changes.append(f"within-root novelty bonus {within_root_novelty_bonus:.2f}")
+        if within_root_depth_bonus > 0.0:
+            notable_changes.append(f"within-root depth bonus {within_root_depth_bonus:.2f}")
+        if within_root_frontier_expansion:
+            notable_changes.append("within-root frontier expansion")
+        if materially_distinct_from_history:
+            notable_changes.append("materially distinct continuation")
         if exploratory_location_progress:
             notable_changes.append("exploratory location progress")
         if inventory_changed:
@@ -1256,7 +1336,8 @@ class LocalExplorer:
         self.logger.info(
             "Local branch %s finished: actions=%s score_change=%s reward=%.2f terminated=%s stuck=%s "
             "loop_penalty=%.2f movement_penalty=%.2f bulk_inventory=%s discard_like=%s aggressive=%s "
-            "post_gain_churn=%s inventory_churn_penalty=%.2f progress_score=%.2f",
+            "post_gain_churn=%s inventory_churn_penalty=%.2f replay_penalty=%.2f novelty_bonus=%.2f "
+            "depth_bonus=%.2f progress_score=%.2f",
             branch_index,
             actions_taken,
             score_change,
@@ -1270,6 +1351,9 @@ class LocalExplorer:
             aggressive_action_count,
             post_gain_churn_action_count,
             inventory_churn_penalty,
+            replay_saturation_penalty,
+            within_root_novelty_bonus,
+            within_root_depth_bonus,
             branch_progress_score,
         )
         return LocalBranchOutcome(
@@ -1299,6 +1383,15 @@ class LocalExplorer:
             room_text_only_gain=room_text_only_gain,
             loop_penalty_reduction=loop_penalty_reduction,
             branch_progress_score=branch_progress_score,
+            continuation_prefix_signature=continuation_prefix_signature,
+            continuation_prefix_actions=continuation_prefix_actions,
+            replay_saturation_penalty=replay_saturation_penalty,
+            within_root_novelty_bonus=within_root_novelty_bonus,
+            within_root_depth_bonus=within_root_depth_bonus,
+            committed_prefix_replay_count=committed_prefix_replay_count,
+            shared_prefix_length_with_history=shared_prefix_length_with_history,
+            materially_distinct_from_history=materially_distinct_from_history,
+            within_root_frontier_expansion=within_root_frontier_expansion,
             oscillation_penalty_total=oscillation_penalty_total,
             movement_penalty_total=movement_penalty_total,
             movement_only_action_count=sum(1 for result in movement_results if result.movement_only_action),
@@ -1369,6 +1462,15 @@ class LocalExplorer:
                     if local_world_model is not None
                     else 0
                 ),
+                "continuation_prefix_signature": continuation_prefix_signature,
+                "continuation_prefix_actions": list(continuation_prefix_actions),
+                "replay_saturation_penalty": replay_saturation_penalty,
+                "within_root_novelty_bonus": within_root_novelty_bonus,
+                "within_root_depth_bonus": within_root_depth_bonus,
+                "committed_prefix_replay_count": committed_prefix_replay_count,
+                "shared_prefix_length_with_history": shared_prefix_length_with_history,
+                "materially_distinct_from_history": materially_distinct_from_history,
+                "within_root_frontier_expansion": within_root_frontier_expansion,
                 "repeated_score_replay": repeated_score_replay,
                 "best_known_score_before_branch": int(best_known_score) if best_known_score is not None else None,
                 "exploratory_location_progress": exploratory_location_progress,
@@ -1556,6 +1658,371 @@ class LocalExplorer:
 
         return " ".join(text.split()).strip().lower()
 
+    def _root_depth_progression_profile(
+        self,
+        *,
+        root_state_id: str,
+        local_world_model: LocalWorldModel | None,
+        fallback_metadata: Mapping[str, object] | None = None,
+    ) -> RootDepthProgressionProfile:
+        """Load the persisted depth-progression profile for one root, if present."""
+
+        if local_world_model is None:
+            if fallback_metadata is not None and isinstance(fallback_metadata.get("depth_progression"), Mapping):
+                profile = RootDepthProgressionProfile.from_record(
+                    fallback_metadata["depth_progression"]
+                )
+                if not profile.root_state_id:
+                    profile.root_state_id = root_state_id
+                return profile
+            return RootDepthProgressionProfile(root_state_id=root_state_id)
+        raw_profile = local_world_model.metadata.get("depth_progression")
+        if isinstance(raw_profile, Mapping):
+            profile = RootDepthProgressionProfile.from_record(raw_profile)
+            if not profile.root_state_id:
+                profile.root_state_id = root_state_id
+            return profile
+        return RootDepthProgressionProfile(root_state_id=root_state_id)
+
+    def _depth_progression_metadata_payload(
+        self,
+        profile: RootDepthProgressionProfile,
+    ) -> dict[str, object]:
+        """Project a depth-progression profile into inspectable metadata fields."""
+
+        return {
+            "depth_progression": profile.to_record(),
+            "depth_progression_productive_root": profile.productive_root,
+            "depth_progression_productive_commit_count": profile.productive_commit_count,
+            "depth_progression_materially_distinct_commit_count": profile.materially_distinct_commit_count,
+            "depth_progression_repeated_winning_continuation_count": (
+                profile.repeated_winning_continuation_count
+            ),
+            "depth_progression_replay_saturation_level": profile.replay_saturation_level,
+            "depth_progression_unique_committed_prefix_count": profile.unique_committed_prefix_count,
+            "depth_progression_last_committed_prefix_signature": profile.last_committed_prefix_signature,
+            "depth_progression_saturated_try_actions": list(profile.saturated_try_actions),
+        }
+
+    def _continuation_prefix_actions(
+        self,
+        *,
+        actions_taken: list[str],
+        last_meaningful_progress_action_index: int | None,
+        first_durable_gain_action_index: int | None,
+    ) -> list[str]:
+        """Return a short normalized prefix signature for one branch continuation."""
+
+        if not actions_taken:
+            return []
+        prefix_horizon = max(1, int(self.action_generator.config.policy.branch_root_prefix_horizon))
+        boundary = prefix_horizon
+        if last_meaningful_progress_action_index is not None:
+            boundary = max(1, last_meaningful_progress_action_index + 1)
+        elif first_durable_gain_action_index is not None:
+            boundary = max(1, first_durable_gain_action_index + 1)
+        prefix_length = min(len(actions_taken), max(1, min(prefix_horizon, boundary)))
+        return [self._normalize_text(action) for action in actions_taken[:prefix_length] if self._normalize_text(action)]
+
+    def _longest_action_prefix(self, left: list[str], right: list[str]) -> int:
+        """Return the longest shared normalized action prefix length between two sequences."""
+
+        normalized_left = [self._normalize_text(action) for action in left if self._normalize_text(action)]
+        normalized_right = [self._normalize_text(action) for action in right if self._normalize_text(action)]
+        prefix_length = 0
+        for left_action, right_action in zip(normalized_left, normalized_right):
+            if left_action != right_action:
+                break
+            prefix_length += 1
+        return prefix_length
+
+    def _branch_cluster_trace(
+        self,
+        *,
+        trajectory_steps: list[TrajectoryStep],
+        final_state: TextGameState,
+    ) -> list[str]:
+        """Return the normalized cluster trace visited by one branch."""
+
+        clusters = [
+            self._normalize_text(step.state_cluster_id)
+            for step in trajectory_steps
+            if self._normalize_text(step.state_cluster_id)
+        ]
+        final_cluster = self._normalize_text(final_state.state_cluster_id)
+        if final_cluster:
+            clusters.append(final_cluster)
+        return sorted(set(clusters))
+
+    def _branch_world_hash_trace(
+        self,
+        *,
+        trajectory_steps: list[TrajectoryStep],
+        final_state: TextGameState,
+    ) -> list[str]:
+        """Return the normalized world-hash trace visited by one branch."""
+
+        hashes = [
+            self._normalize_text(step.world_state_hash)
+            for step in trajectory_steps
+            if self._normalize_text(step.world_state_hash) and self._normalize_text(step.world_state_hash) != "unknown"
+        ]
+        final_hash = self._normalize_text(final_state.world_state_hash)
+        if final_hash and final_hash != "unknown":
+            hashes.append(final_hash)
+        return sorted(set(hashes))
+
+    def _branch_root_progression_features(
+        self,
+        *,
+        root_depth_profile: RootDepthProgressionProfile,
+        actions_taken: list[str],
+        last_meaningful_progress_action_index: int | None,
+        first_durable_gain_action_index: int | None,
+        final_state: TextGameState,
+        trajectory_steps: list[TrajectoryStep],
+    ) -> dict[str, object]:
+        """Score one branch against prior committed continuations from the same productive root."""
+
+        prefix_actions = self._continuation_prefix_actions(
+            actions_taken=actions_taken,
+            last_meaningful_progress_action_index=last_meaningful_progress_action_index,
+            first_durable_gain_action_index=first_durable_gain_action_index,
+        )
+        prefix_signature = " -> ".join(prefix_actions)
+        committed_history = [
+            dict(item)
+            for item in root_depth_profile.committed_branch_history
+            if isinstance(item, dict)
+        ]
+        historical_sequences = [
+            [str(action) for action in item.get("actions", []) if str(action).strip()]
+            for item in committed_history
+            if item.get("actions")
+        ]
+        shared_prefix_length_with_history = max(
+            (self._longest_action_prefix(actions_taken, sequence) for sequence in historical_sequences),
+            default=0,
+        )
+        max_historical_sequence_length = max(
+            (
+                len(sequence)
+                for sequence in historical_sequences
+                if self._longest_action_prefix(actions_taken, sequence) == shared_prefix_length_with_history
+            ),
+            default=0,
+        )
+        deeper_than_history = (
+            max(0, len(actions_taken) - max_historical_sequence_length)
+            if shared_prefix_length_with_history > 0
+            else 0
+        )
+        committed_prefix_replay_count = (
+            int(root_depth_profile.committed_prefix_counts.get(prefix_signature, 0))
+            if prefix_signature
+            else 0
+        )
+        committed_clusters = {self._normalize_text(item) for item in root_depth_profile.committed_seen_clusters if self._normalize_text(item)}
+        branch_clusters = set(
+            self._branch_cluster_trace(trajectory_steps=trajectory_steps, final_state=final_state)
+        )
+        new_cluster_count = len(branch_clusters - committed_clusters)
+        committed_world_hashes = {
+            self._normalize_text(item)
+            for item in root_depth_profile.committed_seen_world_hashes
+            if self._normalize_text(item)
+        }
+        branch_world_hashes = set(
+            self._branch_world_hash_trace(trajectory_steps=trajectory_steps, final_state=final_state)
+        )
+        new_world_hash_count = len(branch_world_hashes - committed_world_hashes)
+        final_cluster = self._normalize_text(final_state.state_cluster_id)
+        committed_final_clusters = {
+            self._normalize_text(item)
+            for item in root_depth_profile.committed_final_clusters
+            if self._normalize_text(item)
+        }
+        new_final_cluster = bool(final_cluster) and final_cluster not in committed_final_clusters
+        materially_distinct_from_history = bool(actions_taken) and any(
+            (
+                committed_prefix_replay_count <= 0,
+                deeper_than_history > 0,
+                new_cluster_count > 0,
+                new_world_hash_count > 0,
+                new_final_cluster,
+            )
+        )
+        within_root_frontier_expansion = root_depth_profile.productive_root and bool(actions_taken) and any(
+            (
+                committed_prefix_replay_count <= 0 and bool(prefix_signature),
+                deeper_than_history > 0,
+                new_cluster_count > 0,
+                new_world_hash_count > 0,
+                new_final_cluster,
+            )
+        )
+        novelty_bonus = 0.0
+        depth_bonus = 0.0
+        replay_saturation_penalty = 0.0
+        if root_depth_profile.productive_root:
+            if committed_prefix_replay_count <= 0 and prefix_signature:
+                novelty_bonus += self.action_generator.config.policy.branch_root_novelty_bonus_weight
+            if new_final_cluster:
+                novelty_bonus += 0.5 * self.action_generator.config.policy.branch_root_novelty_bonus_weight
+            if new_cluster_count > 0:
+                novelty_bonus += min(1.0, 0.35 * float(new_cluster_count)) * (
+                    self.action_generator.config.policy.branch_root_novelty_bonus_weight
+                )
+            if new_world_hash_count > 0:
+                novelty_bonus += min(0.75, 0.25 * float(new_world_hash_count)) * (
+                    self.action_generator.config.policy.branch_root_novelty_bonus_weight
+                )
+            if deeper_than_history > 0:
+                depth_bonus += min(2.0, float(deeper_than_history)) * (
+                    self.action_generator.config.policy.branch_root_depth_bonus_weight
+                )
+            if committed_prefix_replay_count > 0 and not within_root_frontier_expansion:
+                replay_saturation_penalty = (
+                    float(committed_prefix_replay_count)
+                    * self.action_generator.config.policy.branch_root_replay_saturation_penalty_weight
+                )
+        return {
+            "continuation_prefix_signature": prefix_signature,
+            "continuation_prefix_actions": prefix_actions,
+            "replay_saturation_penalty": replay_saturation_penalty,
+            "within_root_novelty_bonus": novelty_bonus,
+            "within_root_depth_bonus": depth_bonus,
+            "committed_prefix_replay_count": committed_prefix_replay_count,
+            "shared_prefix_length_with_history": shared_prefix_length_with_history,
+            "materially_distinct_from_history": materially_distinct_from_history,
+            "within_root_frontier_expansion": within_root_frontier_expansion,
+        }
+
+    def _updated_root_depth_progression_profile(
+        self,
+        *,
+        root_state_id: str,
+        existing_profile: RootDepthProgressionProfile,
+        best_branch: LocalBranchOutcome | None,
+        branch_commit_allowed: bool,
+    ) -> RootDepthProgressionProfile:
+        """Update the persisted root-local continuation history after one revisit."""
+
+        profile = RootDepthProgressionProfile.from_record(existing_profile.to_record())
+        profile.root_state_id = root_state_id
+        if best_branch is None:
+            return profile
+
+        profile.last_replay_saturation_penalty = float(best_branch.replay_saturation_penalty)
+        profile.last_within_root_novelty_bonus = float(best_branch.within_root_novelty_bonus)
+        profile.last_within_root_depth_bonus = float(best_branch.within_root_depth_bonus)
+        profile.last_committed_prefix_signature = str(best_branch.continuation_prefix_signature)
+        profile.last_committed_materially_distinct = bool(best_branch.materially_distinct_from_history)
+        if not branch_commit_allowed or not best_branch.actions_taken:
+            profile.replay_saturation_level = max(
+                0,
+                profile.repeated_winning_continuation_count
+                - max(0, profile.materially_distinct_commit_count - 1),
+            )
+            return profile
+
+        prefix_signature = best_branch.continuation_prefix_signature.strip()
+        if not prefix_signature:
+            prefix_signature = " -> ".join(
+                self._continuation_prefix_actions(
+                    actions_taken=best_branch.actions_taken,
+                    last_meaningful_progress_action_index=best_branch.last_meaningful_progress_action_index,
+                    first_durable_gain_action_index=best_branch.first_durable_gain_action_index,
+                )
+            )
+        previous_prefix_count = int(profile.committed_prefix_counts.get(prefix_signature, 0)) if prefix_signature else 0
+        materially_distinct = bool(best_branch.materially_distinct_from_history or previous_prefix_count <= 0)
+        profile.productive_root = True
+        profile.productive_commit_count += 1
+        if materially_distinct:
+            profile.materially_distinct_commit_count += 1
+        elif previous_prefix_count > 0:
+            profile.repeated_winning_continuation_count += 1
+        if prefix_signature:
+            profile.committed_prefix_counts[prefix_signature] = previous_prefix_count + 1
+        profile.unique_committed_prefix_count = len(profile.committed_prefix_counts)
+        profile.max_committed_final_score = max(profile.max_committed_final_score, int(best_branch.final_score))
+        profile.max_committed_progress_score = max(
+            float(profile.max_committed_progress_score),
+            float(best_branch.branch_progress_score),
+        )
+        visited_clusters = self._branch_cluster_trace(
+            trajectory_steps=best_branch.trajectory_steps,
+            final_state=best_branch.final_state or TextGameState(observation=""),
+        ) if best_branch.final_state is not None else []
+        visited_world_hashes = self._branch_world_hash_trace(
+            trajectory_steps=best_branch.trajectory_steps,
+            final_state=best_branch.final_state or TextGameState(observation=""),
+        ) if best_branch.final_state is not None else []
+        final_cluster = (
+            self._normalize_text(best_branch.final_state.state_cluster_id)
+            if best_branch.final_state is not None
+            else ""
+        )
+        profile.committed_seen_clusters = sorted(
+            {
+                *profile.committed_seen_clusters,
+                *visited_clusters,
+            }
+        )
+        if final_cluster:
+            profile.committed_final_clusters = sorted({*profile.committed_final_clusters, final_cluster})
+        profile.committed_seen_world_hashes = sorted(
+            {
+                *profile.committed_seen_world_hashes,
+                *visited_world_hashes,
+            }
+        )
+        profile.committed_branch_history.append(
+            {
+                "prefix_signature": prefix_signature,
+                "prefix_actions": list(best_branch.continuation_prefix_actions),
+                "actions": list(best_branch.actions_taken),
+                "score_change": int(best_branch.score_change),
+                "final_score": int(best_branch.final_score),
+                "branch_progress_score": float(best_branch.branch_progress_score),
+                "replay_saturation_penalty": float(best_branch.replay_saturation_penalty),
+                "within_root_novelty_bonus": float(best_branch.within_root_novelty_bonus),
+                "within_root_depth_bonus": float(best_branch.within_root_depth_bonus),
+                "materially_distinct_from_history": materially_distinct,
+                "within_root_frontier_expansion": bool(best_branch.within_root_frontier_expansion),
+                "final_cluster_id": final_cluster,
+                "final_world_state_hash": (
+                    self._normalize_text(best_branch.final_state.world_state_hash)
+                    if best_branch.final_state is not None
+                    else ""
+                ),
+                "visited_clusters": list(visited_clusters),
+                "visited_world_hashes": list(visited_world_hashes),
+            }
+        )
+        profile.committed_branch_history = profile.committed_branch_history[-64:]
+        repeated_prefixes = [
+            signature
+            for signature, count in profile.committed_prefix_counts.items()
+            if int(count) > 1 and signature.strip()
+        ]
+        profile.saturated_prefix_signatures = sorted(repeated_prefixes)
+        saturated_try_actions: set[str] = set()
+        for branch_record in profile.committed_branch_history:
+            if str(branch_record.get("prefix_signature", "")) not in repeated_prefixes:
+                continue
+            actions = [self._normalize_text(action) for action in branch_record.get("actions", []) if self._normalize_text(action)]
+            if actions:
+                saturated_try_actions.add(actions[0])
+        profile.saturated_try_actions = sorted(saturated_try_actions)
+        profile.replay_saturation_level = max(
+            0,
+            profile.repeated_winning_continuation_count
+            - max(0, profile.materially_distinct_commit_count - 1),
+        )
+        return profile
+
     def _branch_sort_key(
         self,
         branch: LocalBranchOutcome,
@@ -1582,6 +2049,7 @@ class LocalExplorer:
         persistent_inventory_gain_count: int,
         persistent_inventory_loss_count: int,
         exploratory_location_progress: bool,
+        within_root_frontier_expansion: bool = False,
     ) -> bool:
         """Return whether a branch ended with a durable outcome strong enough to score."""
 
@@ -1590,6 +2058,7 @@ class LocalExplorer:
                 score_change > 0,
                 persistent_inventory_gain_count > 0 and persistent_inventory_loss_count <= 0,
                 exploratory_location_progress,
+                within_root_frontier_expansion,
             )
         )
 
@@ -1729,6 +2198,11 @@ class LocalExplorer:
                 False,
                 "best branch gained inventory only through a stuck or oscillatory local scene",
             )
+
+        if branch.within_root_frontier_expansion:
+            if branch.appears_stuck:
+                return False, "best branch expanded the productive root but still appeared stuck"
+            return True, ""
 
         if branch.score_change > 0:
             return True, ""
