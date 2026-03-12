@@ -1,0 +1,23 @@
+extends: glow_egg_bottleneck_diagnostic.yaml
+
+runtime:
+  docker_notes:
+    - "Depth-3 bottleneck diagnostic to test whether shallow local branching is the remaining blocker."
+    - "Keeps the same live full path and seed while extending local branch horizon."
+
+paths:
+  artifacts_dir: artifacts/diagnostics/egg_region_bottleneck_depth3
+  trajectory_dir: artifacts/diagnostics/egg_region_bottleneck_depth3/trajectories
+  archive_dir: artifacts/diagnostics/egg_region_bottleneck_depth3/archive
+  log_dir: artifacts/diagnostics/egg_region_bottleneck_depth3/logs
+  summary_dir: artifacts/diagnostics/egg_region_bottleneck_depth3/summaries
+  metrics_dir: artifacts/diagnostics/egg_region_bottleneck_depth3/metrics
+
+logging:
+  run_log_filename: egg_region_bottleneck_depth3.log
+
+policy:
+  rollout_depth: 3
+
+experiment:
+  max_steps: 144
