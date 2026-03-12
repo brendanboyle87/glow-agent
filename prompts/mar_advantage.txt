@@ -1,0 +1,16 @@
+Root-local rollout comparison:
+{branch_comparison_block}
+
+Existing local world model:
+{existing_local_model_block}
+
+Grounding constraints:
+{grounding_constraints}
+
+{thinking_mode_block}
+{structured_output_mode_block}
+{schema_contract_block}
+
+Infer only grounded intermediate advantages from these rollouts.
+Prefer score gain, durable inventory gain, or durable affordance gain.
+Keep the whole answer short.

@@ -85,6 +85,8 @@ class LMStudioClient(BaseLLMClient):
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
         }
+        if request.response_format is not None:
+            payload["response_format"] = request.response_format
         started_at = time.monotonic()
         raw = self._request_json(
             method="POST",

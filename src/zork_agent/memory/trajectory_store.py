@@ -10,9 +10,12 @@ TODO: add manifest files only once experiments accumulate more sidecar artifacts
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Mapping
 
 from zork_agent.memory.summaries import SummaryBuilder
 from zork_agent.types import (
+    EpisodeTrajectory,
+    ReplayMetadata,
     SavedNode,
     StateCandidate,
     Trajectory,
@@ -79,6 +82,44 @@ class TrajectoryStore:
         """Load a stored trajectory and return the requested replayable prefix."""
 
         return self.read_trajectory(path).prefix(up_to_step_index)
+
+    def episode_trajectory_for_trajectory(
+        self,
+        trajectory: Trajectory,
+        *,
+        root_state_id: str | None = None,
+        selected_from_archive_state_id: str | None = None,
+        replay_metadata: ReplayMetadata | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> EpisodeTrajectory:
+        """Adapt an existing stored trajectory into the typed episode artifact."""
+
+        return EpisodeTrajectory.from_legacy_trajectory(
+            trajectory,
+            root_state_id=root_state_id,
+            selected_from_archive_state_id=selected_from_archive_state_id,
+            replay_metadata=replay_metadata,
+            metadata=metadata,
+        )
+
+    def read_episode_trajectory(
+        self,
+        path: Path,
+        *,
+        root_state_id: str | None = None,
+        selected_from_archive_state_id: str | None = None,
+        replay_metadata: ReplayMetadata | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> EpisodeTrajectory:
+        """Load a stored episode and adapt it into the typed trajectory artifact."""
+
+        return self.episode_trajectory_for_trajectory(
+            self.read_trajectory(path),
+            root_state_id=root_state_id,
+            selected_from_archive_state_id=selected_from_archive_state_id,
+            replay_metadata=replay_metadata,
+            metadata=metadata,
+        )
 
     def state_candidate_for_step(
         self,

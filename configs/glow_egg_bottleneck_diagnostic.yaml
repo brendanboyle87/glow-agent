@@ -1,0 +1,17 @@
+extends: glow_progress_run.yaml
+
+runtime:
+  docker_notes:
+    - "Targeted bottleneck diagnostic for the post-egg stall regime."
+    - "Preserves the validated live full path and progress-run seed while expanding structured diagnostics."
+
+paths:
+  artifacts_dir: artifacts/diagnostics/egg_region_bottleneck
+  trajectory_dir: artifacts/diagnostics/egg_region_bottleneck/trajectories
+  archive_dir: artifacts/diagnostics/egg_region_bottleneck/archive
+  log_dir: artifacts/diagnostics/egg_region_bottleneck/logs
+  summary_dir: artifacts/diagnostics/egg_region_bottleneck/summaries
+  metrics_dir: artifacts/diagnostics/egg_region_bottleneck/metrics
+
+logging:
+  run_log_filename: egg_region_bottleneck.log

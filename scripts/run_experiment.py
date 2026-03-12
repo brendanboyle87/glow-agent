@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a scaffolded batch experiment from the command line.
+"""Run a GLoW batch experiment from the command line.
 
 TODO: replace this thin wrapper only if script-specific automation needs diverge from the CLI.
 """
@@ -16,7 +16,7 @@ from zork_agent.cli import run_batch_command
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for batch runs."""
 
-    parser = argparse.ArgumentParser(description="Run a batch of scaffolded Zork episodes.")
+    parser = argparse.ArgumentParser(description="Run a batch of GLoW Zork episodes.")
     parser.add_argument("config", type=Path, help="Path to a YAML config file.")
     parser.add_argument("--episodes", type=int, default=None, help="Optional episode count override.")
     return parser
@@ -32,4 +32,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

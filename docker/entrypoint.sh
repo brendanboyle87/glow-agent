@@ -27,7 +27,7 @@ PY
 }
 
 run_smoke_test() {
-  local smoke_config="${SMOKE_CONFIG:-configs/zork1_local.yaml}"
+  local smoke_config="${SMOKE_CONFIG:-configs/glow_core.yaml}"
 
   sync_workspace
   ensure_jericho_runtime
@@ -45,7 +45,7 @@ from zork_agent.env.jericho_env import JerichoEnv
 import jericho  # noqa: F401
 import zork_agent  # noqa: F401
 
-config_path = Path(os.environ.get("SMOKE_CONFIG", "configs/zork1_local.yaml"))
+config_path = Path(os.environ.get("SMOKE_CONFIG", "configs/glow_core.yaml"))
 config = load_config(config_path)
 print(f"[smoke] imports: ok")
 print(f"[smoke] config: ok ({config_path})")

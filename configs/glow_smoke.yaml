@@ -1,0 +1,28 @@
+extends: base.yaml
+
+runtime:
+  use_live_jericho: false
+  docker_notes:
+    - "Offline smoke profile for GLoW control-flow and artifact tests."
+
+llm:
+  offline_stub: true
+  temperature: 0.0
+  max_tokens: 96
+
+policy:
+  rollout_count: 2
+  rollout_depth: 3
+  frontier_max_size: 8
+  archive_top_k: 4
+  action_candidates: 3
+
+experiment:
+  seed: 3
+  batch_size: 2
+  max_steps: 8
+  max_replay_attempts: 3
+  glow_frontier_size: 6
+  glow_local_branches_per_root: 2
+  glow_frontier_analysis_frequency: 1
+  stub_episode_length: 2

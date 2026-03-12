@@ -1,0 +1,23 @@
+extends: glow_mar_reuse_diagnostic.yaml
+
+runtime:
+  docker_notes:
+    - "Dedicated full-path MAR reuse validation against the real LM Studio client."
+    - "Keeps the reuse-forcing regime while replacing the offline stub with the live LLM path."
+
+llm:
+  base_url: http://host.docker.internal:1234/v1
+  model_name: qwen/qwen3.5-9b
+  offline_stub: false
+  frontier_analysis_max_tokens: 800
+
+paths:
+  artifacts_dir: artifacts/validation/mar_reuse_full_path_live_qwen9b
+  trajectory_dir: artifacts/validation/mar_reuse_full_path_live_qwen9b/trajectories
+  archive_dir: artifacts/validation/mar_reuse_full_path_live_qwen9b/archive
+  log_dir: artifacts/validation/mar_reuse_full_path_live_qwen9b/logs
+  summary_dir: artifacts/validation/mar_reuse_full_path_live_qwen9b/summaries
+  metrics_dir: artifacts/validation/mar_reuse_full_path_live_qwen9b/metrics
+
+logging:
+  run_log_filename: mar_reuse_full_path.log

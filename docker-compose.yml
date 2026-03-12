@@ -9,9 +9,9 @@ services:
     environment:
       LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
       LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-lm-studio}
-      LMSTUDIO_MODEL_NAME: ${LMSTUDIO_MODEL_NAME:-local-model}
+      LMSTUDIO_MODEL_NAME: ${LMSTUDIO_MODEL_NAME:-}
       ZORK1_GAME_PATH: ${ZORK1_GAME_PATH:-games/zork1.z5}
-      SMOKE_CONFIG: ${DOCKER_SMOKE_CONFIG:-configs/zork1_local.yaml}
+      SMOKE_CONFIG: ${DOCKER_SMOKE_CONFIG:-configs/glow_core.yaml}
     volumes:
       - .:/workspace
     stdin_open: true

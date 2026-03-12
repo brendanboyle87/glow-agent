@@ -1,0 +1,14 @@
+extends: glow_integration_smoke.yaml
+
+llm:
+  base_url: http://host.docker.internal:1234/v1
+  model_name: qwen/qwen3.5-35b-a3b
+  offline_stub: false
+  temperature: 0.0
+  max_tokens: 160
+  analysis_debug_mode: false
+  frontier_analysis_max_tokens: 3000
+  mar_max_tokens: 1800
+
+policy:
+  archive_state_selection_mode: llm_assisted

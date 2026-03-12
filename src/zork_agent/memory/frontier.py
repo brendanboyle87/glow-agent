@@ -9,10 +9,20 @@ TODO: revisit the heuristic weights once real Zork runs generate meaningful logs
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
 
-from zork_agent.types import FrontierEntry, StateCandidate, derive_state_cluster_id, derive_state_family_key
+from zork_agent.types import (
+    EpisodeTrajectory,
+    FrontierEntry,
+    FrontierTrajectoryEntry,
+    StateCandidate,
+    TrajectoryStep,
+    derive_state_cluster_id,
+    derive_state_family_key,
+)
 
 
 @dataclass(slots=True)
@@ -75,8 +85,211 @@ class FrontierScoringConfig:
                 raise ValueError(f"{name} must be >= 0.0.")
 
 
+@dataclass(slots=True)
+class TrajectoryFrontierConfig:
+    """Retention settings for the paper-faithful trajectory frontier.
+
+    By default, retention is ranked purely by the maximum cumulative reward achieved by
+    each complete trajectory. Optional diversity-aware tie-breaking is available as an
+    implementation choice, but it is disabled by default to stay close to the paper.
+    """
+
+    max_size: int = 8
+    enable_diversity_tiebreak: bool = False
+    diversity_weight: float = 0.0
+    novelty_weight: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Validate trajectory-frontier settings."""
+
+        if self.max_size <= 0:
+            raise ValueError("TrajectoryFrontierConfig.max_size must be greater than 0.")
+        if self.diversity_weight < 0.0:
+            raise ValueError("TrajectoryFrontierConfig.diversity_weight must be >= 0.0.")
+        if self.novelty_weight < 0.0:
+            raise ValueError("TrajectoryFrontierConfig.novelty_weight must be >= 0.0.")
+
+
+class TrajectoryFrontier:
+    """Paper-faithful bounded frontier over complete trajectories.
+
+    This frontier stores full `EpisodeTrajectory` instances and ranks them by the
+    maximum cumulative reward achieved during the episode. That value is the primary
+    retention score. Optional novelty/diversity tie-breaking exists behind an explicit
+    config flag and is an implementation choice rather than a paper requirement.
+    """
+
+    def __init__(self, config: TrajectoryFrontierConfig | None = None):
+        self.config = config or TrajectoryFrontierConfig()
+        self._entries: list[FrontierTrajectoryEntry] = []
+        self._trajectories: dict[str, EpisodeTrajectory] = {}
+        self._insertion_counter = 0
+
+    def __len__(self) -> int:
+        """Return the number of retained trajectories."""
+
+        return len(self._entries)
+
+    def insert(
+        self,
+        trajectory: EpisodeTrajectory,
+        *,
+        novelty_score: float = 0.0,
+        diversity_score: float = 0.0,
+        bottleneck_state_ids: list[str] | None = None,
+        bottleneck_step_indices: list[int] | None = None,
+        inserted_at: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> FrontierTrajectoryEntry:
+        """Insert a completed episode trajectory into the bounded top-k frontier."""
+
+        trajectory.validate_invariants()
+        existing = self._entry_by_trajectory_id(trajectory.trajectory_id)
+        insertion_order = existing.insertion_order if existing is not None else self._next_insertion_order()
+        inserted_label = existing.inserted_at if existing is not None else (inserted_at or _utc_timestamp())
+
+        entry = FrontierTrajectoryEntry(
+            trajectory_id=trajectory.trajectory_id,
+            value=float(trajectory.max_cumulative_reward_achieved),
+            novelty_score=float(novelty_score),
+            diversity_score=float(diversity_score),
+            state_cluster_ids=_ordered_unique(
+                step.state_cluster_id for step in trajectory.steps if step.state_cluster_id
+            ),
+            state_family_keys=_ordered_unique(
+                derive_state_family_key(
+                    observation=step.observation,
+                    inventory_text=step.inventory_text,
+                    valid_actions=step.valid_actions,
+                    last_action=step.action,
+                )
+                for step in trajectory.steps
+            ),
+            bottleneck_state_ids=list(
+                bottleneck_state_ids
+                if bottleneck_state_ids is not None
+                else _ordered_unique(self._stable_state_id_for_step(step) for step in self._bottleneck_steps(trajectory))
+            ),
+            bottleneck_step_indices=list(
+                bottleneck_step_indices
+                if bottleneck_step_indices is not None
+                else [step.step_index for step in self._bottleneck_steps(trajectory)]
+            ),
+            inserted_at=inserted_label,
+            insertion_order=insertion_order,
+            metadata=dict(metadata or {}),
+        )
+
+        self._trajectories[trajectory.trajectory_id] = trajectory
+        self._entries = [item for item in self._entries if item.trajectory_id != trajectory.trajectory_id]
+        self._entries.append(entry)
+        self._resort_and_trim()
+        return self._entry_by_trajectory_id(trajectory.trajectory_id) or entry
+
+    def snapshot_entries(self) -> list[FrontierTrajectoryEntry]:
+        """Return a copy of the retained frontier entry ordering."""
+
+        return list(self._entries)
+
+    def top_k_entries(self, k: int) -> list[FrontierTrajectoryEntry]:
+        """Return the top-k retained frontier entries."""
+
+        return list(self._entries[: max(k, 0)])
+
+    def top_k_trajectories(self, k: int) -> list[EpisodeTrajectory]:
+        """Return the top-k retained complete trajectories."""
+
+        return [
+            self._trajectories[entry.trajectory_id]
+            for entry in self.top_k_entries(k)
+            if entry.trajectory_id in self._trajectories
+        ]
+
+    def trajectories_for_analysis(self, k: int | None = None) -> list[EpisodeTrajectory]:
+        """Return retained trajectories in frontier order for downstream LLM analysis."""
+
+        if k is None:
+            return self.top_k_trajectories(len(self._entries))
+        return self.top_k_trajectories(k)
+
+    def get_trajectory(self, trajectory_id: str) -> EpisodeTrajectory | None:
+        """Return one retained trajectory by id if it is still in the frontier."""
+
+        return self._trajectories.get(trajectory_id)
+
+    def _entry_by_trajectory_id(self, trajectory_id: str) -> FrontierTrajectoryEntry | None:
+        """Return the retained frontier entry for a trajectory id if present."""
+
+        for entry in self._entries:
+            if entry.trajectory_id == trajectory_id:
+                return entry
+        return None
+
+    def _next_insertion_order(self) -> int:
+        """Return the next stable insertion-order counter."""
+
+        next_value = self._insertion_counter
+        self._insertion_counter += 1
+        return next_value
+
+    def _resort_and_trim(self) -> None:
+        """Sort the retained trajectories and evict anything outside the top-k window."""
+
+        self._entries.sort(key=self._entry_sort_key)
+        if len(self._entries) <= self.config.max_size:
+            return
+        retained_entries = self._entries[: self.config.max_size]
+        retained_ids = {entry.trajectory_id for entry in retained_entries}
+        self._entries = retained_entries
+        self._trajectories = {
+            trajectory_id: trajectory
+            for trajectory_id, trajectory in self._trajectories.items()
+            if trajectory_id in retained_ids
+        }
+
+    def _entry_sort_key(self, entry: FrontierTrajectoryEntry) -> tuple[float, int, str]:
+        """Return the deterministic sort key for the trajectory frontier."""
+
+        return (-self._retention_score(entry), entry.insertion_order, entry.trajectory_id)
+
+    def _retention_score(self, entry: FrontierTrajectoryEntry) -> float:
+        """Return the retention score used for top-k clipping."""
+
+        if not self.config.enable_diversity_tiebreak:
+            return float(entry.value)
+        return (
+            float(entry.value)
+            + self.config.diversity_weight * float(entry.diversity_score)
+            + self.config.novelty_weight * float(entry.novelty_score)
+        )
+
+    def _bottleneck_steps(self, trajectory: EpisodeTrajectory) -> list[TrajectoryStep]:
+        """Return candidate bottleneck steps from a trajectory summary."""
+
+        bottleneck_indices = set(trajectory.summary_fields.bottleneck_step_indices)
+        if not bottleneck_indices:
+            return []
+        return [step for step in trajectory.steps if step.step_index in bottleneck_indices]
+
+    def _stable_state_id_for_step(self, step: TrajectoryStep) -> str:
+        """Return the archive-aligned stable state id for one trajectory step."""
+
+        # Import lazily to avoid a module-import cycle: the archive updater depends on
+        # `TrajectoryFrontier`, while the frontier needs the archive's identity rules.
+        from zork_agent.memory.archive_updater import archive_state_identity_for_step
+
+        state_id, _identity_strategy = archive_state_identity_for_step(
+            step,
+            trajectory_id=step.episode_id,
+        )
+        return state_id
+
 class FrontierQueue:
-    """Small sorted frontier with heuristic ranking and near-duplicate suppression."""
+    """Legacy heuristic state frontier with replay-node ranking.
+
+    This queue is retained as a migration adapter for the current branching code path.
+    It is not paper-faithful: it stores state nodes rather than complete trajectories.
+    """
 
     def __init__(self, max_size: int, scoring: FrontierScoringConfig | None = None):
         # TODO: switch to a heap only if profiles show this list-based queue is too slow.
@@ -396,3 +609,32 @@ class FrontierQueue:
             if self._text_similarity(entry.dedupe_key, candidate.dedupe_key) >= self.scoring.similarity_threshold:
                 return True
         return False
+
+
+LegacyHeuristicStateFrontier = FrontierQueue
+
+
+def _ordered_unique(values: Iterable[object] | object) -> list[str]:
+    """Return unique non-empty strings while preserving first-seen order."""
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    if isinstance(values, (str, bytes)):
+        iterable = [values]
+    elif isinstance(values, Iterable):
+        iterable = list(values)
+    else:
+        iterable = [values]
+    for value in iterable:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _utc_timestamp() -> str:
+    """Return a compact UTC timestamp for frontier insertion records."""
+
+    return datetime.now(timezone.utc).isoformat()

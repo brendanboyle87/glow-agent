@@ -7,8 +7,14 @@ from __future__ import annotations
 
 import pytest
 
-from zork_agent.memory.frontier import FrontierQueue, FrontierScoringConfig
-from zork_agent.types import FrontierEntry, SavedNode, StateCandidate
+from zork_agent.memory.archive_updater import ArchiveUpdater
+from zork_agent.memory.frontier import (
+    FrontierQueue,
+    FrontierScoringConfig,
+    TrajectoryFrontier,
+    TrajectoryFrontierConfig,
+)
+from zork_agent.types import EpisodeTrajectory, FrontierEntry, ReplayMetadata, SavedNode, StateCandidate, TrajectoryStep
 
 
 def _saved_node(state_id: str, *, native_state: tuple[object, ...] | None) -> SavedNode:
@@ -25,6 +31,58 @@ def _saved_node(state_id: str, *, native_state: tuple[object, ...] | None) -> Sa
         inventory_text="lamp",
         summary_text=f"summary-{state_id}",
     )
+
+
+def _episode_trajectory(
+    episode_id: str,
+    *,
+    rewards: list[float],
+    scores: list[int],
+    world_state_hashes: list[str],
+    state_cluster_ids: list[str] | None = None,
+) -> EpisodeTrajectory:
+    """Create a small typed episode trajectory fixture for frontier tests."""
+
+    cumulative_reward = 0.0
+    steps: list[TrajectoryStep] = []
+    cluster_ids = state_cluster_ids or ["" for _ in rewards]
+    for index, reward in enumerate(rewards):
+        cumulative_reward += reward
+        steps.append(
+            TrajectoryStep(
+                episode_id=episode_id,
+                step_index=index,
+                action=f"action-{index}",
+                observation=f"Observation {index}",
+                reward=reward,
+                cumulative_reward=cumulative_reward,
+                done=index == len(rewards) - 1,
+                score=scores[index],
+                moves=index + 1,
+                world_state_hash=world_state_hashes[index],
+                state_cluster_id=cluster_ids[index],
+                valid_actions=["look", "north"],
+                world_state_snapshot={
+                    "restore_strategy": "action_replay_fallback",
+                    "replay_actions": [f"action-{step_index}" for step_index in range(index + 1)],
+                },
+            )
+        )
+
+    trajectory = EpisodeTrajectory(
+        episode_id=episode_id,
+        root_state_id=f"{episode_id}:root:{world_state_hashes[0]}",
+        steps=steps,
+        max_cumulative_reward_achieved=max(step.cumulative_reward for step in steps) if steps else 0.0,
+        final_score=steps[-1].score if steps else 0,
+        final_done=steps[-1].done if steps else False,
+        replay_metadata=ReplayMetadata(
+            replay_actions=[step.action for step in steps],
+            world_state_hash=world_state_hashes[0],
+        ),
+    )
+    trajectory.validate_invariants()
+    return trajectory
 
 
 def test_frontier_ranks_entries_by_explicit_weighted_priority() -> None:
@@ -378,6 +436,25 @@ def test_frontier_rejects_invalid_configuration_and_nonfinite_priority() -> None
         frontier.add(FrontierEntry(state_id="bad", score=float("nan"), depth=1))
 
 
+def test_trajectory_frontier_collects_bottleneck_ids_from_generator_inputs() -> None:
+    """Generator-based bottleneck/state-id collection should materialize string values, not generator reprs."""
+
+    trajectory = _episode_trajectory(
+        "traj-generator",
+        rewards=[0.0, 1.0],
+        scores=[0, 1],
+        world_state_hashes=["root", "leaflet"],
+    )
+    trajectory.summary_fields.bottleneck_step_indices = [0, 1]
+    frontier = TrajectoryFrontier(TrajectoryFrontierConfig(max_size=2))
+
+    entry = frontier.insert(trajectory)
+
+    assert "archive:root" in entry.bottleneck_state_ids
+    assert "archive:leaflet" in entry.bottleneck_state_ids
+    assert all("generator object" not in value for value in entry.bottleneck_state_ids)
+
+
 def test_frontier_deprioritizes_movement_only_forest_clusters() -> None:
     """Near-identical forest movement states should decay behind object-bearing states."""
 
@@ -442,3 +519,119 @@ def test_frontier_deprioritizes_movement_only_forest_clusters() -> None:
     forest_entries = [entry for entry in snapshot if entry.state_cluster_id == "region:forest"]
     assert all(entry.effective_novelty < entry.novelty for entry in forest_entries)
     assert all(entry.revisit_saturation_penalty > 0.0 for entry in forest_entries)
+
+
+def test_trajectory_frontier_retains_top_k_complete_trajectories_by_value() -> None:
+    """The paper-faithful frontier should keep the highest-value complete trajectories."""
+
+    frontier = TrajectoryFrontier(TrajectoryFrontierConfig(max_size=2))
+    low = _episode_trajectory(
+        "episode-low",
+        rewards=[0.0, 1.0],
+        scores=[0, 1],
+        world_state_hashes=["hash-a", "hash-b"],
+    )
+    high = _episode_trajectory(
+        "episode-high",
+        rewards=[0.0, 2.0],
+        scores=[0, 2],
+        world_state_hashes=["hash-c", "hash-d"],
+    )
+    mid = _episode_trajectory(
+        "episode-mid",
+        rewards=[0.0, 1.5],
+        scores=[0, 1],
+        world_state_hashes=["hash-e", "hash-f"],
+    )
+
+    frontier.insert(low)
+    frontier.insert(high)
+    frontier.insert(mid)
+
+    retained_ids = [entry.trajectory_id for entry in frontier.snapshot_entries()]
+
+    assert retained_ids == ["episode-high", "episode-mid"]
+    assert [trajectory.trajectory_id for trajectory in frontier.top_k_trajectories(2)] == retained_ids
+
+
+def test_trajectory_frontier_tie_breaking_is_stable_by_insertion_order() -> None:
+    """Equal-valued trajectories should retain stable ordering by insertion order."""
+
+    frontier = TrajectoryFrontier(TrajectoryFrontierConfig(max_size=3))
+    first = _episode_trajectory(
+        "episode-first",
+        rewards=[0.0, 1.0],
+        scores=[0, 1],
+        world_state_hashes=["hash-first-0", "hash-first-1"],
+    )
+    second = _episode_trajectory(
+        "episode-second",
+        rewards=[0.0, 1.0],
+        scores=[0, 1],
+        world_state_hashes=["hash-second-0", "hash-second-1"],
+    )
+
+    frontier.insert(first)
+    frontier.insert(second)
+
+    assert [entry.trajectory_id for entry in frontier.snapshot_entries()] == ["episode-first", "episode-second"]
+
+
+def test_frontier_achieved_value_refresh_uses_the_independent_archive() -> None:
+    """Achieved-value refresh should come from the archive updater, not the frontier itself."""
+
+    frontier = TrajectoryFrontier(TrajectoryFrontierConfig(max_size=3))
+    archive_updater = ArchiveUpdater()
+    lower = _episode_trajectory(
+        "episode-one",
+        rewards=[0.0, 2.0],
+        scores=[0, 2],
+        world_state_hashes=["hash-root", "hash-window"],
+        state_cluster_ids=["region:field", "region:window"],
+    )
+    higher = _episode_trajectory(
+        "episode-two",
+        rewards=[0.0, 5.0],
+        scores=[0, 5],
+        world_state_hashes=["hash-root", "hash-window"],
+        state_cluster_ids=["region:field", "region:window"],
+    )
+
+    frontier.insert(lower)
+    frontier.insert(higher)
+    archive_by_state_id = archive_updater.ingest_episode_trajectories({}, [lower, higher])
+    archive_by_state_id = archive_updater.refresh_achieved_values_from_frontier(archive_by_state_id, frontier)
+
+    assert archive_by_state_id["archive:hash-root"].achieved_value == 0.0
+    assert archive_by_state_id["archive:hash-window"].achieved_value == 5.0
+    assert archive_by_state_id["archive:hash-window"].frontier_support_count == 2
+    assert archive_by_state_id["archive:hash-window"].supporting_frontier_trajectory_ids == [
+        "episode-two",
+        "episode-one",
+    ]
+
+
+def test_trajectory_frontier_analysis_view_returns_complete_trajectories() -> None:
+    """Frontier analysis retrieval should expose the retained full trajectories."""
+
+    frontier = TrajectoryFrontier(TrajectoryFrontierConfig(max_size=2))
+    first = _episode_trajectory(
+        "episode-analysis-1",
+        rewards=[0.0, 1.0, 1.0],
+        scores=[0, 1, 2],
+        world_state_hashes=["hash-1", "hash-2", "hash-3"],
+    )
+    second = _episode_trajectory(
+        "episode-analysis-2",
+        rewards=[0.0, 3.0],
+        scores=[0, 3],
+        world_state_hashes=["hash-4", "hash-5"],
+    )
+
+    frontier.insert(first, novelty_score=0.2, diversity_score=0.4)
+    frontier.insert(second, novelty_score=0.1, diversity_score=0.1)
+
+    analysis_payload = frontier.trajectories_for_analysis()
+
+    assert [trajectory.trajectory_id for trajectory in analysis_payload] == ["episode-analysis-2", "episode-analysis-1"]
+    assert analysis_payload[0].steps[-1].cumulative_reward == 3.0

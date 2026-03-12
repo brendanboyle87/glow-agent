@@ -1,0 +1,4 @@
+extends: glow_core.yaml
+
+experiment:
+  enable_global_frontier_analysis: false

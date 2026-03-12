@@ -4,6 +4,12 @@ Observation:
 Inventory:
 {inventory}
 
+Root state:
+{root_state_id}
+
+Local world model:
+{local_world_model_block}
+
 Salient objects:
 {salient_objects_block}
 

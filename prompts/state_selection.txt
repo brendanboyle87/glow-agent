@@ -1,10 +1,17 @@
-Frontier candidates:
+Candidate archive states:
 {frontier_snapshot}
 
-Pick one candidate to revisit next for local exploration.
-Prefer states that look promising but are still cheap to branch from.
-Use score, novelty, recent gain, and depth directly.
+Pick one archived state to revisit next for replay and further exploration.
+Balance:
+- achieved value when exploitation is appropriate
+- potential value when the state aligns with critical states or bottlenecks
+- replay reliability when a native snapshot is available
 
-Reply in plain text:
-choice: C<number>
-reason: one short sentence
+{thinking_mode_block}
+{structured_output_mode_block}
+
+Final structured output contract:
+{{
+  "choice": "C<number>",
+  "reason": "one short grounded sentence"
+}}

@@ -1,0 +1,24 @@
+extends: base.yaml
+
+runtime:
+  jericho_game_path: games/zork1.z5
+  use_live_jericho: true
+  docker_notes:
+    - "Primary GLoW run profile for Jericho in Docker."
+    - "LM Studio stays on the host and is reached via host.docker.internal."
+
+llm:
+  base_url: http://host.docker.internal:1234/v1
+  model_name: local-model
+  offline_stub: false
+  temperature: 0.1
+  max_tokens: 256
+
+experiment:
+  seed: 11
+  batch_size: 3
+  max_steps: 100
+  max_replay_attempts: 12
+  glow_frontier_size: 12
+  glow_local_branches_per_root: 4
+  glow_frontier_analysis_frequency: 1

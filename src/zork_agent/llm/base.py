@@ -5,6 +5,7 @@ TODO: extend this interface only after a second backend forces a cleaner contrac
 
 from __future__ import annotations
 
+from collections import Counter
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Sequence
 
@@ -56,6 +57,9 @@ class BaseLLMClient(ABC):
     def __init__(self, *, default_model: str | None = None):
         # TODO: centralize backend settings if more local providers are added.
         self.default_model = default_model
+        self.call_counts: Counter[str] = Counter()
+        self.success_counts: Counter[str] = Counter()
+        self.error_counts: Counter[str] = Counter()
 
     @abstractmethod
     def list_models(self) -> list[str]:
@@ -73,6 +77,8 @@ class BaseLLMClient(ABC):
         temperature: float,
         max_tokens: int,
         timeout_seconds: float | None = None,
+        response_format: dict[str, object] | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> LLMResponse:
         """Execute a chat completion request from an existing message list."""
 
@@ -82,8 +88,10 @@ class BaseLLMClient(ABC):
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            response_format=response_format,
+            metadata=dict(metadata or {}),
         )
-        return self.complete_chat(request)
+        return self._dispatch_request(request)
 
     def generate_action_candidates(
         self,
@@ -175,6 +183,41 @@ class BaseLLMClient(ABC):
             metadata={"task": "reflect_on_rollouts"},
         )
 
+    def analyze_frontier(
+        self,
+        *,
+        prompt_manager: "PromptManager",
+        game_id: str,
+        analysis_id: str = "",
+        frontier_trajectory_block: str,
+        achieved_value_block: str,
+        bottleneck_candidate_block: str,
+        model: str | None,
+        temperature: float,
+        max_tokens: int,
+        timeout_seconds: float | None = None,
+        analysis_debug_mode: bool = False,
+        response_format: dict[str, object] | None = None,
+    ) -> LLMResponse:
+        """Render the frontier-analysis prompt and execute a completion."""
+
+        return self._complete_from_prompts(
+            system_prompt=prompt_manager.render_system(game_id=game_id),
+            user_prompt=prompt_manager.render_frontier_analysis(
+                analysis_id=analysis_id,
+                frontier_trajectory_block=frontier_trajectory_block,
+                achieved_value_block=achieved_value_block,
+                bottleneck_candidate_block=bottleneck_candidate_block,
+                analysis_debug_mode=analysis_debug_mode,
+            ),
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+            response_format=response_format,
+            metadata={"task": "analyze_frontier"},
+        )
+
     def score_state_for_revisit(
         self,
         *,
@@ -185,16 +228,22 @@ class BaseLLMClient(ABC):
         temperature: float,
         max_tokens: int,
         timeout_seconds: float | None = None,
+        analysis_debug_mode: bool = False,
+        response_format: dict[str, object] | None = None,
     ) -> LLMResponse:
         """Render the state-selection prompts and execute a completion."""
 
         return self._complete_from_prompts(
             system_prompt=prompt_manager.render_system(game_id=game_id),
-            user_prompt=prompt_manager.render_state_selection(frontier_snapshot=frontier_snapshot),
+            user_prompt=prompt_manager.render_state_selection(
+                frontier_snapshot=frontier_snapshot,
+                analysis_debug_mode=analysis_debug_mode,
+            ),
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            response_format=response_format,
             metadata={"task": "score_state_for_revisit"},
         )
 
@@ -207,6 +256,7 @@ class BaseLLMClient(ABC):
         temperature: float,
         max_tokens: int,
         timeout_seconds: float | None,
+        response_format: dict[str, object] | None = None,
         metadata: dict[str, str],
     ) -> LLMResponse:
         """Build a normalized request from prompts and execute it."""
@@ -218,6 +268,43 @@ class BaseLLMClient(ABC):
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            response_format=response_format,
             metadata=metadata,
         )
-        return self.complete_chat(request)
+        return self._dispatch_request(request)
+
+    def stage_call_counts(self) -> dict[str, int]:
+        """Return a copy of the recorded call counts by stage/task name."""
+
+        return dict(self.call_counts)
+
+    def stage_success_counts(self) -> dict[str, int]:
+        """Return a copy of the recorded successful call counts by stage/task name."""
+
+        return dict(self.success_counts)
+
+    def stage_error_counts(self) -> dict[str, int]:
+        """Return a copy of the recorded failed call counts by stage/task name."""
+
+        return dict(self.error_counts)
+
+    def _dispatch_request(self, request: LLMChatRequest) -> LLMResponse:
+        """Record per-stage call stats around one normalized request."""
+
+        task_name = self._task_name(request)
+        self.call_counts[task_name] += 1
+        try:
+            response = self.complete_chat(request)
+        except Exception:
+            self.error_counts[task_name] += 1
+            raise
+        self.success_counts[task_name] += 1
+        return response
+
+    def _task_name(self, request: LLMChatRequest) -> str:
+        """Return a stable per-stage task name for one request."""
+
+        metadata_task = request.metadata.get("task")
+        if isinstance(metadata_task, str) and metadata_task.strip():
+            return metadata_task.strip()
+        return "chat"

@@ -1,0 +1,30 @@
+extends: glow_integration_smoke.yaml
+
+runtime:
+  docker_notes:
+    - "Dedicated two-session persistence validation against live Jericho."
+    - "Offline LLM stub keeps the run deterministic while exercising the real GLoW loop."
+
+policy:
+  rollout_depth: 2
+  frontier_max_size: 8
+  archive_top_k: 6
+  action_candidates: 4
+
+paths:
+  archive_dir: artifacts/persistence/two_session/shared_archive
+
+logging:
+  level: INFO
+  run_log_filename: persistence.log
+
+experiment:
+  seed: 23
+  batch_size: 1
+  max_steps: 12
+  max_replay_attempts: 6
+  glow_frontier_size: 4
+  glow_local_branches_per_root: 3
+  glow_frontier_analysis_frequency: 1
+  branch_commit_steps: 2
+  local_exploration_post_gain_cooldown_steps: 0

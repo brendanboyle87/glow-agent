@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from zork_agent.memory.trajectory_store import TrajectoryStore
-from zork_agent.types import Trajectory, TrajectoryStep
+from zork_agent.types import EpisodeTrajectory, Trajectory, TrajectoryStep
 from zork_agent.utils.serialization import SerializationError, append_jsonl, read_jsonl, write_jsonl
 
 
@@ -105,6 +105,22 @@ def test_trajectory_store_writes_replayable_prefix(tmp_path: Path) -> None:
 
     assert restored_prefix.episode_id == "episode-001"
     assert [step.action for step in restored_prefix.steps] == ["look"]
+
+
+def test_trajectory_store_adapts_legacy_episode_to_typed_episode_trajectory(tmp_path: Path) -> None:
+    """Stored legacy trajectories should adapt cleanly into the typed episode artifact."""
+
+    store = TrajectoryStore(tmp_path / "trajectories")
+    trajectory = _build_trajectory()
+    path = store.write_trajectory(trajectory)
+
+    typed_episode = store.read_episode_trajectory(path, root_state_id="archive:root-state")
+
+    assert isinstance(typed_episode, EpisodeTrajectory)
+    assert typed_episode.root_state_id == "archive:root-state"
+    assert typed_episode.max_cumulative_reward_achieved == 0.0
+    assert typed_episode.steps[0].cumulative_reward == 0.0
+    assert typed_episode.steps[1].cumulative_reward == 0.0
 
 
 def test_trajectory_store_derives_reversible_state_family_for_replay_candidates(tmp_path: Path) -> None:

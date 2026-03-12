@@ -15,7 +15,7 @@ from zork_agent.cli import inspect_trajectory_command
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for replay inspection."""
 
-    parser = argparse.ArgumentParser(description="Inspect a scaffold trajectory JSONL file.")
+    parser = argparse.ArgumentParser(description="Inspect a GLoW trajectory JSONL file.")
     parser.add_argument("trajectory", type=Path, help="Path to a trajectory JSONL file.")
     return parser
 
@@ -29,4 +29,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

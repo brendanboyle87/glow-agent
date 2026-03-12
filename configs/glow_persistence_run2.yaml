@@ -1,0 +1,8 @@
+extends: glow_persistence_shared.yaml
+
+paths:
+  artifacts_dir: artifacts/persistence/two_session/run2
+  trajectory_dir: artifacts/persistence/two_session/run2/trajectories
+  log_dir: artifacts/persistence/two_session/run2/logs
+  summary_dir: artifacts/persistence/two_session/run2/summaries
+  metrics_dir: artifacts/persistence/two_session/run2/metrics

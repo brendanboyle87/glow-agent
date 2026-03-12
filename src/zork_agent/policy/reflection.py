@@ -172,6 +172,7 @@ class ReflectionEngine:
                 temperature=min(self.config.llm.temperature, 0.2),
                 max_tokens=min(self.config.llm.max_tokens, 160),
                 timeout_seconds=self.config.llm.request_timeout_seconds,
+                metadata={"task": "local_reflection_rollouts"},
             )
         except Exception as exc:
             _LOGGER.warning("Rollout reflection fell back after LLM request failure: %s", exc)
@@ -216,6 +217,7 @@ class ReflectionEngine:
                 temperature=min(self.config.llm.temperature, 0.2),
                 max_tokens=min(self.config.llm.max_tokens, 160),
                 timeout_seconds=self.config.llm.request_timeout_seconds,
+                metadata={"task": "trajectory_reflection"},
             )
         except Exception as exc:
             _LOGGER.warning("Trajectory reflection fell back after LLM request failure: %s", exc)

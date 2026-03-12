@@ -1,6 +1,6 @@
 UV ?= uv
-CONFIG ?= configs/zork1_debug.yaml
-CONTAINER_CONFIG ?= configs/zork1_local.yaml
+CONFIG ?= configs/glow_smoke.yaml
+CONTAINER_CONFIG ?= configs/glow_core.yaml
 TRAJECTORY ?= artifacts/trajectories/zork1-episode-000.jsonl
 
 .PHONY: \

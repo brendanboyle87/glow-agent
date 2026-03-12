@@ -1,4 +1,4 @@
-"""Logging helpers for the scaffold.
+"""Logging helpers for the GLoW implementation.
 
 TODO: add structured log sinks if experiment monitoring becomes more demanding.
 """
@@ -30,4 +30,3 @@ def configure_logging(log_path: Path, level: str = "INFO") -> logging.Logger:
     logger.addHandler(file_handler)
 
     return logger
-

@@ -96,6 +96,56 @@ def test_lmstudio_client_parses_chat_completion_response() -> None:
     assert response.raw_payload["id"] == "chatcmpl-123"
 
 
+def test_lmstudio_client_includes_response_format_in_payload() -> None:
+    """Structured-output requests should pass response_format through to LM Studio."""
+
+    captured_request: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_request["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen/test",
+                "choices": [{"message": {"role": "assistant", "content": "{\"ok\":true}"}}],
+            },
+        )
+
+    client = LMStudioClient(
+        base_url="http://localhost:1234/v1",
+        default_model="qwen/test",
+        retry_backoff_seconds=0.0,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.complete_chat(
+        LLMChatRequest.from_prompts(
+            system_prompt="System",
+            user_prompt="Return JSON.",
+            model=None,
+            temperature=0.0,
+            max_tokens=64,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "simple",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                    },
+                },
+            },
+        )
+    )
+
+    payload = captured_request["payload"]
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"]["name"] == "simple"
+
+
 def test_generate_action_candidates_renders_prompts_and_uses_env_defaults(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

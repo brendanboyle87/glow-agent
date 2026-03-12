@@ -1,0 +1,41 @@
+Analysis id:
+{analysis_id}
+
+Frontier trajectory summaries:
+{frontier_trajectory_block}
+
+Achieved-value state candidates:
+{achieved_value_block}
+
+Known bottleneck candidates:
+{bottleneck_candidate_block}
+
+Grounding constraints:
+{grounding_constraints}
+
+{thinking_mode_block}
+{structured_output_mode_block}
+
+Use only evidence from the supplied trajectories or achieved-value state list.
+Use empty arrays instead of unsupported narrative text.
+Keep the whole answer short.
+
+Final structured output contract:
+{{
+  "analysis_id": "{analysis_id}",
+  "bottlenecks": ["short grounded item"],
+  "partial_solutions": ["short grounded item"],
+  "missing_prerequisites": ["short grounded item"],
+  "critical_states": [
+    {{
+      "critical_state_id": "state-id",
+      "achieved_value": 0.0,
+      "potential_value": 0.0,
+      "confidence": 0.0,
+      "support_count": 0,
+      "source_frontier_trajectory_ids": ["trajectory-id"],
+      "supporting_state_ids": ["state-id"],
+      "textual_rationale": "one short grounded rationale"
+    }}
+  ]
+}}

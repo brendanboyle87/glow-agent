@@ -1,6 +1,6 @@
 """Helpers for deterministic experiment seeds.
 
-TODO: expand this helper if the scaffold adopts libraries with separate RNG state.
+TODO: expand this helper if the implementation adopts libraries with separate RNG state.
 """
 
 from __future__ import annotations
@@ -22,4 +22,3 @@ def set_global_seed(seed: int) -> None:
         np.random.seed(seed)
     except ImportError:
         pass
-

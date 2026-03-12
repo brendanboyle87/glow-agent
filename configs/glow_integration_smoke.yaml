@@ -1,0 +1,27 @@
+extends: base.yaml
+
+runtime:
+  jericho_game_path: games/zork1.z5
+  use_live_jericho: true
+  docker_notes:
+    - "Minimal end-to-end GLoW integration run against live Jericho."
+    - "Uses deterministic LLM fallbacks so the full control loop can be exercised without requiring a loaded host model."
+
+llm:
+  offline_stub: true
+  temperature: 0.0
+  max_tokens: 96
+
+policy:
+  action_candidates: 3
+
+experiment:
+  seed: 13
+  batch_size: 1
+  max_steps: 12
+  max_replay_attempts: 4
+  glow_frontier_size: 4
+  glow_local_branches_per_root: 2
+  glow_frontier_analysis_frequency: 1
+  local_exploration_post_gain_cooldown_steps: 0
+  branch_commit_steps: 2

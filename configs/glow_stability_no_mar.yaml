@@ -1,0 +1,20 @@
+extends: glow_stability_long.yaml
+
+runtime:
+  docker_notes:
+    - "Dedicated no-MAR ablation against the validated longer single-session stability shape."
+    - "MAR updates and local-world-model guidance are disabled; archive/frontier/selection stay active."
+
+paths:
+  artifacts_dir: artifacts/ablations/long_single_session_no_mar
+  trajectory_dir: artifacts/ablations/long_single_session_no_mar/trajectories
+  archive_dir: artifacts/ablations/long_single_session_no_mar/archive
+  log_dir: artifacts/ablations/long_single_session_no_mar/logs
+  summary_dir: artifacts/ablations/long_single_session_no_mar/summaries
+  metrics_dir: artifacts/ablations/long_single_session_no_mar/metrics
+
+logging:
+  run_log_filename: ablation_no_mar.log
+
+experiment:
+  enable_mar: false

@@ -1,0 +1,35 @@
+extends: glow_mar_reuse_full_path.yaml
+
+runtime:
+  docker_notes:
+    - "First serious progress-seeking full run against the live GLoW path."
+    - "Keeps the validated live LLM + MAR stack, but relaxes the reuse-forcing bias so selection can diversify."
+
+policy:
+  rollout_depth: 2
+  frontier_max_size: 20
+  archive_top_k: 10
+  state_selection_selection_penalty: 0.25
+  state_selection_visit_penalty: 0.1
+  state_selection_native_snapshot_bonus: 0.2
+
+paths:
+  artifacts_dir: artifacts/progress/first_full_progress_run_live_qwen9b
+  trajectory_dir: artifacts/progress/first_full_progress_run_live_qwen9b/trajectories
+  archive_dir: artifacts/progress/first_full_progress_run_live_qwen9b/archive
+  log_dir: artifacts/progress/first_full_progress_run_live_qwen9b/logs
+  summary_dir: artifacts/progress/first_full_progress_run_live_qwen9b/summaries
+  metrics_dir: artifacts/progress/first_full_progress_run_live_qwen9b/metrics
+
+logging:
+  run_log_filename: progress_run.log
+
+experiment:
+  seed: 41
+  max_steps: 128
+  max_replay_attempts: 24
+  glow_frontier_size: 8
+  glow_local_branches_per_root: 4
+  glow_frontier_analysis_frequency: 1
+  enable_mar: true
+  enable_potential_value_selection: true

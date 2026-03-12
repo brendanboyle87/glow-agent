@@ -1,25 +1,19 @@
-# Zork Agent Scaffold
+# GLoW for Jericho
 
-This repository scaffolds a local research project for parser-based interactive fiction, starting with Jericho + Zork I and a local LLM served by LM Studio. The current codebase is intentionally incomplete: it wires configuration, prompts, logging, JSONL trajectories, Docker/runtime conventions, and a minimal CLI without claiming to reproduce the full GLoW paper.
+This repository is a research implementation of GLoW-style exploration for Jericho text games, starting with Zork I and a local LM Studio model. The codebase is organized around the paper-facing concepts that now drive the implementation:
 
-The design keeps two concerns separate:
+- complete-trajectory frontier memory
+- independent persistent archive-state memory with achieved plus potential value
+- global frontier analysis
+- local world models updated through Multi-path Advantage Reflection (MAR)
+- a GLoW-style global/local control loop
 
-- Paper-inspired surfaces live in `src/zork_agent/policy/` and describe hierarchical exploration, reflection, and state selection at a high level.
-- Engineering approximations live in `src/zork_agent/env/`, `src/zork_agent/llm/`, `src/zork_agent/memory/`, and `src/zork_agent/experiment/`, where the current implementation is deliberately simple and testable.
+The implementation remains inspectable and practical:
 
-## What Is Scaffolded Today
-
-- Typed config loading from YAML with `extends` support and environment overrides.
-- Editable prompt templates under `prompts/`.
-- A CLI with `run-single`, `run-batch`, `inspect-trajectory`, and `validate-config`.
-- JSONL trajectory writing and replay inspection helpers.
-- Standard-library logging with deterministic seed helpers.
-- A Docker runtime aimed at Linux + Jericho.
-- An LM Studio client that targets the OpenAI-compatible local API.
-- A Jericho-first wrapper with typed reset/step outputs, inventory/score helpers, native `get_state()` / `set_state()` restore, and replay fallback.
-- Frontier memory that retains native snapshots for the best replay targets and prunes the rest down to action-prefix fallback nodes.
-- A working baseline episode loop that ties together reset, frontier updates, replay selection, shallow local branching, reflection, and JSON/JSONL artifacts.
-- Placeholder policy components with explicit TODOs rather than paper claims.
+- Jericho native snapshots are preferred for restore.
+- Replay remains as a fallback for robustness.
+- LLM outputs are cached and written as artifacts for offline inspection.
+- Deterministic fallbacks remain available when parsing fails.
 
 ## Architecture
 
@@ -29,33 +23,28 @@ Host macOS
     -> OpenAI-compatible HTTP API (:1234)
 
 Linux Docker container
-  zork-agent CLI / scripts
-    -> config loading + prompt files
-    -> LMStudioClient
-         -> host.docker.internal:1234/v1
-    -> EpisodeRunner
-         -> JerichoEnv
-              -> Jericho FrotzEnv
-         -> ActionGenerator
+  zork-agent CLI
+    -> EpisodeRunner (GLoW control loop)
+         -> TrajectoryFrontier
+         -> ArchiveStore / ArchiveUpdater
+         -> FrontierAnalyzer
          -> StateSelector
+         -> JerichoEnv
          -> LocalExplorer
-         -> ReflectionEngine
-         -> FrontierQueue
+              -> MAR reflector
+              -> LocalWorldModelStore
          -> TrajectoryStore
 
 Artifacts
   artifacts/trajectories/*.jsonl
-  artifacts/summaries/*.json
+  artifacts/archive/*.archive.jsonl
+  artifacts/summaries/frontier_analysis/**/*
+  artifacts/summaries/state_selection/**/*
+  artifacts/summaries/local_world_models/**/*
+  artifacts/metrics/episodes/*.json
+  artifacts/metrics/runs/*.json
   artifacts/logs/*.log
 ```
-
-## What Is Not Implemented Yet
-
-- Full hierarchical exploration or archive management from GLoW.
-- Learned or retrieval-based memory.
-- Robust Jericho state branching, action pruning, or benchmarking.
-- Model-specific prompt tuning or automatic evaluation metrics.
-- A production-grade Docker orchestration story beyond a single local research container.
 
 ## Project Layout
 
@@ -96,7 +85,7 @@ cp .env.example .env
 mkdir -p games
 ```
 
-Put your Zork I ROM at `games/zork1.z5`, or edit `configs/zork1_local.yaml` / `configs/zork1_debug.yaml` to point somewhere else.
+Put your Zork I ROM at `games/zork1.z5`, or override `ZORK1_GAME_PATH` in `.env`.
 
 Install the Python environment on the host:
 
@@ -153,16 +142,16 @@ Open a shell inside the runtime:
 make run-docker-shell
 ```
 
-Run a single Zork episode inside the container:
+Run the main GLoW config inside the container:
 
 ```bash
-make run-zork-docker CONTAINER_CONFIG=configs/zork1_local.yaml
+make run-zork-docker CONTAINER_CONFIG=configs/glow_core.yaml
 ```
 
 Run the Docker smoke test:
 
 ```bash
-make smoke-test-docker CONTAINER_CONFIG=configs/zork1_local.yaml
+make smoke-test-docker CONTAINER_CONFIG=configs/glow_core.yaml
 ```
 
 Notes:
@@ -180,7 +169,7 @@ Notes:
 The `smoke-test` entrypoint path checks four things, in order:
 
 1. Python imports for `zork_agent` and `jericho`
-2. config loading through `configs/zork1_local.yaml` or `DOCKER_SMOKE_CONFIG`
+2. config loading through `configs/glow_core.yaml` or `DOCKER_SMOKE_CONFIG`
 3. reachability of `LMSTUDIO_BASE_URL` via `GET /v1/models`
 4. Jericho environment initialization if the configured game file exists
 
@@ -188,12 +177,12 @@ If the ROM file is missing, the final Jericho init step is reported as `skipped`
 
 ## 4. Run From the Host
 
-Host-side validation and placeholder runs work too:
+Validate configs and run the GLoW implementation directly on the host:
 
 ```bash
-uv run zork-agent validate-config configs/zork1_debug.yaml
-uv run zork-agent run-single configs/zork1_debug.yaml
-uv run zork-agent run-batch configs/zork1_debug.yaml --episodes 2
+uv run zork-agent validate-config configs/glow_smoke.yaml
+uv run zork-agent run-single configs/glow_smoke.yaml
+uv run zork-agent run-batch configs/glow_smoke.yaml --episodes 2
 ```
 
 Inspect a saved trajectory:
@@ -207,63 +196,131 @@ uv run zork-agent inspect-trajectory artifacts/trajectories/zork1-episode-000.js
 ```bash
 make sync
 make test
-make validate-config CONFIG=configs/zork1_debug.yaml
-make run-single CONFIG=configs/zork1_debug.yaml
-make run-batch CONFIG=configs/zork1_debug.yaml
+make validate-config CONFIG=configs/glow_smoke.yaml
+make run-single CONFIG=configs/glow_smoke.yaml
+make run-batch CONFIG=configs/glow_smoke.yaml
 make build-docker
 make run-docker-shell
-make run-zork-docker CONTAINER_CONFIG=configs/zork1_local.yaml
-make smoke-test-docker CONTAINER_CONFIG=configs/zork1_local.yaml
+make run-zork-docker CONTAINER_CONFIG=configs/glow_core.yaml
+make smoke-test-docker CONTAINER_CONFIG=configs/glow_core.yaml
 ```
-
-The older aliases `make docker-build`, `make docker-shell`, and `make docker-run-single` still work.
 
 ## Configs
 
 - `configs/base.yaml`: shared defaults.
-- `configs/zork1_local.yaml`: intended for Docker + live LM Studio on the host.
-- `configs/zork1_debug.yaml`: offline-friendly placeholder mode for smoke tests.
+- `configs/glow_core.yaml`: main GLoW run with LM Studio + Jericho.
+- `configs/glow_smoke.yaml`: fast offline smoke-test config.
+- `configs/glow_ablation_no_global_analysis.yaml`: disables frontier analysis.
+- `configs/glow_ablation_no_mar.yaml`: disables MAR / local-world-model updates.
+- `configs/glow_ablation_no_potential_value_selection.yaml`: removes potential-value contribution in archive-state selection.
 
 Config loading supports:
 
 - YAML inheritance via `extends`
 - environment overrides from `.env`
 - deterministic seeds where possible
-- explicit artifact/log/archive directories
+- explicit artifact/log/archive/metrics directories
 - early validation of prompt-file existence and common URL/budget mistakes
-- configurable frontier snapshot retention via `policy.snapshot_retention_limit`
-- configurable selection/revisit budgets via:
-  - `policy.state_selection_mode`
-  - `experiment.max_steps`
-  - `experiment.max_replay_attempts`
-  - `experiment.frontier_refresh_cadence`
-  - `experiment.local_exploration_cadence`
+- clean ablation switches via:
+  - `experiment.enable_global_frontier_analysis`
+  - `experiment.enable_mar`
+  - `experiment.enable_potential_value_selection`
 
-## Episode Loop
+## Main Run
 
-The baseline runner in `src/zork_agent/experiment/episode_runner.py` is intentionally simple:
+Main GLoW run:
 
-1. Reset Jericho and add the initial state to the frontier.
-2. Take normal exploratory actions from the current state.
-3. Periodically refresh the frontier with replayable saved nodes.
-4. On the configured cadence, choose a promising frontier node to revisit.
-5. Restore that node with Jericho-native snapshots first, replay fallback second.
-6. Run shallow local rollouts from the restored node and compare their outcomes.
-7. Reflect over those branches to extract compact action guidance.
-8. Use either the best local branch's first action or a fresh action-generation call to continue the main episode.
-9. Persist the episode trajectory as JSONL and a summary sidecar as JSON.
+```bash
+docker compose run --rm jericho uv run zork-agent run-single configs/glow_core.yaml
+```
 
-The local branching and reflection stages are heuristic/LLM-assisted research layers on top of an explicit deterministic control loop. The frontier ranking remains heuristic and inspectable, while action generation, optional selector assistance, and reflection are the LLM-mediated parts.
+Main ablations:
 
-## Paper Fidelity Vs Approximation
+```bash
+uv run zork-agent run-batch configs/glow_ablation_no_global_analysis.yaml --episodes 3
+uv run zork-agent run-batch configs/glow_ablation_no_mar.yaml --episodes 3
+uv run zork-agent run-batch configs/glow_ablation_no_potential_value_selection.yaml --episodes 3
+```
 
-This codebase is research scaffolding, not a paper reproduction.
+## Evaluation Artifacts
 
-- Jericho native snapshots are first-class and preferred. That is a pragmatic engineering choice for fast revisit/branching, not a claim that the underlying paper used the same restore mechanics.
-- Frontier ranking is an explicit heuristic formula over score, novelty, recent gain, and depth. It is deliberately easy to tune and inspect rather than paper-faithful.
-- Local exploration is shallow multi-branch rollout comparison, not full tree search.
-- Reflection is compact operational guidance extracted from rollouts or trajectories. It is meant to bias future prompts, not stand in for a full learned memory system.
-- Replay remains as a fallback for robustness when native restore is unavailable or fails validation.
+Per-episode outputs:
+
+- `artifacts/trajectories/*.jsonl`
+- `artifacts/summaries/*.summary.json`
+- `artifacts/metrics/episodes/*.metrics.json`
+
+Structured analysis artifacts:
+
+- `artifacts/archive/*.archive.jsonl`
+- `artifacts/summaries/frontier_analysis/<analysis_id>/`
+- `artifacts/summaries/state_selection/<selection_id>/`
+- `artifacts/summaries/local_world_models/<root_state_id>/`
+
+Run-level metrics:
+
+- `artifacts/metrics/runs/*.json`
+
+These metrics include environment interactions, max/final score, restore counts, frontier sizes over time, frontier-analysis counts, MAR updates, selection decisions, and branch counts by root state.
+
+## Archive vs Frontier
+
+The repo now treats the archive and frontier as separate memories:
+
+- `TrajectoryFrontier` is a bounded top-k memory of complete trajectories ranked by achieved value.
+- The archive is a broader persistent state memory written independently under `artifacts/archive/`.
+
+Archive ingestion walks every explored trajectory, not just the retained frontier. This means a state can remain selectable even after the trajectory that first discovered it falls out of the frontier.
+
+Primary archive fields:
+
+- identity and provenance:
+  - `state_id`
+  - `first_seen_episode_id` / `first_seen_timestep`
+  - `last_seen_episode_id` / `last_seen_timestep`
+  - `provenance_trajectory_id` / `provenance_timestep`
+  - `provenance_trajectory_ids`
+- restore handles:
+  - native snapshot reference if available
+  - replay prefix / restore metadata fallback
+- counters:
+  - `visit_count`
+  - `selection_count`
+  - `restore_success_count`
+  - `restore_failure_count`
+- local descriptors:
+  - observation / inventory / valid-action summaries
+  - state-cluster id
+
+Derived archive fields:
+
+- `achieved_value`
+  - refreshed from the currently retained frontier trajectories
+- `projected_potential_value`
+  - cached from the latest frontier analysis / critical-state annotations
+- `frontier_support_count` and `supporting_frontier_trajectory_ids`
+  - derived from the current frontier, not intrinsic state properties
+
+### State Identity
+
+State identity is explicit and intentionally simple:
+
+- prefer Jericho/native `world_state_hash` when available
+- otherwise fall back to a deterministic normalized signature over:
+  - observation text
+  - inventory text
+  - sorted valid actions
+
+The fallback identity is an approximation and is documented as such in code and the fidelity ledger. It is used only when the environment does not provide a stable engine hash.
+
+## Fidelity Ledger
+
+The implementation is intentionally explicit about what is paper-faithful and what remains an implementation choice.
+
+See:
+
+- [docs/glow_fidelity_ledger.md](/Users/brendanboyle/repos/glow-agent/docs/glow_fidelity_ledger.md)
+- [docs/archive_memory_design_note.md](/Users/brendanboyle/repos/glow-agent/docs/archive_memory_design_note.md)
 
 ## Prompts
 
@@ -272,15 +329,15 @@ Prompt templates are plain text files under `prompts/` and are loaded at runtime
 The LM Studio client uses plain Python `str.format(...)`-style placeholders and exposes helper methods for:
 
 - action candidate generation
-- trajectory summarization
-- rollout reflection
-- revisit scoring
+- frontier analysis
+- MAR advantage reflection
+- archive-state selection
 
 Each helper ultimately sends a standard `POST /v1/chat/completions` request through the same lower-level completion path.
 
 The client accepts either a full OpenAI-compatible base URL such as `http://127.0.0.1:1234/v1` or a host-only form such as `http://127.0.0.1:1234`; the latter is normalized to `/v1`.
 
-## Jericho Wrapper Notes
+## Jericho Runtime Notes
 
 The environment wrapper in `src/zork_agent/env/jericho_env.py` exposes:
 
@@ -303,16 +360,14 @@ Important limitations:
 - Jericho-native snapshots are preferred because they are faster and less drift-prone than re-running an action prefix.
 - Replay remains in `src/zork_agent/env/replay.py` as a fallback path. The restore flow is: try `set_state()`, validate score/observation/inventory conservatively, then fall back to `reset()` plus action replay if native restore fails or looks suspicious.
 - Post-`set_state()` observation validation is still partly constrained by Jericho's helper surface: score and inventory can usually be re-queried directly, but observation text may come from the best available live value or the cached saved-node text when Jericho does not expose a clean current-observation getter.
-- Frontier memory keeps native states only for the top configured revisit targets and prunes the rest to action-prefix-only saved nodes via `policy.snapshot_retention_limit`.
+- Native snapshot references are kept available for archive states and replay metadata whenever the live runtime can provide them.
 
 ## Known Limitations
 
-- The live Jericho path is Linux-oriented and expected to run in Docker. macOS host runs are mainly for debug/stub workflows.
-- Native Jericho snapshots are held in memory for frontier revisit; they are not fully serialized into JSONL trajectories, so persisted trajectories reload as replay-first restore targets.
-- Replay validation is conservative but still heuristic. Observation matching can fail on innocuous wording drift, or pass when semantically different states look textually similar.
-- `get_valid_actions()` and `get_inventory()` depend on Jericho internals and may be slow, unavailable, or inconsistent across games.
-- The Docker entrypoint reapplies Docker-only Jericho/spaCy dependencies after `uv sync` so bind-mounted workspace updates do not strip them out. This is pragmatic, but not especially elegant.
-- The current Make/CLI workflow is aimed at local research iteration rather than long-running experiment orchestration or resumable jobs.
+- The live Jericho path is Linux-oriented and expected to run in Docker.
+- Native snapshots are preferred but not always fully serializable; replay fallback remains part of the implementation.
+- The global world model, archive selection, and MAR all depend on prompt-mediated structured inference; deterministic fallbacks remain necessary when parsing or model quality is weak.
+- The repo is a faithful research implementation target, not a claim of byte-for-byte reproduction of unpublished details or unstated training procedures.
 
 ## Docker Networking Notes
 
@@ -330,7 +385,7 @@ from zork_agent.config import load_config
 from zork_agent.llm.lmstudio_client import LMStudioClient
 from zork_agent.llm.prompts import PromptManager
 
-config = load_config(Path("configs/zork1_local.yaml"))
+config = load_config(Path("configs/glow_core.yaml"))
 client = LMStudioClient(
     base_url=config.llm.base_url,
     default_model=config.llm.model_name,
@@ -366,13 +421,13 @@ Run the tests:
 uv run pytest
 ```
 
-The automated tests currently cover config loading, frontier bookkeeping, replay loading, JSONL serialization, prompt rendering, LM Studio response parsing, HTTP error handling, Jericho wrapper behavior via fake backends, and stub-mode episode/evaluator smoke tests.
+The automated tests cover:
 
-Additional robustness checks now cover:
-
-- sparse replay `step_index` handling instead of list-position assumptions
-- trajectory integrity checks for mixed episode ids or unsorted steps
-- malformed JSONL detection with line-number context
-- frontier tie-breaking stability
-- LM Studio base-URL normalization and clearer backend error messages
-- malformed LLM output fallback paths in selection/action-generation tests
+- config loading and ablation toggles
+- trajectory frontier and independent archive refresh
+- frontier analysis parsing and artifacts
+- archive-state selection
+- MAR and local world model persistence
+- action reranking and prompt construction
+- replay / native restore behavior
+- GLoW episode-runner and evaluator control flow with mocked env + mocked LLMs

@@ -423,7 +423,7 @@ class JerichoEnv:
             observation = "Opening the small mailbox reveals a leaflet."
             world_state_hash = "stub-open-mailbox"
         elif normalized == "read leaflet":
-            observation = "Welcome to the scaffold. The leaflet mostly confirms this is a placeholder."
+            observation = "Welcome to the GLoW test harness. The leaflet mostly confirms this is a placeholder."
             world_state_hash = "stub-read-leaflet"
 
         done = self._step_index >= self.config.experiment.stub_episode_length or normalized == "quit"

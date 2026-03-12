@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one scaffolded episode from the command line.
+"""Run one GLoW episode from the command line.
 
 TODO: keep this script thin and push real logic into the package.
 """
@@ -16,7 +16,7 @@ from zork_agent.cli import run_single_command
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for single-episode runs."""
 
-    parser = argparse.ArgumentParser(description="Run one scaffolded Zork episode.")
+    parser = argparse.ArgumentParser(description="Run one GLoW Zork episode.")
     parser.add_argument("config", type=Path, help="Path to a YAML config file.")
     parser.add_argument("--episode-id", type=str, default=None, help="Optional explicit episode id.")
     return parser
@@ -32,4 +32,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

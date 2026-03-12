@@ -1,0 +1,27 @@
+extends: glow_persistence_shared.yaml
+
+runtime:
+  docker_notes:
+    - "Dedicated longer single-session stability validation against live Jericho."
+    - "Fresh archive and artifacts isolate repeated-cycle behavior within one process."
+
+policy:
+  frontier_max_size: 10
+  archive_top_k: 8
+
+paths:
+  artifacts_dir: artifacts/stability/long_single_session
+  trajectory_dir: artifacts/stability/long_single_session/trajectories
+  archive_dir: artifacts/stability/long_single_session/archive
+  log_dir: artifacts/stability/long_single_session/logs
+  summary_dir: artifacts/stability/long_single_session/summaries
+  metrics_dir: artifacts/stability/long_single_session/metrics
+
+logging:
+  run_log_filename: stability.log
+
+experiment:
+  seed: 29
+  max_steps: 30
+  max_replay_attempts: 10
+  glow_frontier_size: 5
