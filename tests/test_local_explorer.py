@@ -22,9 +22,12 @@ from zork_agent.llm.prompts import PromptManager
 from zork_agent.policy.action_generator import ActionGenerator
 from zork_agent.policy.local_explorer import LocalExplorer
 from zork_agent.types import (
+    ActionBiasRecord,
     ActionProposal,
+    AffordanceRecord,
     BranchTerminationReason,
     LocalBranchOutcome,
+    LocalWorldModel,
     TextGameState,
     WorldStateSnapshot,
 )
@@ -236,6 +239,7 @@ def _build_config(tmp_path: Path) -> ProjectConfig:
     for name in (
         "system.txt",
         "action.txt",
+        "mar_advantage.txt",
         "trajectory.txt",
         "reflection.txt",
         "selection.txt",
@@ -342,6 +346,91 @@ def test_local_explorer_reduces_to_one_branch_without_a_replayable_snapshot(tmp_
     assert len(result.branches) == 1
 
 
+def test_local_explorer_ignores_stored_local_model_when_mar_disabled(tmp_path: Path) -> None:
+    """The no-MAR ablation should not read or pass along stored local guidance."""
+
+    config = _build_config(tmp_path)
+    config.experiment.enable_mar = False
+    env = JerichoEnv(config, env_factory=BranchingBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    captured_local_models: list[LocalWorldModel | None] = []
+
+    def scripted_proposals(
+        state: TextGameState,
+        *,
+        recent_trajectory_context: str | None = None,
+        candidate_count: int | None = None,
+        temperature: float | None = None,
+        recent_actions: list[str] | None = None,
+        recent_loop_results=None,
+        state_action_history=None,
+        supported_try_actions=None,
+        supported_avoid_actions=None,
+        supported_reflection_objects=None,
+        root_state_id: str = "",
+        local_world_model=None,
+    ) -> list[ActionProposal]:
+        captured_local_models.append(local_world_model)
+        return [ActionProposal(action="read leaflet", rank=1)]
+
+    action_generator.propose_actions = scripted_proposals  # type: ignore[method-assign]
+
+    env.reset(seed=13)
+    base_state = env.step("open mailbox").to_state()
+    base_saved_node = explorer._saved_node_from_state(base_state)
+    root_state_id = explorer._root_state_id(base_state, base_saved_node)
+    explorer.local_world_model_store.write(LocalWorldModel(root_state_id=root_state_id))
+
+    result = explorer.explore_from_state(base_state, branch_count=1, branch_horizon=1)
+
+    assert captured_local_models == [None]
+    assert result.used_local_world_model is None
+    assert result.mar_inference is None
+    assert result.updated_local_world_model is None
+    assert result.best_branch is not None
+    assert result.best_branch.actions_taken == ["read leaflet"]
+
+
+def test_local_explorer_reports_local_guidance_reuse_when_model_exists(tmp_path: Path) -> None:
+    """A repeated root with a stored local model should report guidance reuse in branch metadata."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=BranchingBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    env.reset(seed=19)
+    base_state = env.step("open mailbox").to_state()
+    base_saved_node = explorer._saved_node_from_state(base_state)
+    root_state_id = explorer._root_state_id(base_state, base_saved_node)
+    explorer.local_world_model_store.write(
+        LocalWorldModel(
+            root_state_id=root_state_id,
+            action_priors=[ActionBiasRecord(action="read leaflet", weight=1.0)],
+            action_antipriors=[ActionBiasRecord(action="close mailbox", weight=1.0)],
+        )
+    )
+
+    result = explorer.explore_from_state(base_state, branch_count=1, branch_horizon=1)
+
+    assert result.used_local_world_model is not None
+    assert result.metadata["local_world_model_read_attempted"] is True
+    assert result.metadata["local_world_model_read_hit"] is True
+    assert result.metadata["local_world_model_guidance_available"] is True
+    assert result.metadata["branches_with_local_guidance_count"] == 1
+    assert result.metadata["action_generation_calls_with_local_guidance_count"] == 1
+    assert result.metadata["reuse_status_reason"] == "local_guidance_attached_to_reranker_only_no_llm_client"
+    assert result.best_branch is not None
+    assert result.best_branch.metadata["had_local_guidance"] is True
+    assert result.best_branch.metadata["guidance_attached_to_policy_input"] is True
+    assert result.best_branch.metadata["guidance_attached_to_prompt"] is False
+    assert result.best_branch.metadata["selected_actions_matching_local_try_guidance_count"] == 1
+
+
 def test_local_explorer_penalizes_open_close_oscillation_when_scoring_branches(tmp_path: Path) -> None:
     """Oscillating open/close loops should lose to productive branches."""
 
@@ -360,6 +449,11 @@ def test_local_explorer_penalizes_open_close_oscillation_when_scoring_branches(t
         recent_actions: list[str] | None = None,
         recent_loop_results=None,
         state_action_history=None,
+        supported_try_actions=None,
+        supported_avoid_actions=None,
+        supported_reflection_objects=None,
+        root_state_id: str = "",
+        local_world_model=None,
     ) -> list[ActionProposal]:
         if "mailbox" in state.observation.lower():
             return [
@@ -414,6 +508,50 @@ def test_local_explorer_allows_inventory_gain_branch_with_zero_score(tmp_path: P
     assert result.branch_commit_allowed is True
 
 
+def test_local_explorer_decays_repeated_score_replay_branch_progress(tmp_path: Path) -> None:
+    """Repeating an already-achieved score branch should not keep its full score bonus."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=InventoryGainBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    fresh_score = explorer._branch_progress_score(  # type: ignore[attr-defined]
+        score_change=5,
+        final_score=5,
+        best_known_score=0,
+        persistent_inventory_gain_count=0,
+        persistent_inventory_loss_count=0,
+        persistent_affordance_gain=0,
+        persistent_exit_gain_count=0,
+        landmark_gain=0,
+        novel_object_count=0,
+        room_text_only_gain=0.0,
+        loop_penalty_reduction=0.0,
+        oscillation_penalty_total=0.0,
+        movement_penalty_total=0.0,
+    )
+    repeated_score = explorer._branch_progress_score(  # type: ignore[attr-defined]
+        score_change=5,
+        final_score=5,
+        best_known_score=5,
+        persistent_inventory_gain_count=0,
+        persistent_inventory_loss_count=0,
+        persistent_affordance_gain=0,
+        persistent_exit_gain_count=0,
+        landmark_gain=0,
+        novel_object_count=0,
+        room_text_only_gain=0.0,
+        loop_penalty_reduction=0.0,
+        oscillation_penalty_total=0.0,
+        movement_penalty_total=0.0,
+    )
+
+    assert fresh_score == 5.0
+    assert repeated_score == 0.0
+
+
 def test_local_explorer_rejects_zero_score_movement_only_branch(tmp_path: Path) -> None:
     """Movement-only room-text variation should not clear the branch commit gate."""
 
@@ -432,6 +570,11 @@ def test_local_explorer_rejects_zero_score_movement_only_branch(tmp_path: Path) 
         recent_actions: list[str] | None = None,
         recent_loop_results=None,
         state_action_history=None,
+        supported_try_actions=None,
+        supported_avoid_actions=None,
+        supported_reflection_objects=None,
+        root_state_id: str = "",
+        local_world_model=None,
     ) -> list[ActionProposal]:
         return [
             ActionProposal(action="go around trees", rank=1),
@@ -459,6 +602,75 @@ def test_local_explorer_rejects_zero_score_movement_only_branch(tmp_path: Path) 
     )
 
 
+def test_local_explorer_allows_exploratory_location_branch_without_score_or_inventory(tmp_path: Path) -> None:
+    """A real outward location move can clear commit even without immediate score or inventory."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=WanderingForestBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    allowed, reason = explorer._branch_clears_commit_gate(  # type: ignore[attr-defined]
+        LocalBranchOutcome(
+            branch_index=0,
+            actions_taken=["south", "west"],
+            total_reward=0.0,
+            score_change=0,
+            final_score=5,
+            final_observation="Behind House. A small window is ajar.",
+            terminated=False,
+            termination_reason=BranchTerminationReason.HORIZON_REACHED,
+            persistent_inventory_gain_count=0,
+            persistent_inventory_loss_count=0,
+            persistent_affordance_gain=0,
+            persistent_exit_gain_count=1,
+            new_room_location_signal=True,
+            landmark_gain=1,
+            movement_action_ratio=1.0,
+            branch_progress_score=1.5,
+            metadata={"exploratory_location_progress": True},
+        )
+    )
+
+    assert allowed is True
+    assert reason == ""
+
+
+def test_local_explorer_detects_repeated_known_local_affordance_replay(tmp_path: Path) -> None:
+    """Branches that just replay a known local affordance loop should be identifiable for score decay."""
+
+    config = _build_config(tmp_path)
+    env = JerichoEnv(config, env_factory=WanderingForestBackend)
+    prompt_manager = PromptManager(config.prompts)
+    action_generator = ActionGenerator(config, prompt_manager, llm_client=None)
+    explorer = LocalExplorer(action_generator, env=env)
+
+    local_world_model = LocalWorldModel(
+        root_state_id="forest-root",
+        action_priors=[ActionBiasRecord(action="north", weight=1.0)],
+        inferred_affordances=[AffordanceRecord(affordance="disturb", object_text="leaves", confidence=0.9)],
+    )
+
+    repeated = explorer._is_repeated_known_local_affordance_branch(  # type: ignore[attr-defined]
+        local_world_model=local_world_model,
+        actions_taken=["north", "take leaves"],
+        action_events=[{"selected_action_matches_local_try_guidance": True}],
+        score_change=0,
+        exploratory_location_progress=False,
+    )
+    exploratory = explorer._is_repeated_known_local_affordance_branch(  # type: ignore[attr-defined]
+        local_world_model=local_world_model,
+        actions_taken=["north", "down"],
+        action_events=[{"selected_action_matches_local_try_guidance": True}],
+        score_change=0,
+        exploratory_location_progress=True,
+    )
+
+    assert repeated is True
+    assert exploratory is False
+
+
 def test_local_explorer_aborts_low_value_movement_cycle_early(tmp_path: Path) -> None:
     """Movement-only cycles between one or two clusters should fail fast inside a branch."""
 
@@ -478,6 +690,11 @@ def test_local_explorer_aborts_low_value_movement_cycle_early(tmp_path: Path) ->
         recent_actions: list[str] | None = None,
         recent_loop_results=None,
         state_action_history=None,
+        supported_try_actions=None,
+        supported_avoid_actions=None,
+        supported_reflection_objects=None,
+        root_state_id: str = "",
+        local_world_model=None,
     ) -> list[ActionProposal]:
         return [
             ActionProposal(action="go around trees", rank=1),

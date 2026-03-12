@@ -14,21 +14,26 @@ import re
 
 from zork_agent.env.jericho_env import JerichoEnv
 from zork_agent.env.replay import restore_saved_node
+from zork_agent.memory.local_world_model_store import LocalWorldModelStore
 from zork_agent.memory.frontier import FrontierEntry, FrontierQueue
 from zork_agent.policy.action_generator import ActionGenerator
+from zork_agent.policy.mar_reflector import MultiPathAdvantageReflector
 from zork_agent.policy.state_selector import StateSelector
 from zork_agent.types import (
     ActionClusterHistory,
     ActionProposal,
     BranchTerminationReason,
+    LocalWorldModel,
     LocalBranchOutcome,
     LocalExplorationResult,
     LoopHeuristicResult,
+    MARInferenceResult,
     MovementHeuristicResult,
     ReplayResult,
     RestoreMode,
     SavedNode,
     TextGameState,
+    TrajectoryStep,
     action_target_tokens,
     action_shape_is_complex_transitive,
     canonical_if_verb_family,
@@ -98,6 +103,8 @@ class LocalExplorer:
         state_selector: StateSelector | None = None,
         *,
         env: JerichoEnv | None = None,
+        local_world_model_store: LocalWorldModelStore | None = None,
+        mar_reflector: MultiPathAdvantageReflector | None = None,
         logger: logging.Logger | None = None,
         default_branch_count: int | None = None,
         default_branch_horizon: int | None = None,
@@ -108,6 +115,14 @@ class LocalExplorer:
         self.action_generator = action_generator
         self.state_selector = state_selector
         self.env = env
+        self.local_world_model_store = local_world_model_store or LocalWorldModelStore(
+            action_generator.config.paths.summary_dir / "local_world_models"
+        )
+        self.mar_reflector = mar_reflector or MultiPathAdvantageReflector(
+            action_generator.config,
+            action_generator.prompt_manager,
+            action_generator.llm_client,
+        )
         self.logger = logger or _LOGGER
         self.default_branch_count = (
             default_branch_count
@@ -150,6 +165,7 @@ class LocalExplorer:
         temperature: float | None = None,
         action_candidate_count: int | None = None,
         recent_trajectory_context: str | None = None,
+        best_known_score: int | None = None,
     ) -> LocalExplorationResult:
         """Restore the same base state before each branch and compare shallow rollouts."""
 
@@ -167,6 +183,36 @@ class LocalExplorer:
 
         base_saved_node = self._saved_node_from_state(restored_state)
         comparison_notes = ""
+        root_state_id = self._root_state_id(restored_state, base_saved_node)
+        mar_enabled = self.action_generator.config.experiment.enable_mar
+        local_world_model_read_attempted = mar_enabled
+        used_local_world_model = None
+        if mar_enabled:
+            used_local_world_model = self.local_world_model_store.read(root_state_id)
+            if used_local_world_model is not None:
+                self.logger.info(
+                    "Loaded existing local world model for root=%s hints=%s priors=%s antipriors=%s",
+                    root_state_id,
+                    len(used_local_world_model.accumulated_advantage_hints),
+                    len(used_local_world_model.action_priors),
+                    len(used_local_world_model.action_antipriors),
+                )
+        else:
+            self.logger.info(
+                "MAR disabled for root=%s; local-world-model reads and guidance are disabled.",
+                root_state_id,
+            )
+        local_world_model_read_hit = used_local_world_model is not None
+        local_guidance_available = bool(
+            used_local_world_model is not None
+            and (
+                used_local_world_model.accumulated_advantage_hints
+                or used_local_world_model.action_priors
+                or used_local_world_model.action_antipriors
+                or used_local_world_model.inferred_affordances
+                or used_local_world_model.discovered_subgoals
+            )
+        )
         if base_saved_node is None and effective_branch_count > 1:
             comparison_notes = (
                 "Base state had no replayable snapshot; local exploration was reduced to one branch."
@@ -186,6 +232,9 @@ class LocalExplorer:
                 temperature=effective_temperature,
                 action_candidate_count=effective_action_candidate_count,
                 recent_trajectory_context=recent_trajectory_context,
+                root_state_id=root_state_id,
+                local_world_model=used_local_world_model,
+                best_known_score=best_known_score,
             )
             branches.append(outcome)
             if self._is_post_score_stale_branch(base_state=restored_state, branch=outcome):
@@ -239,6 +288,73 @@ class LocalExplorer:
                 commit_rejection_reason or "none",
             )
 
+        mar_inference = None
+        updated_local_world_model = None
+        if mar_enabled:
+            mar_inference = self.mar_reflector.infer_advantage_hint(
+                root_state_id=root_state_id,
+                branches=branches,
+                existing_local_world_model=used_local_world_model,
+            )
+            updated_local_world_model = self.mar_reflector.update_local_world_model(
+                root_state_id=root_state_id,
+                existing_local_world_model=used_local_world_model,
+                inference_result=mar_inference,
+            )
+            mar_artifact_dir = self.local_world_model_store.write_mar_result(
+                mar_inference,
+                updated_local_world_model,
+            )
+            mar_inference.artifact_directory = str(mar_artifact_dir)
+            self.logger.info(
+                "Updated local world model for root=%s hints=%s priors=%s antipriors=%s fallback=%s",
+                root_state_id,
+                len(updated_local_world_model.accumulated_advantage_hints),
+                len(updated_local_world_model.action_priors),
+                len(updated_local_world_model.action_antipriors),
+                mar_inference.used_fallback,
+            )
+        else:
+            self.logger.info(
+                "MAR disabled for root=%s; skipping advantage inference and local-model update.",
+                root_state_id,
+            )
+
+        branches_with_local_guidance_count = sum(
+            1 for branch in branches if bool(branch.metadata.get("had_local_guidance", False))
+        )
+        branches_with_prompt_guidance_count = sum(
+            1 for branch in branches if bool(branch.metadata.get("guidance_attached_to_prompt", False))
+        )
+        action_generation_calls_with_local_guidance_count = sum(
+            int(branch.metadata.get("action_generation_calls_with_local_guidance", 0))
+            for branch in branches
+        )
+        action_generation_calls_with_prompt_guidance_count = sum(
+            int(branch.metadata.get("action_generation_calls_with_prompt_guidance", 0))
+            for branch in branches
+        )
+        selected_actions_matching_local_try_guidance_count = sum(
+            int(branch.metadata.get("selected_actions_matching_local_try_guidance_count", 0))
+            for branch in branches
+        )
+        selected_actions_matching_local_avoid_guidance_count = sum(
+            int(branch.metadata.get("selected_actions_matching_local_avoid_guidance_count", 0))
+            for branch in branches
+        )
+        if not mar_enabled:
+            reuse_status_reason = "mar_disabled"
+        elif not local_world_model_read_hit:
+            reuse_status_reason = "no_persisted_local_world_model_for_root"
+        elif not local_guidance_available:
+            reuse_status_reason = "persisted_local_world_model_loaded_but_empty"
+        elif branches_with_local_guidance_count <= 0:
+            reuse_status_reason = "local_world_model_loaded_but_not_attached_to_branch_inputs"
+        elif branches_with_prompt_guidance_count <= 0 and self.action_generator.llm_client is None:
+            reuse_status_reason = "local_guidance_attached_to_reranker_only_no_llm_client"
+        else:
+            reuse_status_reason = "local_guidance_attached_to_later_branches"
+
         return LocalExplorationResult(
             base_state=restored_state,
             branch_count=len(branches),
@@ -246,10 +362,55 @@ class LocalExplorer:
             temperature=effective_temperature,
             action_candidate_count=effective_action_candidate_count,
             branches=branches,
+            root_state_id=root_state_id,
             best_branch_index=best_branch_index,
             branch_commit_allowed=branch_commit_allowed,
             commit_rejection_reason=commit_rejection_reason,
             comparison_notes=comparison_notes,
+            used_local_world_model=used_local_world_model,
+            mar_inference=mar_inference,
+            updated_local_world_model=updated_local_world_model,
+            metadata={
+                "local_world_model_read_attempted": local_world_model_read_attempted,
+                "local_world_model_read_hit": local_world_model_read_hit,
+                "local_world_model_guidance_available": local_guidance_available,
+                "local_world_model_hint_count": (
+                    len(used_local_world_model.accumulated_advantage_hints)
+                    if used_local_world_model is not None
+                    else 0
+                ),
+                "local_world_model_prior_count": (
+                    len(used_local_world_model.action_priors)
+                    if used_local_world_model is not None
+                    else 0
+                ),
+                "local_world_model_antiprior_count": (
+                    len(used_local_world_model.action_antipriors)
+                    if used_local_world_model is not None
+                    else 0
+                ),
+                "local_world_model_affordance_count": (
+                    len(used_local_world_model.inferred_affordances)
+                    if used_local_world_model is not None
+                    else 0
+                ),
+                "local_world_model_write_performed": updated_local_world_model is not None,
+                "branches_with_local_guidance_count": branches_with_local_guidance_count,
+                "branches_with_prompt_guidance_count": branches_with_prompt_guidance_count,
+                "action_generation_calls_with_local_guidance_count": (
+                    action_generation_calls_with_local_guidance_count
+                ),
+                "action_generation_calls_with_prompt_guidance_count": (
+                    action_generation_calls_with_prompt_guidance_count
+                ),
+                "selected_actions_matching_local_try_guidance_count": (
+                    selected_actions_matching_local_try_guidance_count
+                ),
+                "selected_actions_matching_local_avoid_guidance_count": (
+                    selected_actions_matching_local_avoid_guidance_count
+                ),
+                "reuse_status_reason": reuse_status_reason,
+            },
         )
 
     def run_local_rollouts(
@@ -286,6 +447,9 @@ class LocalExplorer:
         temperature: float,
         action_candidate_count: int,
         recent_trajectory_context: str | None,
+        root_state_id: str,
+        local_world_model: LocalWorldModel | None,
+        best_known_score: int | None,
     ) -> LocalBranchOutcome:
         """Restore the base state and run one shallow local rollout."""
 
@@ -329,6 +493,19 @@ class LocalExplorer:
         )
         visited_states = [current_state]
         action_cluster_history = ActionClusterHistory(cluster_label=current_state.world_state_hash)
+        supported_try_actions, supported_avoid_actions, supported_objects = self.mar_reflector.guidance_from_local_world_model(
+            local_world_model
+        )
+        local_guidance_available = bool(supported_try_actions or supported_avoid_actions or supported_objects)
+        if local_guidance_available:
+            self.logger.info(
+                "Local branch %s using local guidance for root=%s try=%s avoid=%s objects=%s",
+                branch_index,
+                root_state_id,
+                supported_try_actions[:4],
+                supported_avoid_actions[:4],
+                supported_objects[:4],
+            )
         action_cluster_history.record_state_cluster(
             cluster_id=current_state.state_cluster_id or current_state.world_state_hash,
             observation=current_state.observation,
@@ -340,6 +517,7 @@ class LocalExplorer:
             inverse_pairs=self.action_generator.config.policy.inverse_action_pairs,
         )
         actions_taken: list[str] = []
+        trajectory_steps: list[TrajectoryStep] = []
         action_events: list[dict[str, object]] = []
         loop_results: list[LoopHeuristicResult] = []
         movement_results: list[MovementHeuristicResult] = []
@@ -360,6 +538,11 @@ class LocalExplorer:
         max_persistent_inventory_gain_count = 0
         max_persistent_affordance_gain = 0
         max_persistent_exit_gain_count = 0
+        action_generation_calls_with_local_guidance = 0
+        action_generation_calls_with_prompt_guidance = 0
+        action_generation_calls_with_reranker_guidance = 0
+        selected_actions_matching_local_try_guidance_count = 0
+        selected_actions_matching_local_avoid_guidance_count = 0
         termination_reason = BranchTerminationReason.HORIZON_REACHED
         terminated = False
 
@@ -376,7 +559,18 @@ class LocalExplorer:
                 recent_actions=actions_taken,
                 recent_loop_results=loop_results,
                 state_action_history=action_cluster_history,
+                supported_try_actions=supported_try_actions,
+                supported_avoid_actions=supported_avoid_actions,
+                supported_reflection_objects=supported_objects,
+                root_state_id=root_state_id,
+                local_world_model=local_world_model,
             )
+            action_generation_metadata = (
+                dict(self.action_generator.last_result.metadata)
+                if self.action_generator.last_result is not None
+                else {}
+            )
+            action_generation_result = self.action_generator.last_result
             if not proposals:
                 termination_reason = BranchTerminationReason.NO_ACTIONS
                 break
@@ -386,6 +580,29 @@ class LocalExplorer:
                 branch_index=branch_index,
                 step_offset=step_offset,
             )
+            if bool(action_generation_metadata.get("local_guidance_attached_to_policy_input", False)):
+                action_generation_calls_with_local_guidance += 1
+            if bool(action_generation_metadata.get("local_guidance_attached_to_prompt", False)):
+                action_generation_calls_with_prompt_guidance += 1
+            if bool(action_generation_metadata.get("local_guidance_consumed_by_reranker", False)):
+                action_generation_calls_with_reranker_guidance += 1
+            normalized_action = self._normalize_text(action)
+            normalized_local_try_actions = {
+                self._normalize_text(item)
+                for item in action_generation_metadata.get("local_model_try_actions", [])
+                if isinstance(item, str)
+            }
+            normalized_local_avoid_actions = {
+                self._normalize_text(item)
+                for item in action_generation_metadata.get("local_model_avoid_actions", [])
+                if isinstance(item, str)
+            }
+            selected_action_matches_local_try_guidance = normalized_action in normalized_local_try_actions
+            selected_action_matches_local_avoid_guidance = normalized_action in normalized_local_avoid_actions
+            if selected_action_matches_local_try_guidance:
+                selected_actions_matching_local_try_guidance_count += 1
+            if selected_action_matches_local_avoid_guidance:
+                selected_actions_matching_local_avoid_guidance_count += 1
             pre_step_actions = list(actions_taken)
             pre_step_states = list(visited_states)
             gain_already_established = first_durable_gain_action_index is not None
@@ -567,6 +784,16 @@ class LocalExplorer:
             )
             movement_results.append(movement_result)
             movement_penalty_total += movement_result.total_penalty
+            step_room_text_only_gain = self._room_text_only_gain(
+                base_state=pre_step_states[-1],
+                final_state=current_state,
+                score_change=current_state.score - pre_step_states[-1].score,
+                inventory_changed=self._normalize_text(current_state.inventory_text)
+                != self._normalize_text(pre_step_states[-1].inventory_text),
+                affordance_gain=affordance_gain,
+                novel_object_count=len(novel_object_tokens) if revealed_new_object else 0,
+                landmark_gain=0,
+            )
             meaningful_progress_this_step = self._action_is_meaningful_branch_progress(
                 action=action,
                 movement_only_action=movement_only_action,
@@ -633,7 +860,111 @@ class LocalExplorer:
                     "state_cluster_id": current_state.state_cluster_id,
                     "durable_progress": durable_progress_this_step,
                     "meaningful_progress": meaningful_progress_this_step,
+                    "had_local_guidance": bool(
+                        action_generation_metadata.get("local_guidance_attached_to_policy_input", False)
+                    ),
+                    "guidance_attached_to_prompt": bool(
+                        action_generation_metadata.get("local_guidance_attached_to_prompt", False)
+                    ),
+                    "guidance_consumed_by_reranker": bool(
+                        action_generation_metadata.get("local_guidance_consumed_by_reranker", False)
+                    ),
+                    "selected_action_matches_local_try_guidance": (
+                        selected_action_matches_local_try_guidance
+                    ),
+                    "selected_action_matches_local_avoid_guidance": (
+                        selected_action_matches_local_avoid_guidance
+                    ),
+                    "local_model_try_actions": list(
+                        action_generation_metadata.get("local_model_try_actions", [])
+                    )[:4],
+                    "local_model_avoid_actions": list(
+                        action_generation_metadata.get("local_model_avoid_actions", [])
+                    )[:4],
+                    "local_model_objects": list(
+                        action_generation_metadata.get("local_model_objects", [])
+                    )[:4],
+                    "candidate_pool_before_rerank": (
+                        list(action_generation_result.candidate_pool_before_rerank[:6])
+                        if action_generation_result is not None
+                        else []
+                    ),
+                    "reranked_candidates": (
+                        list(action_generation_result.top_actions()[:6])
+                        if action_generation_result is not None
+                        else []
+                    ),
+                    "llm_ranked_actions": (
+                        list(action_generation_result.llm_ranked_actions[:6])
+                        if action_generation_result is not None
+                        else []
+                    ),
+                    "ranking_source": (
+                        action_generation_result.ranking_source
+                        if action_generation_result is not None
+                        else ""
+                    ),
+                    "top_selection_reason": (
+                        action_generation_result.top_selection_reason
+                        if action_generation_result is not None
+                        else ""
+                    ),
+                    "strategic_mode": (
+                        action_generation_result.strategic_mode
+                        if action_generation_result is not None
+                        else ""
+                    ),
+                    "strategic_reason": (
+                        action_generation_result.strategic_reason
+                        if action_generation_result is not None
+                        else ""
+                    ),
+                    "local_world_model_hint_count": int(
+                        action_generation_metadata.get("local_world_model_hint_count", 0)
+                    ),
+                    "local_world_model_prior_count": int(
+                        action_generation_metadata.get("local_world_model_prior_count", 0)
+                    ),
+                    "local_world_model_antiprior_count": int(
+                        action_generation_metadata.get("local_world_model_antiprior_count", 0)
+                    ),
+                    "local_world_model_no_achievement_revisit_streak": int(
+                        action_generation_metadata.get("local_world_model_no_achievement_revisit_streak", 0)
+                    ),
+                    "local_world_model_nonproductive_revisit_streak": int(
+                        action_generation_metadata.get("local_world_model_nonproductive_revisit_streak", 0)
+                    ),
+                    "local_world_model_try_guidance_suppressed": bool(
+                        action_generation_metadata.get("local_world_model_try_guidance_suppressed", False)
+                    ),
                 }
+            )
+            trajectory_steps.append(
+                transition.to_trajectory_step(
+                    episode_id=f"local-branch-{branch_index}",
+                    step_index_override=step_offset,
+                    loop_result=loop_result,
+                    cumulative_reward=total_reward,
+                    metadata={
+                        "restore_mode": restore_result.restore_mode.value,
+                        "branch_index": branch_index,
+                        "root_state_id": root_state_id,
+                        "movement_only_action": movement_result.movement_only_action,
+                        "movement_repeat_count": movement_result.movement_repeat_count,
+                        "movement_penalty": movement_result.total_penalty,
+                        "state_cluster_id": current_state.state_cluster_id,
+                        "cluster_visit_count": current_state.cluster_visit_count,
+                        "region_novelty_score": current_state.region_novelty_score,
+                        "room_text_only_gain": step_room_text_only_gain,
+                        "affordance_gain": affordance_gain,
+                        "persistent_affordance_gain": persistent_affordance_gain,
+                        "persistent_exit_gain_count": persistent_exit_gain,
+                        "inventory_gained": persistent_inventory_gained_vs_base,
+                        "inventory_lost": persistent_inventory_lost_vs_base,
+                        "revealed_new_object": persistent_revealed_new_object,
+                    },
+                    native_snapshot_reference=current_state.world_state_hash,
+                )
             )
             if (
                 first_durable_gain_action_index is None
@@ -758,6 +1089,8 @@ class LocalExplorer:
         loop_penalty_reduction = self._loop_penalty_reduction(loop_results)
         branch_progress_score = self._branch_progress_score(
             score_change=score_change,
+            final_score=current_state.score,
+            best_known_score=best_known_score,
             persistent_inventory_gain_count=persistent_inventory_gain_count,
             persistent_inventory_loss_count=persistent_inventory_loss_count,
             persistent_affordance_gain=new_affordance_count,
@@ -769,10 +1102,27 @@ class LocalExplorer:
             oscillation_penalty_total=oscillation_penalty_total,
             movement_penalty_total=movement_penalty_total,
         )
+        repeated_score_replay = (
+            score_change > 0
+            and best_known_score is not None
+            and current_state.score <= int(best_known_score)
+        )
+        exploratory_location_progress = self._branch_has_exploratory_location_progress(
+            score_change=score_change,
+            persistent_inventory_gain_count=persistent_inventory_gain_count,
+            persistent_inventory_loss_count=persistent_inventory_loss_count,
+            persistent_exit_gain_count=persistent_exit_gain_count,
+            new_room_location_signal=new_room_location_signal,
+            landmark_gain=landmark_gain,
+            ended_in_same_cluster=ended_in_same_cluster,
+        )
+        if exploratory_location_progress:
+            branch_progress_score += self.action_generator.config.policy.branch_progress_location_weight
         commit_anchor = self._branch_has_commit_anchor(
             score_change=score_change,
             persistent_inventory_gain_count=persistent_inventory_gain_count,
             persistent_inventory_loss_count=persistent_inventory_loss_count,
+            exploratory_location_progress=exploratory_location_progress,
         )
         low_value_movement_branch = self._is_low_value_movement_branch(
             score_change=score_change,
@@ -799,6 +1149,18 @@ class LocalExplorer:
             post_gain_churn_action_count=post_gain_churn_action_count,
         )
         branch_progress_score -= inventory_churn_penalty
+        repeated_known_local_affordance = self._is_repeated_known_local_affordance_branch(
+            local_world_model=local_world_model,
+            actions_taken=actions_taken,
+            action_events=action_events,
+            score_change=score_change,
+            exploratory_location_progress=exploratory_location_progress,
+        )
+        if repeated_known_local_affordance:
+            branch_progress_score = min(
+                branch_progress_score,
+                self.action_generator.config.policy.movement_progress_cap,
+            )
         if (
             exhausted_family_count > 0
             and not durable_progress
@@ -874,6 +1236,10 @@ class LocalExplorer:
             notable_changes.append("local object churn without durable gain")
         if inventory_churn_penalty > 0.0:
             notable_changes.append(f"inventory churn penalty {inventory_churn_penalty:.2f}")
+        if repeated_known_local_affordance:
+            notable_changes.append("repeated known local affordance replay")
+        if exploratory_location_progress:
+            notable_changes.append("exploratory location progress")
         if inventory_changed:
             notable_changes.append("inventory changed")
         if new_affordance_count > 0:
@@ -884,6 +1250,8 @@ class LocalExplorer:
             notable_changes.append(f"room text only gain {room_text_only_gain:.2f}")
         if branch_progress_score > 0.0:
             notable_changes.append(f"progress score {branch_progress_score:.2f}")
+        if repeated_score_replay:
+            notable_changes.append("repeated score replay")
 
         self.logger.info(
             "Local branch %s finished: actions=%s score_change=%s reward=%.2f terminated=%s stuck=%s "
@@ -950,6 +1318,7 @@ class LocalExplorer:
             last_meaningful_progress_action_index=last_meaningful_progress_action_index,
             last_meaningful_progress_action=last_meaningful_progress_action,
             notable_observation_changes=notable_changes,
+            trajectory_steps=trajectory_steps,
             final_state=current_state,
             restore_result=restore_result,
             metadata={
@@ -965,6 +1334,45 @@ class LocalExplorer:
                 "aggressive_action_count": aggressive_action_count,
                 "speculative_tool_use_action_count": speculative_tool_use_action_count,
                 "post_gain_churn_action_count": post_gain_churn_action_count,
+                "had_local_guidance": (
+                    local_guidance_available or action_generation_calls_with_local_guidance > 0
+                ),
+                "guidance_attached_to_policy_input": action_generation_calls_with_local_guidance > 0,
+                "guidance_attached_to_prompt": action_generation_calls_with_prompt_guidance > 0,
+                "guidance_consumed_by_reranker": action_generation_calls_with_reranker_guidance > 0,
+                "action_generation_calls_with_local_guidance": action_generation_calls_with_local_guidance,
+                "action_generation_calls_with_prompt_guidance": action_generation_calls_with_prompt_guidance,
+                "action_generation_calls_with_reranker_guidance": (
+                    action_generation_calls_with_reranker_guidance
+                ),
+                "selected_actions_matching_local_try_guidance_count": (
+                    selected_actions_matching_local_try_guidance_count
+                ),
+                "selected_actions_matching_local_avoid_guidance_count": (
+                    selected_actions_matching_local_avoid_guidance_count
+                ),
+                "local_model_try_actions": list(supported_try_actions),
+                "local_model_avoid_actions": list(supported_avoid_actions),
+                "local_model_objects": list(supported_objects),
+                "local_world_model_hint_count": (
+                    len(local_world_model.accumulated_advantage_hints)
+                    if local_world_model is not None
+                    else 0
+                ),
+                "local_world_model_prior_count": (
+                    len(local_world_model.action_priors)
+                    if local_world_model is not None
+                    else 0
+                ),
+                "local_world_model_antiprior_count": (
+                    len(local_world_model.action_antipriors)
+                    if local_world_model is not None
+                    else 0
+                ),
+                "repeated_score_replay": repeated_score_replay,
+                "best_known_score_before_branch": int(best_known_score) if best_known_score is not None else None,
+                "exploratory_location_progress": exploratory_location_progress,
+                "repeated_known_local_affordance": repeated_known_local_affordance,
             },
         )
 
@@ -1027,6 +1435,17 @@ class LocalExplorer:
             summary_text=str(state.metadata.get("summary_text", "")),
             metadata=dict(state.metadata),
         )
+
+    def _root_state_id(self, state: TextGameState, saved_node: SavedNode | None) -> str:
+        """Return the stable root-state id used for MAR/local-world-model storage."""
+
+        if saved_node is not None and saved_node.state_id.strip():
+            return saved_node.state_id
+        if state.world_state_snapshot is not None and state.world_state_snapshot.world_state_hash != "unknown":
+            return f"local-root:{state.world_state_snapshot.world_state_hash}"
+        if state.world_state_hash != "unknown":
+            return f"local-root:{state.world_state_hash}"
+        return f"local-root:{state.state_cluster_id or 'unknown'}"
 
     def _choose_branch_action(
         self,
@@ -1162,6 +1581,7 @@ class LocalExplorer:
         score_change: int,
         persistent_inventory_gain_count: int,
         persistent_inventory_loss_count: int,
+        exploratory_location_progress: bool,
     ) -> bool:
         """Return whether a branch ended with a durable outcome strong enough to score."""
 
@@ -1169,8 +1589,72 @@ class LocalExplorer:
             (
                 score_change > 0,
                 persistent_inventory_gain_count > 0 and persistent_inventory_loss_count <= 0,
+                exploratory_location_progress,
             )
         )
+
+    def _branch_has_exploratory_location_progress(
+        self,
+        *,
+        score_change: int,
+        persistent_inventory_gain_count: int,
+        persistent_inventory_loss_count: int,
+        persistent_exit_gain_count: int,
+        new_room_location_signal: bool,
+        landmark_gain: int,
+        ended_in_same_cluster: bool,
+    ) -> bool:
+        """Return whether a zero-score branch still made a meaningful outward location move."""
+
+        return (
+            score_change <= 0
+            and persistent_inventory_gain_count <= 0
+            and persistent_inventory_loss_count <= 0
+            and not ended_in_same_cluster
+            and new_room_location_signal
+            and (persistent_exit_gain_count > 0 or landmark_gain > 0)
+        )
+
+    def _is_repeated_known_local_affordance_branch(
+        self,
+        *,
+        local_world_model: LocalWorldModel | None,
+        actions_taken: list[str],
+        action_events: list[dict[str, object]],
+        score_change: int,
+        exploratory_location_progress: bool,
+    ) -> bool:
+        """Return whether a branch is replaying a locally known affordance loop."""
+
+        if (
+            local_world_model is None
+            or not actions_taken
+            or score_change > 0
+            or exploratory_location_progress
+        ):
+            return False
+        known_try_actions = {
+            self._normalize_text(record.action)
+            for record in local_world_model.action_priors
+            if self._normalize_text(record.action)
+        }
+        known_object_hints = {
+            self._normalize_text(record.object_text)
+            for record in local_world_model.inferred_affordances
+            if self._normalize_text(record.object_text)
+        }
+        if not known_try_actions or not known_object_hints:
+            return False
+        matched_try_guidance = any(
+            bool(event.get("selected_action_matches_local_try_guidance", False))
+            for event in action_events
+        )
+        matched_known_object = any(
+            action_target_tokens(action, self.action_generator.config.policy.inverse_action_pairs)
+            & known_object_hints
+            for action in actions_taken
+        )
+        return matched_try_guidance and matched_known_object
 
     def _branch_has_durable_progress(
         self,
@@ -1216,6 +1700,11 @@ class LocalExplorer:
                 False,
                 f"best branch progress_score {branch.branch_progress_score:.2f} did not clear threshold {threshold:.2f}",
             )
+
+        if bool(branch.metadata.get("exploratory_location_progress", False)):
+            if branch.appears_stuck:
+                return False, "best branch reached a new location but still appeared stuck"
+            return True, ""
 
         if self._branch_is_movement_commit_reject(branch):
             return (
@@ -1350,6 +1839,8 @@ class LocalExplorer:
         self,
         *,
         score_change: int,
+        final_score: int,
+        best_known_score: int | None,
         persistent_inventory_gain_count: int,
         persistent_inventory_loss_count: int,
         persistent_affordance_gain: int,
@@ -1364,8 +1855,11 @@ class LocalExplorer:
         """Score one branch using explicit weighted progress signals."""
 
         policy = self.action_generator.config.policy
+        score_contribution = max(float(score_change), 0.0) * policy.branch_progress_score_weight
+        if best_known_score is not None and score_change > 0 and int(final_score) <= int(best_known_score):
+            score_contribution = 0.0
         return (
-            max(float(score_change), 0.0) * policy.branch_progress_score_weight
+            score_contribution
             + float(persistent_inventory_gain_count) * policy.branch_progress_inventory_weight
             + float(persistent_affordance_gain) * policy.branch_progress_affordance_weight
             + float(persistent_exit_gain_count) * policy.branch_progress_exit_weight

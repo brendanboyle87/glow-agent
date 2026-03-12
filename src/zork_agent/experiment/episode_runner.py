@@ -1050,6 +1050,7 @@ class EpisodeRunner:
                         max(1, remaining_steps // effective_branch_count),
                     ),
                 )
+                best_known_score_before_cycle = best_trajectory.final_score if best_trajectory is not None else 0
                 local_result = self.local_explorer.explore_from_state(
                     restore_result.final_state,
                     env=self.env,
@@ -1058,6 +1059,7 @@ class EpisodeRunner:
                     temperature=self.config.llm.temperature,
                     action_candidate_count=self.config.policy.action_candidates,
                     recent_trajectory_context=selection_result.rationale,
+                    best_known_score=best_known_score_before_cycle,
                 )
                 local_result_metadata = dict(local_result.metadata)
                 root_exploration_counts[local_result.root_state_id] += 1
@@ -1213,6 +1215,9 @@ class EpisodeRunner:
                                 ),
                                 "exploratory_location_progress": bool(
                                     branch.metadata.get("exploratory_location_progress", False)
+                                ),
+                                "repeated_score_replay": bool(
+                                    branch.metadata.get("repeated_score_replay", False)
                                 ),
                                 "repeated_known_local_affordance": bool(
                                     branch.metadata.get("repeated_known_local_affordance", False)
