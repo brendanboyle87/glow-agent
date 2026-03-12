@@ -1,4 +1,4 @@
-"""Single-episode orchestration for the scaffold.
+"""Single-episode orchestration for the GLoW implementation.
 
 This runner is intentionally explicit. It mixes a deterministic heuristic frontier
 with optional LLM-mediated action generation, state selection, and reflection, but
@@ -12,26 +12,46 @@ from __future__ import annotations
 from collections import Counter
 import json
 import logging
+from pathlib import Path
 
 from zork_agent.config import ProjectConfig
 from zork_agent.env.jericho_env import JerichoEnv
 from zork_agent.env.replay import restore_saved_node
 from zork_agent.llm.base import BaseLLMClient
 from zork_agent.llm.prompts import PromptManager
-from zork_agent.memory.frontier import FrontierEntry, FrontierQueue, FrontierScoringConfig
+from zork_agent.memory.archive_store import ArchiveStore
+from zork_agent.memory.archive_updater import ArchiveUpdater
+from zork_agent.memory.frontier import (
+    FrontierEntry,
+    FrontierQueue,
+    FrontierScoringConfig,
+    TrajectoryFrontier,
+    TrajectoryFrontierConfig,
+)
 from zork_agent.memory.trajectory_store import TrajectoryStore
 from zork_agent.policy.action_generator import ActionGenerator
+from zork_agent.policy.frontier_analyzer import FrontierAnalyzer
 from zork_agent.policy.local_explorer import LocalExplorer
 from zork_agent.policy.reflection import ReflectionPolicy
 from zork_agent.policy.state_selector import StateSelector
 from zork_agent.types import (
     ActionClusterHistory,
+    ArchiveStateSelectionResult,
+    ArchivedState,
     EpisodeMapMemory,
+    GlowEpisodeMetrics,
+    GlowSelectionDecisionMetric,
     EpisodeResult,
+    EpisodeTrajectory,
+    FrontierAnalysisResult,
     LocalBranchOutcome,
+    LocalExplorationResult,
     LoopHeuristicResult,
     MovementHeuristicResult,
+    ReplayMetadata,
     ReflectionGuidance,
+    RunnerMode,
+    SavedNode,
     StrategicGuidance,
     StrategicMode,
     StateSelectionResult,
@@ -66,8 +86,11 @@ class EpisodeRunner:
         self.llm_client = llm_client
         self.env = JerichoEnv(config)
         self.trajectory_store = TrajectoryStore(config.paths.trajectory_dir)
+        self.archive_store = ArchiveStore(config.paths.archive_dir)
+        self.archive_updater = ArchiveUpdater(self.trajectory_store.summary_builder)
         self.summary_builder = self.trajectory_store.summary_builder
         self.frontier = self._build_frontier()
+        self.trajectory_frontier = self._build_trajectory_frontier()
         self.action_generator = ActionGenerator(config, self.prompt_manager, llm_client)
         self.state_selector = StateSelector(
             config=config,
@@ -81,9 +104,35 @@ class EpisodeRunner:
             env=self.env,
             logger=self.logger,
         )
+        self.frontier_analyzer = FrontierAnalyzer(
+            config=config,
+            prompt_manager=self.prompt_manager,
+            llm_client=llm_client,
+            logger=self.logger,
+        )
         self.reflection = ReflectionPolicy(config, self.prompt_manager, llm_client)
 
     def run_episode(
+        self,
+        episode_index: int = 0,
+        episode_id: str | None = None,
+        episode_seed: int | None = None,
+    ) -> EpisodeResult:
+        """Run one episode using the configured legacy or GLoW-style control loop."""
+
+        if self.config.experiment.runner_mode is RunnerMode.GLOW_FAITHFUL:
+            return self._run_glow_episode(
+                episode_index=episode_index,
+                episode_id=episode_id,
+                episode_seed=episode_seed,
+            )
+        return self._run_legacy_episode(
+            episode_index=episode_index,
+            episode_id=episode_id,
+            episode_seed=episode_seed,
+        )
+
+    def _run_legacy_episode(
         self,
         episode_index: int = 0,
         episode_id: str | None = None,
@@ -812,6 +861,1155 @@ class EpisodeRunner:
             metadata=episode_metadata,
         )
 
+    def _run_glow_episode(
+        self,
+        episode_index: int = 0,
+        episode_id: str | None = None,
+        episode_seed: int | None = None,
+    ) -> EpisodeResult:
+        """Run one episode using an explicit GLoW-style global/local control loop."""
+
+        resolved_seed = episode_seed if episode_seed is not None else self.config.experiment.seed + episode_index
+        set_global_seed(resolved_seed)
+        generated_episode_id = episode_id or f"{self.config.experiment.game_id}-episode-{episode_index:03d}"
+        self.trajectory_frontier = self._build_trajectory_frontier()
+
+        cycle_count = 0
+        total_rollout_steps = 0
+        archive_by_state_id: dict[str, ArchivedState] = {}
+        loaded_archive_snapshot_path = ""
+        loaded_archive_state_count = 0
+        loaded_archive_prior_run_state_count = 0
+        archive_snapshot_path = ""
+        frontier_analysis_result: FrontierAnalysisResult | None = None
+        selection_artifact_directories: list[str] = []
+        frontier_analysis_artifact_directories: list[str] = []
+        mar_artifact_directories: list[str] = []
+        local_world_model_snapshot_paths: list[str] = []
+        frontier_size_over_time: list[int] = []
+        frontier_root_diversity_over_time: list[int] = []
+        archive_state_count_over_time: list[int] = []
+        max_score_over_time: list[int] = []
+        score_milestones: list[dict[str, object]] = []
+        frontier_analysis_diagnostics: list[dict[str, object]] = []
+        frontier_analysis_count = 0
+        frontier_analysis_success_count = 0
+        frontier_analysis_fallback_count = 0
+        frontier_analysis_ids: list[str] = []
+        restore_attempt_count = 0
+        restore_success_count = 0
+        mar_update_count = 0
+        local_world_model_write_count = 0
+        local_world_model_read_count = 0
+        local_world_model_read_hit_count = 0
+        selected_state_decisions: list[GlowSelectionDecisionMetric] = []
+        branch_counts_per_root_state: Counter[str] = Counter()
+        root_exploration_counts: Counter[str] = Counter()
+        local_world_model_root_ids: set[str] = set()
+        reused_local_world_model_root_ids: set[str] = set()
+        local_world_model_reuse_count = 0
+        roots_with_prior_mar_update: set[str] = set()
+        revisited_roots_after_mar_update: set[str] = set()
+        same_root_revisit_after_mar_update_count = 0
+        local_guidance_attached_branch_count = 0
+        local_guidance_prompt_attachment_count = 0
+        local_guidance_action_generation_count = 0
+        local_guidance_action_generation_prompt_count = 0
+        local_guidance_selected_action_match_count = 0
+        mar_reuse_status_reason_counts: Counter[str] = Counter()
+        selected_root_ids_over_time: list[str] = []
+        selected_root_observation_summaries: dict[str, str] = {}
+        selected_root_details: dict[str, dict[str, object]] = {}
+        selected_region_counts: Counter[str] = Counter()
+        branch_action_counts: Counter[str] = Counter()
+        committed_action_counts: Counter[str] = Counter()
+        committed_root_counts: Counter[str] = Counter()
+        action_target_token_counts: Counter[str] = Counter()
+        winning_branch_signature_counts: Counter[str] = Counter()
+        unique_first_actions_per_root: dict[str, set[str]] = {}
+        commit_allowed_count = 0
+        committed_branch_positive_progress_count = 0
+        committed_branch_score_gain_count = 0
+        shadow_commit_threshold = 0.5
+        shadow_threshold_would_commit_count = 0
+        threshold_blocked_exploratory_best_branch_count = 0
+        branch_cycle_diagnostics: list[dict[str, object]] = []
+        last_score_improvement_cycle = 0
+        last_new_root_cycle = 0
+        best_trajectory: EpisodeTrajectory | None = None
+        initial_archived_state: ArchivedState | None = None
+
+        try:
+            (
+                archive_by_state_id,
+                loaded_archive_snapshot_path,
+                loaded_archive_state_count,
+                loaded_archive_prior_run_state_count,
+            ) = self._load_persisted_archive(generated_episode_id)
+            if loaded_archive_state_count > 0:
+                self.logger.info(
+                    "Loaded %s archived states from %s (%s first seen in prior runs).",
+                    loaded_archive_state_count,
+                    loaded_archive_snapshot_path,
+                    loaded_archive_prior_run_state_count,
+                )
+            initial_state = self.env.reset(seed=resolved_seed)
+            initial_archived_state = self.archive_updater.archived_state_for_live_state(
+                state=initial_state,
+                episode_id=generated_episode_id,
+                provenance_trajectory_id=f"{generated_episode_id}-root",
+                provenance_timestep=0,
+            )
+            archive_by_state_id = self.archive_updater.upsert_archived_state(
+                archive_by_state_id,
+                initial_archived_state,
+            )
+            archive_snapshot_path = str(
+                self.archive_store.write_states(
+                    generated_episode_id,
+                    self.archive_updater.sorted_states(archive_by_state_id),
+                )
+            )
+
+            while total_rollout_steps < self.config.experiment.max_steps:
+                cycle_count += 1
+                frontier_size_before = len(self.trajectory_frontier)
+                frontier_size_over_time.append(frontier_size_before)
+                archive_states = self.archive_updater.sorted_states(archive_by_state_id)
+                selection_result = self.state_selector.select_archive_state(
+                    archive_states=archive_states,
+                    frontier_insight=frontier_analysis_result.insight if frontier_analysis_result is not None else None,
+                    trajectory_frontier=self.trajectory_frontier,
+                    mode=self.config.policy.archive_state_selection_mode,
+                    selection_id=f"{generated_episode_id}-selection-{cycle_count:03d}",
+                )
+                if selection_result.artifact_directory:
+                    selection_artifact_directories.append(selection_result.artifact_directory)
+                selected_archived_state = selection_result.selected_archived_state
+                if selected_archived_state is None:
+                    self.logger.info(
+                        "GLoW runner ended for %s because no archived state was available for selection.",
+                        generated_episode_id,
+                    )
+                    break
+
+                tracked_selected_state = archive_by_state_id.setdefault(
+                    selected_archived_state.state_id,
+                    selected_archived_state,
+                )
+                self.archive_updater.note_selection(tracked_selected_state)
+                restore_attempt_count += 1
+                restore_result = self._restore_archived_state(selected_archived_state)
+                if not restore_result.success:
+                    self.logger.warning(
+                        "GLoW runner could not restore archived state %s: %s",
+                        selected_archived_state.state_id,
+                        restore_result.message,
+                    )
+                    selected_state_decisions.append(
+                        GlowSelectionDecisionMetric(
+                            cycle_index=cycle_count,
+                            selected_state_id=selected_archived_state.state_id,
+                            root_state_id=selected_archived_state.state_id,
+                            replay_method=selection_result.chosen_replay_method,
+                            achieved_contribution=selection_result.achieved_contribution,
+                            potential_contribution=selection_result.potential_contribution,
+                            rationale=selection_result.rationale,
+                            frontier_size_before=frontier_size_before,
+                            frontier_size_after=len(self.trajectory_frontier),
+                            branch_count=0,
+                            restore_succeeded=False,
+                            used_llm_adjudication=selection_result.selection_mode.value == "llm_assisted",
+                            selected_frontier_trajectory_ids=list(selection_result.selected_frontier_trajectory_ids),
+                            selected_critical_state_ids=list(selection_result.selected_critical_state_ids),
+                            metadata={"selection_artifact_directory": selection_result.artifact_directory},
+                        )
+                    )
+                    self.archive_updater.note_restore_result(tracked_selected_state, success=False)
+                    if cycle_count >= self.config.experiment.max_replay_attempts + 1:
+                        break
+                    continue
+                restore_success_count += 1
+                self.archive_updater.note_restore_result(tracked_selected_state, success=True)
+                self.logger.info(
+                    "Restored archived state %s first_seen=%s via %s.",
+                    selected_archived_state.state_id,
+                    selected_archived_state.first_seen_episode_id or "unknown",
+                    restore_result.restore_mode.value,
+                )
+
+                remaining_steps = max(1, self.config.experiment.max_steps - total_rollout_steps)
+                effective_branch_count = max(
+                    1,
+                    min(self.config.experiment.glow_local_branches_per_root, remaining_steps),
+                )
+                effective_branch_horizon = max(
+                    1,
+                    min(
+                        self.config.policy.rollout_depth,
+                        max(1, remaining_steps // effective_branch_count),
+                    ),
+                )
+                local_result = self.local_explorer.explore_from_state(
+                    restore_result.final_state,
+                    env=self.env,
+                    branch_count=effective_branch_count,
+                    branch_horizon=effective_branch_horizon,
+                    temperature=self.config.llm.temperature,
+                    action_candidate_count=self.config.policy.action_candidates,
+                    recent_trajectory_context=selection_result.rationale,
+                )
+                local_result_metadata = dict(local_result.metadata)
+                root_exploration_counts[local_result.root_state_id] += 1
+                selected_root_ids_over_time.append(local_result.root_state_id)
+                root_summary = self._archived_state_summary(selected_archived_state)
+                root_region_label = self._coarse_region_label(
+                    summary=root_summary,
+                    state_cluster_id=selected_archived_state.state_cluster_id,
+                )
+                if root_summary:
+                    selected_root_observation_summaries.setdefault(local_result.root_state_id, root_summary)
+                selected_region_counts[root_region_label] += 1
+                selected_root_details.setdefault(
+                    local_result.root_state_id,
+                    {
+                        "state_id": local_result.root_state_id,
+                        "summary": root_summary,
+                        "region_label": root_region_label,
+                        "first_seen_episode_id": selected_archived_state.first_seen_episode_id or "",
+                        "provenance_trajectory_id": selected_archived_state.provenance_trajectory_id,
+                    },
+                )
+                selected_root_details[local_result.root_state_id]["selection_count"] = root_exploration_counts[
+                    local_result.root_state_id
+                ]
+                if root_exploration_counts[local_result.root_state_id] == 1:
+                    last_new_root_cycle = cycle_count
+                if local_result.root_state_id in roots_with_prior_mar_update:
+                    same_root_revisit_after_mar_update_count += 1
+                    revisited_roots_after_mar_update.add(local_result.root_state_id)
+                    self.logger.info(
+                        "Revisited root %s after prior MAR update; reuse_status=%s",
+                        local_result.root_state_id,
+                        local_result_metadata.get("reuse_status_reason", "unknown"),
+                    )
+                if bool(local_result_metadata.get("local_world_model_read_attempted", False)):
+                    local_world_model_read_count += 1
+                if bool(local_result_metadata.get("local_world_model_read_hit", False)):
+                    local_world_model_read_hit_count += 1
+                if local_result.used_local_world_model is not None:
+                    local_world_model_reuse_count += 1
+                    reused_local_world_model_root_ids.add(local_result.root_state_id)
+                local_guidance_attached_branch_count += int(
+                    local_result_metadata.get("branches_with_local_guidance_count", 0)
+                )
+                local_guidance_prompt_attachment_count += int(
+                    local_result_metadata.get("branches_with_prompt_guidance_count", 0)
+                )
+                local_guidance_action_generation_count += int(
+                    local_result_metadata.get("action_generation_calls_with_local_guidance_count", 0)
+                )
+                local_guidance_action_generation_prompt_count += int(
+                    local_result_metadata.get("action_generation_calls_with_prompt_guidance_count", 0)
+                )
+                local_guidance_selected_action_match_count += int(
+                    local_result_metadata.get("selected_actions_matching_local_try_guidance_count", 0)
+                )
+                reuse_status_reason = str(local_result_metadata.get("reuse_status_reason", "")).strip()
+                if reuse_status_reason:
+                    mar_reuse_status_reason_counts[reuse_status_reason] += 1
+                branch_counts_per_root_state[local_result.root_state_id] += len(local_result.branches)
+                for branch in local_result.branches:
+                    branch_action_counts.update(action for action in branch.actions_taken if action.strip())
+                    action_target_token_counts.update(
+                        token
+                        for action in branch.actions_taken
+                        for token in action_target_tokens(
+                            action,
+                            self.config.policy.inverse_action_pairs,
+                        )
+                    )
+                    if branch.actions_taken:
+                        unique_first_actions_per_root.setdefault(local_result.root_state_id, set()).add(
+                            branch.actions_taken[0]
+                        )
+                best_branch = local_result.best_branch
+                if local_result.branch_commit_allowed and best_branch is not None:
+                    commit_allowed_count += 1
+                    committed_root_counts[local_result.root_state_id] += 1
+                    committed_action_counts.update(action for action in best_branch.actions_taken if action.strip())
+                    winning_branch_signature_counts[" -> ".join(best_branch.actions_taken)] += 1
+                    if best_branch.branch_progress_score > 0.0:
+                        committed_branch_positive_progress_count += 1
+                    if best_branch.score_change > 0:
+                        committed_branch_score_gain_count += 1
+                threshold_blocker = (
+                    best_branch is not None
+                    and not local_result.branch_commit_allowed
+                    and "threshold" in local_result.commit_rejection_reason.lower()
+                )
+                plausibly_exploratory_best_branch = (
+                    best_branch is not None
+                    and best_branch.score_change == 0
+                    and best_branch.branch_progress_score > 0.0
+                    and not best_branch.appears_stuck
+                )
+                if (
+                    best_branch is not None
+                    and not local_result.branch_commit_allowed
+                    and best_branch.branch_progress_score > shadow_commit_threshold
+                ):
+                    shadow_threshold_would_commit_count += 1
+                if threshold_blocker and plausibly_exploratory_best_branch:
+                    threshold_blocked_exploratory_best_branch_count += 1
+                branch_cycle_diagnostics.append(
+                    {
+                        "cycle_index": cycle_count,
+                        "root_state_id": local_result.root_state_id,
+                        "root_region_label": root_region_label,
+                        "root_summary": root_summary,
+                        "selected_archive_state_id": selected_archived_state.state_id,
+                        "first_seen_episode_id": selected_archived_state.first_seen_episode_id or "",
+                        "branch_commit_allowed": local_result.branch_commit_allowed,
+                        "commit_rejection_reason": local_result.commit_rejection_reason,
+                        "commit_threshold_blocker": threshold_blocker,
+                        "plausibly_exploratory_best_branch": plausibly_exploratory_best_branch,
+                        "best_branch_index": local_result.best_branch_index,
+                        "best_branch_progress_score": (
+                            best_branch.branch_progress_score if best_branch is not None else 0.0
+                        ),
+                        "best_branch_score_change": best_branch.score_change if best_branch is not None else 0,
+                        "best_branch_actions": list(best_branch.actions_taken) if best_branch is not None else [],
+                        "best_branch_region_label": (
+                            self._coarse_region_label(
+                                summary=best_branch.final_observation,
+                                state_cluster_id=(
+                                    best_branch.final_state.state_cluster_id
+                                    if best_branch.final_state is not None
+                                    else ""
+                                ),
+                            )
+                            if best_branch is not None
+                            else ""
+                        ),
+                        "branches": [
+                            {
+                                "branch_index": branch.branch_index,
+                                "actions": list(branch.actions_taken),
+                                "first_action": branch.actions_taken[0] if branch.actions_taken else "",
+                                "progress_score": branch.branch_progress_score,
+                                "score_change": branch.score_change,
+                                "final_score": branch.final_score,
+                                "appears_stuck": branch.appears_stuck,
+                                "terminated": branch.terminated,
+                                "termination_reason": branch.termination_reason.value,
+                                "region_label": self._coarse_region_label(
+                                    summary=branch.final_observation,
+                                    state_cluster_id=(
+                                        branch.final_state.state_cluster_id
+                                        if branch.final_state is not None
+                                        else ""
+                                    ),
+                                ),
+                                "exploratory_location_progress": bool(
+                                    branch.metadata.get("exploratory_location_progress", False)
+                                ),
+                                "repeated_known_local_affordance": bool(
+                                    branch.metadata.get("repeated_known_local_affordance", False)
+                                ),
+                                "action_events": list(branch.metadata.get("action_events", [])),
+                            }
+                            for branch in local_result.branches
+                        ],
+                    }
+                )
+                revisit_progress = self._classify_revisit_progress(local_result.branches)
+                self.archive_updater.note_revisit_progress(
+                    tracked_selected_state,
+                    achieved_progress=bool(revisit_progress["achieved_progress"]),
+                    exploratory_progress=bool(revisit_progress["exploratory_progress"]),
+                    branch_commit_allowed=local_result.branch_commit_allowed,
+                    best_branch_actions=best_branch.actions_taken if best_branch is not None else [],
+                )
+                local_world_model_for_decay = (
+                    local_result.updated_local_world_model or local_result.used_local_world_model
+                )
+                if local_world_model_for_decay is not None:
+                    local_world_model_for_decay.metadata.update(
+                        {
+                            "no_achievement_revisit_count": int(
+                                tracked_selected_state.metadata.get("no_achievement_revisit_count", 0)
+                            ),
+                            "no_achievement_revisit_streak": int(
+                                tracked_selected_state.metadata.get("no_achievement_revisit_streak", 0)
+                            ),
+                            "nonproductive_revisit_count": int(
+                                tracked_selected_state.metadata.get("nonproductive_revisit_count", 0)
+                            ),
+                            "nonproductive_revisit_streak": int(
+                                tracked_selected_state.metadata.get("nonproductive_revisit_streak", 0)
+                            ),
+                            "last_revisit_achieved_progress": bool(revisit_progress["achieved_progress"]),
+                            "last_revisit_score_progress": bool(revisit_progress["score_progress"]),
+                            "last_revisit_fresh_durable_progress": bool(
+                                revisit_progress["fresh_durable_progress"]
+                            ),
+                            "last_revisit_repeated_local_affordance_only_progress": bool(
+                                revisit_progress["repeated_local_affordance_only_progress"]
+                            ),
+                            "last_revisit_exploratory_progress": bool(revisit_progress["exploratory_progress"]),
+                            "last_revisit_branch_commit_allowed": local_result.branch_commit_allowed,
+                            "last_revisit_best_branch_actions": (
+                                list(best_branch.actions_taken) if best_branch is not None else []
+                            ),
+                        }
+                    )
+                    self.local_explorer.local_world_model_store.write(local_world_model_for_decay)
+                if local_result.mar_inference is not None and local_result.mar_inference.artifact_directory:
+                    mar_artifact_directories.append(local_result.mar_inference.artifact_directory)
+                    mar_update_count += 1
+                if local_result.updated_local_world_model is not None:
+                    local_world_model_write_count += 1
+                    local_world_model_root_ids.add(local_result.updated_local_world_model.root_state_id)
+                    roots_with_prior_mar_update.add(local_result.updated_local_world_model.root_state_id)
+                    local_world_model_snapshot_paths.append(
+                        str(
+                            self.local_explorer.local_world_model_store.model_path(
+                                local_result.updated_local_world_model.root_state_id
+                            )
+                        )
+                    )
+
+                branch_trajectories = self._build_glow_branch_trajectories(
+                    episode_id=generated_episode_id,
+                    cycle_index=cycle_count,
+                    selected_archived_state=selected_archived_state,
+                    local_result=local_result,
+                )
+                total_rollout_steps += sum(len(branch.actions_taken) for branch in local_result.branches)
+                if not branch_trajectories:
+                    self.logger.info(
+                        "GLoW runner ended for %s because local exploration produced no replayable branch trajectories.",
+                        generated_episode_id,
+                    )
+                    break
+
+                for trajectory in branch_trajectories:
+                    self.trajectory_frontier.insert(trajectory)
+                    best_trajectory = self._prefer_higher_value_trajectory(best_trajectory, trajectory)
+                archive_by_state_id = self.archive_updater.ingest_episode_trajectories(
+                    archive_by_state_id,
+                    branch_trajectories,
+                )
+                archive_by_state_id = self.archive_updater.refresh_achieved_values_from_frontier(
+                    archive_by_state_id,
+                    self.trajectory_frontier,
+                )
+                if self._should_run_glow_frontier_analysis(cycle_index=cycle_count):
+                    frontier_analysis_result = self.frontier_analyzer.analyze_frontier(
+                        self.trajectory_frontier,
+                        archive_states=self.archive_updater.sorted_states(archive_by_state_id),
+                        top_k=min(
+                            self.config.experiment.glow_frontier_size,
+                            max(1, len(self.trajectory_frontier)),
+                        ),
+                        analysis_id=f"{generated_episode_id}-analysis-{cycle_count:03d}",
+                    )
+                    if frontier_analysis_result.artifact_directory:
+                        frontier_analysis_artifact_directories.append(frontier_analysis_result.artifact_directory)
+                    frontier_analysis_count += 1
+                    if frontier_analysis_result.used_fallback:
+                        frontier_analysis_fallback_count += 1
+                    else:
+                        frontier_analysis_success_count += 1
+                    frontier_analysis_ids.append(frontier_analysis_result.analysis_id)
+                    frontier_analysis_diagnostics.append(
+                        self._frontier_analysis_diagnostic_record(
+                            frontier_analysis_result=frontier_analysis_result,
+                            archive_by_state_id=archive_by_state_id,
+                        )
+                    )
+                archive_by_state_id = self.archive_updater.apply_projected_potential_from_frontier_analysis(
+                    archive_by_state_id,
+                    frontier_analysis_result.insight if frontier_analysis_result is not None else None,
+                )
+                current_cycle_max_score = max(
+                    (
+                        trajectory.summary_fields.max_score
+                        for trajectory in branch_trajectories
+                    ),
+                    default=max_score_over_time[-1] if max_score_over_time else 0,
+                )
+                previous_cycle_max_score = max_score_over_time[-1] if max_score_over_time else 0
+                if current_cycle_max_score > previous_cycle_max_score:
+                    milestone_trajectory = max(
+                        branch_trajectories,
+                        key=lambda trajectory: trajectory.summary_fields.max_score,
+                    )
+                    score_milestones.append(
+                        {
+                            "cycle_index": cycle_count,
+                            "score": current_cycle_max_score,
+                            "trajectory_id": milestone_trajectory.trajectory_id,
+                            "root_state_id": milestone_trajectory.root_state_id,
+                        }
+                    )
+                    last_score_improvement_cycle = cycle_count
+                max_score_over_time.append(max(current_cycle_max_score, previous_cycle_max_score))
+                archive_state_count_over_time.append(len(archive_by_state_id))
+                frontier_root_diversity_over_time.append(self._frontier_root_diversity())
+                archive_snapshot_path = str(
+                    self.archive_store.write_states(
+                        generated_episode_id,
+                        self.archive_updater.sorted_states(archive_by_state_id),
+                    )
+                )
+
+                selected_state_decisions.append(
+                    GlowSelectionDecisionMetric(
+                        cycle_index=cycle_count,
+                        selected_state_id=selected_archived_state.state_id,
+                        root_state_id=local_result.root_state_id,
+                        replay_method=selection_result.chosen_replay_method,
+                        achieved_contribution=selection_result.achieved_contribution,
+                        potential_contribution=selection_result.potential_contribution,
+                        rationale=selection_result.rationale,
+                        frontier_size_before=frontier_size_before,
+                        frontier_size_after=len(self.trajectory_frontier),
+                        branch_count=len(local_result.branches),
+                        restore_succeeded=True,
+                        used_llm_adjudication=selection_result.selection_mode.value == "llm_assisted",
+                        selected_frontier_trajectory_ids=list(selection_result.selected_frontier_trajectory_ids),
+                        selected_critical_state_ids=list(selection_result.selected_critical_state_ids),
+                        metadata={
+                            "selection_artifact_directory": selection_result.artifact_directory,
+                            "mar_artifact_directory": (
+                                local_result.mar_inference.artifact_directory
+                                if local_result.mar_inference is not None
+                                else ""
+                            ),
+                            "frontier_analysis_id": (
+                                frontier_analysis_result.analysis_id
+                                if frontier_analysis_result is not None
+                                else ""
+                            ),
+                            "local_world_model_read_hit": bool(
+                                local_result_metadata.get("local_world_model_read_hit", False)
+                            ),
+                            "local_world_model_guidance_available": bool(
+                                local_result_metadata.get("local_world_model_guidance_available", False)
+                            ),
+                            "branches_with_local_guidance_count": int(
+                                local_result_metadata.get("branches_with_local_guidance_count", 0)
+                            ),
+                            "branches_with_prompt_guidance_count": int(
+                                local_result_metadata.get("branches_with_prompt_guidance_count", 0)
+                            ),
+                            "revisit_achieved_progress": bool(revisit_progress["achieved_progress"]),
+                            "revisit_score_progress": bool(revisit_progress["score_progress"]),
+                            "revisit_fresh_durable_progress": bool(
+                                revisit_progress["fresh_durable_progress"]
+                            ),
+                            "revisit_repeated_local_affordance_only_progress": bool(
+                                revisit_progress["repeated_local_affordance_only_progress"]
+                            ),
+                            "revisit_exploratory_progress": bool(revisit_progress["exploratory_progress"]),
+                            "root_no_achievement_revisit_streak": int(
+                                tracked_selected_state.metadata.get("no_achievement_revisit_streak", 0)
+                            ),
+                            "root_nonproductive_revisit_streak": int(
+                                tracked_selected_state.metadata.get("nonproductive_revisit_streak", 0)
+                            ),
+                            "action_generation_calls_with_local_guidance_count": int(
+                                local_result_metadata.get(
+                                    "action_generation_calls_with_local_guidance_count",
+                                    0,
+                                )
+                            ),
+                            "action_generation_calls_with_prompt_guidance_count": int(
+                                local_result_metadata.get(
+                                    "action_generation_calls_with_prompt_guidance_count",
+                                    0,
+                                )
+                            ),
+                            "selected_actions_matching_local_try_guidance_count": int(
+                                local_result_metadata.get(
+                                    "selected_actions_matching_local_try_guidance_count",
+                                    0,
+                                )
+                            ),
+                            "reuse_status_reason": reuse_status_reason,
+                            "branch_commit_allowed": local_result.branch_commit_allowed,
+                            "commit_rejection_reason": local_result.commit_rejection_reason,
+                            "best_branch_progress_score": local_result.best_branch_progress_score,
+                            "best_branch_actions": list(best_branch.actions_taken) if best_branch is not None else [],
+                        },
+                    )
+                )
+
+                if any(trajectory.final_done for trajectory in branch_trajectories):
+                    self.logger.info(
+                        "GLoW runner terminated early for %s after a completed branch trajectory.",
+                        generated_episode_id,
+                    )
+                    break
+
+        finally:
+            self.env.close()
+
+        if best_trajectory is None:
+            best_trajectory = EpisodeTrajectory(
+                episode_id=generated_episode_id,
+                root_state_id=(
+                    initial_archived_state.state_id
+                    if initial_archived_state is not None
+                    else f"{generated_episode_id}:root"
+                ),
+                selected_from_archive_state_id=None,
+                steps=[],
+                max_cumulative_reward_achieved=0.0,
+                final_score=0,
+                final_done=False,
+                replay_metadata=(
+                    initial_archived_state.replay_metadata
+                    if initial_archived_state is not None
+                    else ReplayMetadata()
+                ),
+                metadata={"runner_mode": RunnerMode.GLOW_FAITHFUL.value, "seed": resolved_seed},
+            )
+
+        stored_trajectory = self._trajectory_from_episode_trajectory(
+            episode_id=generated_episode_id,
+            episode_trajectory=best_trajectory,
+        )
+        trajectory_path = self.trajectory_store.write_trajectory(stored_trajectory)
+        notes = self._glow_notes(frontier_analysis_result)
+        llm_call_counts = self.llm_client.stage_call_counts() if self.llm_client is not None else {}
+        llm_success_counts = self.llm_client.stage_success_counts() if self.llm_client is not None else {}
+        llm_error_counts = self.llm_client.stage_error_counts() if self.llm_client is not None else {}
+        unique_selected_root_count = len(root_exploration_counts)
+        cycles_since_last_new_root = cycle_count - last_new_root_cycle if cycle_count > 0 else 0
+        cycles_since_last_new_score = cycle_count - last_score_improvement_cycle if cycle_count > 0 else 0
+        top_selected_region_concentration = 0.0
+        if selected_region_counts:
+            top_selected_region_concentration = selected_region_counts.most_common(1)[0][1] / max(
+                1,
+                sum(selected_region_counts.values()),
+            )
+        top_selected_root_concentration = 0.0
+        if root_exploration_counts:
+            top_selected_root_concentration = root_exploration_counts.most_common(1)[0][1] / max(
+                1,
+                sum(root_exploration_counts.values()),
+            )
+        top_branch_action_concentration = 0.0
+        if branch_action_counts:
+            top_branch_action_concentration = branch_action_counts.most_common(1)[0][1] / max(
+                1,
+                sum(branch_action_counts.values()),
+            )
+        progress_stuckness_summary = {
+            "top_selected_root_concentration": top_selected_root_concentration,
+            "top_branch_action_concentration": top_branch_action_concentration,
+            "cycles_since_last_new_root": cycles_since_last_new_root,
+            "cycles_since_last_new_score": cycles_since_last_new_score,
+            "score_exceeded_zero": bool(max_score_over_time and max(max_score_over_time) > 0),
+        }
+        repeated_root_local_world_model_summaries = self._repeated_root_local_world_model_summaries(
+            root_exploration_counts=root_exploration_counts,
+            selected_root_details=selected_root_details,
+        )
+        episode_metrics = GlowEpisodeMetrics(
+            episode_id=generated_episode_id,
+            seed=resolved_seed,
+            environment_interactions=total_rollout_steps,
+            max_score=best_trajectory.summary_fields.max_score if best_trajectory.steps else 0,
+            final_score=best_trajectory.final_score,
+            frontier_size_over_time=frontier_size_over_time,
+            frontier_analysis_count=frontier_analysis_count,
+            frontier_analysis_ids=frontier_analysis_ids,
+            mar_update_count=mar_update_count,
+            restore_attempt_count=restore_attempt_count,
+            restore_success_count=restore_success_count,
+            selected_state_decisions=selected_state_decisions,
+            branch_counts_per_root_state=dict(branch_counts_per_root_state),
+            local_world_model_root_ids=sorted(local_world_model_root_ids),
+            frontier_analysis_artifact_directories=frontier_analysis_artifact_directories,
+            selection_artifact_directories=selection_artifact_directories,
+            mar_artifact_directories=mar_artifact_directories,
+            local_world_model_snapshot_paths=local_world_model_snapshot_paths,
+            metadata={
+                "frontier_retained_trajectory_count": len(self.trajectory_frontier),
+                "archive_state_count": len(archive_by_state_id),
+                "llm_client_initialized": self.llm_client is not None,
+                "llm_client_class": type(self.llm_client).__name__ if self.llm_client is not None else "",
+                "llm_default_model": (
+                    self.llm_client.default_model
+                    if self.llm_client is not None and self.llm_client.default_model is not None
+                    else ""
+                ),
+                "llm_stage_call_counts": llm_call_counts,
+                "llm_stage_success_counts": llm_success_counts,
+                "llm_stage_error_counts": llm_error_counts,
+                "frontier_analysis_success_count": frontier_analysis_success_count,
+                "frontier_analysis_fallback_count": frontier_analysis_fallback_count,
+                "frontier_analysis_diagnostics": frontier_analysis_diagnostics,
+                "loaded_archive_snapshot_path": loaded_archive_snapshot_path,
+                "loaded_archive_state_count": loaded_archive_state_count,
+                "loaded_archive_prior_run_state_count": loaded_archive_prior_run_state_count,
+                "local_world_model_reuse_count": local_world_model_reuse_count,
+                "local_world_model_write_count": local_world_model_write_count,
+                "local_world_model_read_count": local_world_model_read_count,
+                "local_world_model_read_hit_count": local_world_model_read_hit_count,
+                "reused_local_world_model_root_ids": sorted(reused_local_world_model_root_ids),
+                "root_exploration_counts": dict(root_exploration_counts),
+                "same_root_revisit_after_mar_update_count": same_root_revisit_after_mar_update_count,
+                "revisited_roots_after_mar_update": sorted(revisited_roots_after_mar_update),
+                "local_guidance_attached_branch_count": local_guidance_attached_branch_count,
+                "local_guidance_prompt_attachment_count": local_guidance_prompt_attachment_count,
+                "local_guidance_action_generation_count": local_guidance_action_generation_count,
+                "local_guidance_action_generation_prompt_count": (
+                    local_guidance_action_generation_prompt_count
+                ),
+                "local_guidance_selected_action_match_count": (
+                    local_guidance_selected_action_match_count
+                ),
+                "mar_reuse_status_reason_counts": dict(mar_reuse_status_reason_counts),
+                "archive_snapshot_path": archive_snapshot_path,
+                "archive_state_count_over_time": archive_state_count_over_time,
+                "frontier_root_diversity_over_time": frontier_root_diversity_over_time,
+                "max_score_over_time": max_score_over_time,
+                "score_milestones": score_milestones,
+                "selected_root_ids_over_time": selected_root_ids_over_time,
+                "selected_root_observation_summaries": selected_root_observation_summaries,
+                "selected_root_details": list(selected_root_details.values()),
+                "selected_region_counts": dict(selected_region_counts),
+                "top_selected_regions": self._counter_top_entries(
+                    selected_region_counts,
+                    key_name="region_label",
+                ),
+                "top_selected_region_concentration": top_selected_region_concentration,
+                "unique_selected_root_count": unique_selected_root_count,
+                "top_selected_roots": self._counter_top_entries(
+                    root_exploration_counts,
+                    key_name="state_id",
+                    summaries=selected_root_observation_summaries,
+                ),
+                "top_selected_root_concentration": top_selected_root_concentration,
+                "commit_allowed_count": commit_allowed_count,
+                "committed_branch_positive_progress_count": committed_branch_positive_progress_count,
+                "committed_branch_score_gain_count": committed_branch_score_gain_count,
+                "shadow_commit_threshold": shadow_commit_threshold,
+                "shadow_threshold_would_commit_count": shadow_threshold_would_commit_count,
+                "threshold_blocked_exploratory_best_branch_count": (
+                    threshold_blocked_exploratory_best_branch_count
+                ),
+                "branch_cycle_diagnostics": branch_cycle_diagnostics,
+                "unique_branch_action_count": len(branch_action_counts),
+                "unique_committed_action_count": len(committed_action_counts),
+                "unique_first_actions_per_root": {
+                    root_state_id: sorted(actions)
+                    for root_state_id, actions in unique_first_actions_per_root.items()
+                },
+                "top_branch_actions": self._counter_top_entries(branch_action_counts, key_name="action"),
+                "top_committed_actions": self._counter_top_entries(committed_action_counts, key_name="action"),
+                "top_action_target_tokens": self._counter_top_entries(
+                    action_target_token_counts,
+                    key_name="token",
+                ),
+                "top_winning_action_sequences": self._counter_top_entries(
+                    winning_branch_signature_counts,
+                    key_name="action_sequence",
+                ),
+                "top_committed_roots": self._counter_top_entries(
+                    committed_root_counts,
+                    key_name="state_id",
+                    summaries=selected_root_observation_summaries,
+                ),
+                "cycles_since_last_new_root": cycles_since_last_new_root,
+                "cycles_since_last_new_score": cycles_since_last_new_score,
+                "repeated_root_local_world_model_summaries": repeated_root_local_world_model_summaries,
+                "progress_stuckness_summary": progress_stuckness_summary,
+                "selected_state_statistics": self._selection_statistics(selected_state_decisions),
+            },
+        )
+        metrics_path = self._write_metrics_json(generated_episode_id, episode_metrics.to_record())
+        episode_metadata = {
+            "runner_mode": RunnerMode.GLOW_FAITHFUL.value,
+            "seed": resolved_seed,
+            "glow_cycle_count": cycle_count,
+            "glow_total_rollout_steps": total_rollout_steps,
+            "glow_frontier_size": len(self.trajectory_frontier),
+            "glow_archive_state_count": len(archive_by_state_id),
+            "llm_client_initialized": self.llm_client is not None,
+            "llm_client_class": type(self.llm_client).__name__ if self.llm_client is not None else "",
+            "llm_default_model": (
+                self.llm_client.default_model
+                if self.llm_client is not None and self.llm_client.default_model is not None
+                else ""
+            ),
+            "llm_stage_call_counts": llm_call_counts,
+            "llm_stage_success_counts": llm_success_counts,
+            "llm_stage_error_counts": llm_error_counts,
+            "frontier_analysis_success_count": frontier_analysis_success_count,
+            "frontier_analysis_fallback_count": frontier_analysis_fallback_count,
+            "frontier_analysis_diagnostics": frontier_analysis_diagnostics,
+            "loaded_archive_snapshot_path": loaded_archive_snapshot_path,
+            "loaded_archive_state_count": loaded_archive_state_count,
+            "loaded_archive_prior_run_state_count": loaded_archive_prior_run_state_count,
+            "local_world_model_reuse_count": local_world_model_reuse_count,
+            "local_world_model_write_count": local_world_model_write_count,
+            "local_world_model_read_count": local_world_model_read_count,
+            "local_world_model_read_hit_count": local_world_model_read_hit_count,
+            "reused_local_world_model_root_ids": sorted(reused_local_world_model_root_ids),
+            "root_exploration_counts": dict(root_exploration_counts),
+            "same_root_revisit_after_mar_update_count": same_root_revisit_after_mar_update_count,
+            "revisited_roots_after_mar_update": sorted(revisited_roots_after_mar_update),
+            "local_guidance_attached_branch_count": local_guidance_attached_branch_count,
+            "local_guidance_prompt_attachment_count": local_guidance_prompt_attachment_count,
+            "local_guidance_action_generation_count": local_guidance_action_generation_count,
+            "local_guidance_action_generation_prompt_count": local_guidance_action_generation_prompt_count,
+            "local_guidance_selected_action_match_count": local_guidance_selected_action_match_count,
+            "mar_reuse_status_reason_counts": dict(mar_reuse_status_reason_counts),
+            "archive_snapshot_path": archive_snapshot_path,
+            "archive_state_count_over_time": archive_state_count_over_time,
+            "frontier_root_diversity_over_time": frontier_root_diversity_over_time,
+            "max_score_over_time": max_score_over_time,
+            "score_milestones": score_milestones,
+            "selected_root_ids_over_time": selected_root_ids_over_time,
+            "selected_root_observation_summaries": selected_root_observation_summaries,
+            "selected_root_details": list(selected_root_details.values()),
+            "selected_region_counts": dict(selected_region_counts),
+            "top_selected_regions": self._counter_top_entries(
+                selected_region_counts,
+                key_name="region_label",
+            ),
+            "top_selected_region_concentration": top_selected_region_concentration,
+            "unique_selected_root_count": unique_selected_root_count,
+            "top_selected_roots": self._counter_top_entries(
+                root_exploration_counts,
+                key_name="state_id",
+                summaries=selected_root_observation_summaries,
+            ),
+            "top_selected_root_concentration": top_selected_root_concentration,
+            "commit_allowed_count": commit_allowed_count,
+            "committed_branch_positive_progress_count": committed_branch_positive_progress_count,
+            "committed_branch_score_gain_count": committed_branch_score_gain_count,
+            "shadow_commit_threshold": shadow_commit_threshold,
+            "shadow_threshold_would_commit_count": shadow_threshold_would_commit_count,
+            "threshold_blocked_exploratory_best_branch_count": (
+                threshold_blocked_exploratory_best_branch_count
+            ),
+            "branch_cycle_diagnostics": branch_cycle_diagnostics,
+            "unique_branch_action_count": len(branch_action_counts),
+            "unique_committed_action_count": len(committed_action_counts),
+            "unique_first_actions_per_root": {
+                root_state_id: sorted(actions)
+                for root_state_id, actions in unique_first_actions_per_root.items()
+            },
+            "top_branch_actions": self._counter_top_entries(branch_action_counts, key_name="action"),
+            "top_committed_actions": self._counter_top_entries(committed_action_counts, key_name="action"),
+            "top_action_target_tokens": self._counter_top_entries(
+                action_target_token_counts,
+                key_name="token",
+            ),
+            "top_winning_action_sequences": self._counter_top_entries(
+                winning_branch_signature_counts,
+                key_name="action_sequence",
+            ),
+            "top_committed_roots": self._counter_top_entries(
+                committed_root_counts,
+                key_name="state_id",
+                summaries=selected_root_observation_summaries,
+            ),
+            "cycles_since_last_new_root": cycles_since_last_new_root,
+            "cycles_since_last_new_score": cycles_since_last_new_score,
+            "repeated_root_local_world_model_summaries": repeated_root_local_world_model_summaries,
+            "progress_stuckness_summary": progress_stuckness_summary,
+            "glow_frontier_analysis_frequency": self.config.experiment.glow_frontier_analysis_frequency,
+            "glow_local_branches_per_root": self.config.experiment.glow_local_branches_per_root,
+            "archive_selection_mode": self.config.policy.archive_state_selection_mode.value,
+            "selection_artifact_directories": selection_artifact_directories,
+            "frontier_analysis_artifact_directories": frontier_analysis_artifact_directories,
+            "mar_artifact_directories": mar_artifact_directories,
+            "local_world_model_snapshot_paths": local_world_model_snapshot_paths,
+            "best_frontier_trajectory_id": best_trajectory.trajectory_id,
+            "best_frontier_root_state_id": best_trajectory.root_state_id,
+            "frontier_analysis_id": frontier_analysis_result.analysis_id if frontier_analysis_result is not None else "",
+            "frontier_inferred_bottlenecks": (
+                list(frontier_analysis_result.insight.inferred_bottlenecks[:6])
+                if frontier_analysis_result is not None
+                else []
+            ),
+            "frontier_partial_solutions": (
+                list(frontier_analysis_result.insight.partial_solutions[:6])
+                if frontier_analysis_result is not None
+                else []
+            ),
+            "metrics_path": str(metrics_path),
+        }
+        summary_path = self._write_summary_json(
+            generated_episode_id,
+            {
+                "episode_id": generated_episode_id,
+                "seed": resolved_seed,
+                "total_reward": best_trajectory.max_cumulative_reward_achieved,
+                "step_count": len(best_trajectory.steps),
+                "final_score": best_trajectory.final_score,
+                "trajectory_path": str(trajectory_path),
+                "final_state_summary": (
+                    self.summary_builder.summarize_state_candidate(
+                        observation=best_trajectory.steps[-1].observation,
+                        score=best_trajectory.final_score,
+                        depth=best_trajectory.steps[-1].step_index + 1,
+                        recent_gain=0.0,
+                        inventory_text=best_trajectory.steps[-1].inventory_text,
+                        valid_actions=best_trajectory.steps[-1].valid_actions,
+                    )
+                    if best_trajectory.steps
+                    else "No completed branch trajectory."
+                ),
+                "notes": notes,
+                "metadata": episode_metadata,
+            },
+        )
+        return EpisodeResult(
+            episode_id=generated_episode_id,
+            seed=resolved_seed,
+            total_reward=best_trajectory.max_cumulative_reward_achieved,
+            step_count=len(best_trajectory.steps),
+            final_score=best_trajectory.final_score,
+            trajectory_path=trajectory_path,
+            summary_path=summary_path,
+            metrics_path=metrics_path,
+            notes=notes,
+            metadata=episode_metadata,
+        )
+
+    def _restore_archived_state(self, archived_state: ArchivedState):
+        """Restore an archived state using its provenance trajectory when available."""
+
+        saved_node = self._saved_node_from_archived_state(archived_state)
+        if saved_node is None:
+            return restore_saved_node(self.env, None, logger=self.logger)
+        return restore_saved_node(
+            self.env,
+            saved_node,
+            target_step_index=saved_node.step_index,
+            logger=self.logger,
+        )
+
+    def _load_persisted_archive(
+        self,
+        episode_id: str,
+    ) -> tuple[dict[str, ArchivedState], str, int, int]:
+        """Load the newest persisted archive snapshot for cross-run reuse."""
+
+        latest_snapshot = self.archive_store.read_latest_snapshot()
+        if latest_snapshot is None:
+            return {}, "", 0, 0
+
+        snapshot_path, loaded_states = latest_snapshot
+        archive_by_state_id: dict[str, ArchivedState] = {}
+        for archived_state in loaded_states:
+            archive_by_state_id = self.archive_updater.upsert_archived_state(
+                archive_by_state_id,
+                archived_state,
+            )
+        prior_run_state_count = sum(
+            1
+            for archived_state in archive_by_state_id.values()
+            if archived_state.first_seen_episode_id != episode_id
+        )
+        return (
+            archive_by_state_id,
+            str(snapshot_path),
+            len(archive_by_state_id),
+            prior_run_state_count,
+        )
+
+    def _saved_node_from_archived_state(self, archived_state: ArchivedState) -> SavedNode | None:
+        """Build a replayable saved node from an archived state plus provenance data."""
+
+        metadata = archived_state.metadata
+        observation = archived_state.observation_summary or str(metadata.get("observation", "")).strip()
+        if not observation:
+            return None
+        return SavedNode(
+            state_id=archived_state.state_id,
+            episode_id=archived_state.provenance_trajectory_id,
+            step_index=archived_state.provenance_timestep,
+            native_state=archived_state.native_snapshot or archived_state.replay_metadata.native_snapshot,
+            action_prefix=list(archived_state.replay_metadata.replay_actions),
+            score=archived_state.score_at_state or int(metadata.get("score", 0)),
+            observation=observation,
+            inventory_text=archived_state.inventory_summary or str(metadata.get("inventory_text", "")),
+            world_state_hash=archived_state.replay_metadata.world_state_hash or str(metadata.get("world_state_hash", "unknown")),
+            valid_actions=(
+                [item.strip() for item in archived_state.valid_action_summary.split(",") if item.strip()]
+                or [str(item) for item in (metadata.get("valid_actions") or [])]
+            ),
+            summary_text=self.summary_builder.summarize_state_candidate(
+                observation=observation,
+                score=archived_state.score_at_state or int(metadata.get("score", 0)),
+                depth=archived_state.provenance_timestep + 1,
+                recent_gain=0.0,
+                inventory_text=archived_state.inventory_summary or str(metadata.get("inventory_text", "")),
+                valid_actions=(
+                    [item.strip() for item in archived_state.valid_action_summary.split(",") if item.strip()]
+                    or [str(item) for item in (metadata.get("valid_actions") or [])]
+                ),
+            ),
+            metadata=dict(metadata),
+        )
+
+    def _build_glow_branch_trajectories(
+        self,
+        *,
+        episode_id: str,
+        cycle_index: int,
+        selected_archived_state: ArchivedState,
+        local_result: LocalExplorationResult,
+    ) -> list[EpisodeTrajectory]:
+        """Convert local branch rollouts into complete trajectories for the global frontier."""
+
+        prefix_steps = self._prefix_steps_for_archived_state(selected_archived_state)
+        branch_trajectories: list[EpisodeTrajectory] = []
+        for branch in local_result.branches:
+            if not branch.trajectory_steps:
+                continue
+            trajectory_id = f"{episode_id}-cycle-{cycle_index:03d}-branch-{branch.branch_index:02d}"
+            combined_steps = self._combined_branch_steps(
+                trajectory_id=trajectory_id,
+                prefix_steps=prefix_steps,
+                branch_steps=branch.trajectory_steps,
+            )
+            legacy_trajectory = Trajectory(
+                episode_id=trajectory_id,
+                steps=combined_steps,
+                metadata={
+                    "runner_mode": RunnerMode.GLOW_FAITHFUL.value,
+                    "source_episode_id": episode_id,
+                    "cycle_index": cycle_index,
+                    "root_state_id": local_result.root_state_id,
+                    "selected_from_archive_state_id": selected_archived_state.state_id,
+                    "branch_index": branch.branch_index,
+                    "branch_progress_score": branch.branch_progress_score,
+                    "branch_commit_allowed": branch.branch_commit_allowed,
+                    "commit_rejection_reason": branch.commit_rejection_reason,
+                },
+            )
+            branch_trajectories.append(
+                self.trajectory_store.episode_trajectory_for_trajectory(
+                    legacy_trajectory,
+                    root_state_id=local_result.root_state_id,
+                    selected_from_archive_state_id=selected_archived_state.state_id,
+                    replay_metadata=selected_archived_state.replay_metadata,
+                    metadata=legacy_trajectory.metadata,
+                )
+            )
+        return branch_trajectories
+
+    def _prefix_steps_for_archived_state(self, archived_state: ArchivedState) -> list[TrajectoryStep]:
+        """Return a retained provenance prefix for an archived state when available.
+
+        The archive is now independent from the bounded trajectory frontier, so an
+        archived state may outlive the complete provenance trajectory that first
+        produced it. In that case we keep restore/replay exact through
+        `archived_state.replay_metadata`, but the frontier-facing branch trajectory
+        starts at the restored root rather than reconstructing a synthetic prefix.
+        """
+
+        provenance_trajectory = self.trajectory_frontier.get_trajectory(archived_state.provenance_trajectory_id)
+        if provenance_trajectory is None:
+            return []
+        return [
+            step
+            for step in provenance_trajectory.steps
+            if step.step_index <= archived_state.provenance_timestep
+        ]
+
+    def _combined_branch_steps(
+        self,
+        *,
+        trajectory_id: str,
+        prefix_steps: list[TrajectoryStep],
+        branch_steps: list[TrajectoryStep],
+    ) -> list[TrajectoryStep]:
+        """Combine a retained provenance prefix with a newly explored local branch."""
+
+        combined: list[TrajectoryStep] = []
+        for step in [*prefix_steps, *branch_steps]:
+            record = step.to_record()
+            record["episode_id"] = trajectory_id
+            record["step_index"] = len(combined)
+            combined.append(TrajectoryStep.from_record(record))
+        return combined
+
+    def _should_run_glow_frontier_analysis(self, *, cycle_index: int) -> bool:
+        """Return whether the global frontier analysis should run this cycle."""
+
+        if not self.config.experiment.enable_global_frontier_analysis:
+            return False
+        frequency = max(1, self.config.experiment.glow_frontier_analysis_frequency)
+        return cycle_index % frequency == 0 and len(self.trajectory_frontier) > 0
+
+    def _prefer_higher_value_trajectory(
+        self,
+        current_best: EpisodeTrajectory | None,
+        candidate: EpisodeTrajectory,
+    ) -> EpisodeTrajectory:
+        """Keep the highest-value trajectory discovered so far."""
+
+        if current_best is None:
+            return candidate
+        if candidate.max_cumulative_reward_achieved > current_best.max_cumulative_reward_achieved:
+            return candidate
+        if candidate.max_cumulative_reward_achieved < current_best.max_cumulative_reward_achieved:
+            return current_best
+        if candidate.final_score > current_best.final_score:
+            return candidate
+        return current_best
+
+    def _trajectory_from_episode_trajectory(
+        self,
+        *,
+        episode_id: str,
+        episode_trajectory: EpisodeTrajectory,
+    ) -> Trajectory:
+        """Project a typed episode trajectory back into the legacy JSONL artifact format."""
+
+        copied_steps: list[TrajectoryStep] = []
+        for index, step in enumerate(episode_trajectory.steps):
+            record = step.to_record()
+            record["episode_id"] = episode_id
+            record["step_index"] = index
+            copied_steps.append(TrajectoryStep.from_record(record))
+        return Trajectory(
+            episode_id=episode_id,
+            steps=copied_steps,
+            metadata={
+                "runner_mode": RunnerMode.GLOW_FAITHFUL.value,
+                "root_state_id": episode_trajectory.root_state_id,
+                "selected_from_archive_state_id": episode_trajectory.selected_from_archive_state_id,
+                "trajectory_id": episode_trajectory.trajectory_id,
+                **dict(episode_trajectory.metadata),
+            },
+        )
+
+    def _glow_notes(self, analysis_result: FrontierAnalysisResult | None) -> str:
+        """Build a compact notes string for the paper-faithful runner summary."""
+
+        if analysis_result is None:
+            return "No frontier analysis was available."
+        insight = analysis_result.insight
+        fragments = [
+            *insight.partial_solutions[:2],
+            *insight.inferred_bottlenecks[:2],
+            *insight.missing_prerequisites[:1],
+        ]
+        return " | ".join(fragment for fragment in fragments if fragment.strip()) or "Frontier analysis completed."
+
     def _branch_commit_actions(self, branch: LocalBranchOutcome) -> list[str]:
         """Return the branch prefix that should be committed into the main episode.
 
@@ -859,6 +2057,15 @@ class EpisodeRunner:
                 trivial_reversible_penalty=self.config.policy.frontier_trivial_reversible_penalty,
                 strategic_score_weight=self.config.policy.frontier_strategic_score_weight,
             ),
+        )
+
+    def _build_trajectory_frontier(self) -> TrajectoryFrontier:
+        """Construct the paper-faithful complete-trajectory frontier."""
+
+        return TrajectoryFrontier(
+            TrajectoryFrontierConfig(
+                max_size=self.config.experiment.glow_frontier_size,
+            )
         )
 
     def _annotate_state(
@@ -1505,3 +2712,250 @@ class EpisodeRunner:
             encoding="utf-8",
         )
         return summary_path
+
+    def _write_metrics_json(self, episode_id: str, payload: dict[str, object]) -> Path:
+        """Persist a structured per-episode metrics artifact."""
+
+        metrics_path = self.config.paths.metrics_dir / "episodes" / f"{episode_id}.metrics.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(
+            json.dumps(to_jsonable(payload), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return metrics_path
+
+    def _selection_statistics(
+        self,
+        selection_decisions: list[GlowSelectionDecisionMetric],
+    ) -> dict[str, dict[str, float | int]]:
+        """Aggregate archive-selection behavior for episode-level metrics."""
+
+        stats: dict[str, dict[str, float | int]] = {}
+        for decision in selection_decisions:
+            if decision.selected_state_id is None:
+                continue
+            record = stats.setdefault(
+                decision.selected_state_id,
+                {
+                    "selection_count": 0,
+                    "restore_success_count": 0,
+                    "achieved_contribution_total": 0.0,
+                    "potential_contribution_total": 0.0,
+                    "branch_count_total": 0,
+                },
+            )
+            record["selection_count"] += 1
+            record["restore_success_count"] += int(decision.restore_succeeded)
+            record["achieved_contribution_total"] += float(decision.achieved_contribution)
+            record["potential_contribution_total"] += float(decision.potential_contribution)
+            record["branch_count_total"] += int(decision.branch_count)
+        return stats
+
+    @staticmethod
+    def _classify_revisit_progress(branches: list[LocalBranchOutcome]) -> dict[str, bool]:
+        """Classify whether one revisit produced fresh gains or stale local replay only."""
+
+        score_progress = any(branch.score_change > 0 for branch in branches)
+        fresh_durable_progress = any(
+            branch.durable_progress and not bool(branch.metadata.get("repeated_known_local_affordance", False))
+            for branch in branches
+        )
+        repeated_local_affordance_only_progress = (
+            not score_progress
+            and not fresh_durable_progress
+            and any(
+                branch.durable_progress and bool(branch.metadata.get("repeated_known_local_affordance", False))
+                for branch in branches
+            )
+        )
+        exploratory_progress = any(
+            bool(branch.metadata.get("exploratory_location_progress", False))
+            for branch in branches
+        )
+        return {
+            "achieved_progress": score_progress or fresh_durable_progress,
+            "score_progress": score_progress,
+            "fresh_durable_progress": fresh_durable_progress,
+            "repeated_local_affordance_only_progress": repeated_local_affordance_only_progress,
+            "exploratory_progress": exploratory_progress,
+        }
+
+    def _frontier_root_diversity(self) -> int:
+        """Return the number of unique root states currently retained in the frontier."""
+
+        return len(
+            {
+                trajectory.root_state_id
+                for trajectory in self.trajectory_frontier.trajectories_for_analysis()
+                if trajectory.root_state_id.strip()
+            }
+        )
+
+    def _archived_state_summary(self, archived_state: ArchivedState) -> str:
+        """Return one compact human-readable summary for a selected archived state."""
+
+        summary = archived_state.observation_summary.strip()
+        if summary:
+            return summary
+        observation = str(archived_state.metadata.get("observation", "")).strip()
+        return observation
+
+    def _coarse_region_label(self, *, summary: str, state_cluster_id: str) -> str:
+        """Infer one compact semantic region label for diagnostics and stall summaries."""
+
+        cluster_text = state_cluster_id.strip().lower()
+        summary_text = summary.strip().lower()
+        combined = f"{cluster_text} {summary_text}"
+
+        if "behind house" in combined or "open window" in combined or "region:window" in cluster_text:
+            return "behind-house-window"
+        if "window" in combined:
+            return "window"
+        if "mailbox" in combined or "west of house" in combined:
+            return "west-house-mailbox"
+        if "north of house" in combined or "south of house" in combined or "east of house" in combined:
+            return "house-perimeter"
+        if "forest path" in combined or "region:title:forest-path" in cluster_text:
+            return "forest-path"
+        if "up a tree" in combined or "region:title:up-a-tree" in cluster_text:
+            return "tree"
+        if "canary" in combined:
+            return "canary"
+        if "egg" in combined or "region:egg" in cluster_text:
+            return "egg"
+        if "nest" in combined:
+            return "nest"
+        if "leaves" in combined:
+            return "leaves"
+        if "forest" in combined:
+            return "forest"
+        if cluster_text.startswith("region:"):
+            return cluster_text.split("region:", 1)[1]
+        return "other"
+
+    def _frontier_analysis_diagnostic_record(
+        self,
+        *,
+        frontier_analysis_result: FrontierAnalysisResult,
+        archive_by_state_id: dict[str, ArchivedState],
+    ) -> dict[str, object]:
+        """Build one compact per-analysis diagnostic record for bottleneck inspection."""
+
+        output_text = " ".join(
+            [
+                frontier_analysis_result.raw_completion,
+                *frontier_analysis_result.insight.inferred_bottlenecks,
+                *frontier_analysis_result.insight.partial_solutions,
+                *frontier_analysis_result.insight.missing_prerequisites,
+                *[
+                    annotation.textual_rationale
+                    for annotation in frontier_analysis_result.insight.candidate_critical_states
+                ],
+            ]
+        ).lower()
+        tracked_terms = [
+            "house",
+            "window",
+            "behind house",
+            "open window",
+            "forest",
+            "tree",
+            "egg",
+            "canary",
+            "nest",
+            "leaves",
+            "mailbox",
+        ]
+        mentioned_terms = [term for term in tracked_terms if term in output_text]
+        critical_state_regions: list[str] = []
+        for annotation in frontier_analysis_result.insight.candidate_critical_states:
+            archived_state = archive_by_state_id.get(annotation.critical_state_id)
+            if archived_state is not None:
+                critical_state_regions.append(
+                    self._coarse_region_label(
+                        summary=self._archived_state_summary(archived_state),
+                        state_cluster_id=archived_state.state_cluster_id,
+                    )
+                )
+            else:
+                critical_state_regions.append("unknown")
+        non_egg_regions = {
+            region
+            for region in critical_state_regions
+            if region not in {"egg", "nest", "canary", "tree", "unknown"}
+        }
+        return {
+            "analysis_id": frontier_analysis_result.analysis_id,
+            "used_fallback": frontier_analysis_result.used_fallback,
+            "parse_error": frontier_analysis_result.parse_error,
+            "mentioned_terms": mentioned_terms,
+            "critical_state_count": len(frontier_analysis_result.insight.candidate_critical_states),
+            "critical_state_regions": critical_state_regions,
+            "identified_non_egg_critical_state": bool(non_egg_regions),
+            "non_egg_critical_regions": sorted(non_egg_regions),
+        }
+
+    def _repeated_root_local_world_model_summaries(
+        self,
+        *,
+        root_exploration_counts: Counter[str],
+        selected_root_details: dict[str, dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Summarize persisted local-world-model contents for repeatedly selected roots."""
+
+        summaries: list[dict[str, object]] = []
+        for root_state_id, selection_count in root_exploration_counts.items():
+            if selection_count < 2:
+                continue
+            local_world_model = self.local_explorer.local_world_model_store.read(root_state_id)
+            if local_world_model is None:
+                continue
+            root_detail = selected_root_details.get(root_state_id, {})
+            summaries.append(
+                {
+                    "root_state_id": root_state_id,
+                    "selection_count": selection_count,
+                    "region_label": str(root_detail.get("region_label", "")),
+                    "summary": str(root_detail.get("summary", "")),
+                    "hint_count": len(local_world_model.accumulated_advantage_hints),
+                    "try_actions": [
+                        bias.action
+                        for bias in sorted(
+                            local_world_model.action_priors,
+                            key=lambda item: (-item.weight, item.action),
+                        )[:5]
+                    ],
+                    "avoid_actions": [
+                        bias.action
+                        for bias in sorted(
+                            local_world_model.action_antipriors,
+                            key=lambda item: (-item.weight, item.action),
+                        )[:5]
+                    ],
+                    "object_hints": [
+                        affordance.object_text
+                        for affordance in local_world_model.inferred_affordances[:5]
+                    ],
+                }
+            )
+        return summaries
+
+    def _counter_top_entries(
+        self,
+        counts: Counter[str],
+        *,
+        key_name: str,
+        summaries: dict[str, str] | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, object]]:
+        """Serialize the top entries of a counter for JSON metrics payloads."""
+
+        entries: list[dict[str, object]] = []
+        for item, count in counts.most_common(limit):
+            entry: dict[str, object] = {key_name: item, "count": int(count)}
+            if summaries is not None:
+                summary = summaries.get(item, "").strip()
+                if summary:
+                    entry["summary"] = summary
+            entries.append(entry)
+        return entries
