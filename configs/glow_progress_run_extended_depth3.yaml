@@ -1,0 +1,20 @@
+extends: glow_progress_run_extended.yaml
+
+runtime:
+  docker_notes:
+    - "Longer progress-seeking run after generic stale-revisit and repeated-score-replay fixes."
+    - "Keeps the live full path while using the validated depth-3 local branch horizon."
+
+paths:
+  artifacts_dir: artifacts/progress/extended_progress_run_depth3_live_qwen9b
+  trajectory_dir: artifacts/progress/extended_progress_run_depth3_live_qwen9b/trajectories
+  archive_dir: artifacts/progress/extended_progress_run_depth3_live_qwen9b/archive
+  log_dir: artifacts/progress/extended_progress_run_depth3_live_qwen9b/logs
+  summary_dir: artifacts/progress/extended_progress_run_depth3_live_qwen9b/summaries
+  metrics_dir: artifacts/progress/extended_progress_run_depth3_live_qwen9b/metrics
+
+logging:
+  run_log_filename: progress_run_extended_depth3.log
+
+policy:
+  rollout_depth: 3
