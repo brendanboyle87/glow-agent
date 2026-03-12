@@ -1,4 +1,4 @@
-"""Shared typed data containers used across the scaffold.
+"""Shared typed data containers for the GLoW implementation.
 
 TODO: introduce stricter event schemas once the agent loop stabilizes.
 """
@@ -58,6 +58,7 @@ class LLMChatRequest:
     temperature: float = 0.2
     max_tokens: int = 256
     timeout_seconds: float | None = None
+    response_format: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -70,6 +71,7 @@ class LLMChatRequest:
         temperature: float,
         max_tokens: int,
         timeout_seconds: float | None = None,
+        response_format: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> "LLMChatRequest":
         """Build a chat request from simple system and user prompts."""
@@ -84,6 +86,7 @@ class LLMChatRequest:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            response_format=dict(response_format) if response_format is not None else None,
             metadata=dict(metadata or {}),
         )
 
@@ -110,7 +113,7 @@ class WorldStateSnapshot:
     """Best-effort snapshot of the current text-game world state.
 
     Jericho exposes `get_state()` / `set_state()` for exact restoration on supported
-    environments. When those internals are unavailable, the scaffold falls back to an
+    environments. When those internals are unavailable, the runtime falls back to an
     action-replay snapshot built from the action history.
     """
 
@@ -1541,6 +1544,9 @@ class ActionClusterHistory:
     recent_affordance_targets: set[str] = field(default_factory=set)
     current_visible_nouns: set[str] = field(default_factory=set)
     fresh_visible_nouns: set[str] = field(default_factory=set)
+    current_valid_actions: set[str] = field(default_factory=set)
+    fresh_valid_actions: set[str] = field(default_factory=set)
+    fresh_exit_actions: set[str] = field(default_factory=set)
     recent_cluster_sequence: list[str] = field(default_factory=list)
     no_progress_steps: int = 0
     movement_no_progress_steps: int = 0
@@ -1698,6 +1704,21 @@ class ActionClusterHistory:
         self.current_visible_nouns = set(visible_nouns)
         self.fresh_visible_nouns = visible_nouns - self.seen_nouns
         self.seen_nouns.update(memory_nouns)
+        normalized_valid_actions = {
+            normalize_parser_action(action)
+            for action in (valid_actions or [])
+            if normalize_parser_action(action)
+        }
+        if self.current_valid_actions:
+            self.fresh_valid_actions = normalized_valid_actions - self.current_valid_actions
+        else:
+            self.fresh_valid_actions = set()
+        self.fresh_exit_actions = {
+            action
+            for action in self.fresh_valid_actions
+            if is_movement_action(action, inverse_pairs)
+        }
+        self.current_valid_actions = normalized_valid_actions
 
     def record_state_cluster(self, *, cluster_id: str, observation: str) -> tuple[int, bool]:
         """Record a visit to the current state cluster and return visit metadata."""
@@ -2800,6 +2821,8 @@ class TextGameTransition:
         metadata: Mapping[str, Any] | None = None,
         step_index_override: int | None = None,
         loop_result: LoopHeuristicResult | None = None,
+        cumulative_reward: float | None = None,
+        native_snapshot_reference: str | None = None,
     ) -> "TrajectoryStep":
         """Convert a transition into a JSONL-friendly trajectory step."""
 
@@ -2812,6 +2835,7 @@ class TextGameTransition:
             action=self.action,
             observation=self.observation,
             reward=self.reward,
+            cumulative_reward=self.reward if cumulative_reward is None else float(cumulative_reward),
             done=self.done,
             score=self.score,
             moves=self.moves,
@@ -2832,6 +2856,11 @@ class TextGameTransition:
             unresolved_opportunity_count=int(merged_metadata.get("unresolved_opportunity_count", 0)),
             room_text_only_gain=float(merged_metadata.get("room_text_only_gain", 0.0)),
             affordance_gain=int(merged_metadata.get("affordance_gain", 0)),
+            native_snapshot_reference=(
+                native_snapshot_reference
+                or str(merged_metadata.get("native_snapshot_reference", "")).strip()
+                or None
+            ),
             world_state_snapshot=(
                 self.world_state_snapshot.to_record(include_internal_state=False)
                 if self.world_state_snapshot is not None
@@ -2907,6 +2936,9 @@ class ActionCandidateFeatures:
     movement_repeat_count: int = 0
     cluster_repeat_count: int = 0
     movement_targets_landmark: bool = False
+    is_freshly_unlocked_action: bool = False
+    is_freshly_unlocked_exit: bool = False
+    follows_recent_affordance_unlock: bool = False
     touches_exhausted_family: bool = False
     exhausted_family_count: int = 0
     max_family_no_progress_count: int = 0
@@ -2958,6 +2990,7 @@ class ActionGenerationResult:
     top_selection_reason: str = ""
     strategic_mode: str = ""
     strategic_reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def top_actions(self) -> list[str]:
         """Return the candidate action texts in ranked order."""
@@ -2979,9 +3012,18 @@ class ActionGenerationResult:
 class StateSelectionMode(str, Enum):
     """Mode used to choose the next frontier state for revisit."""
 
+    ARCHIVE_BALANCED = "archive_balanced"
     HEURISTIC = "heuristic"
+    LEGACY_HEURISTIC = "legacy_heuristic"
     LLM_ASSISTED = "llm_assisted"
     FALLBACK_HEURISTIC = "fallback_heuristic"
+
+
+class RunnerMode(str, Enum):
+    """Episode-runner mode used to orchestrate global/local exploration."""
+
+    LEGACY = "legacy"
+    GLOW_FAITHFUL = "glow_faithful"
 
 
 @dataclass(slots=True)
@@ -3026,6 +3068,86 @@ class StateSelectionResult:
         """Return the selected frontier state id if available."""
 
         return self.selected.state_id if self.selected is not None else None
+
+
+@dataclass(slots=True)
+class ArchiveCandidateSummary:
+    """Compact archive-state summary used for state-selection prompts and logs."""
+
+    candidate_id: str
+    state_id: str
+    achieved_value: float
+    potential_value: float
+    achieved_contribution: float
+    potential_contribution: float
+    replay_method: str
+    visit_count: int
+    selection_count: int
+    support_count: int = 0
+    summary_text: str = ""
+
+    def to_prompt_line(self) -> str:
+        """Render a bounded one-line summary for LLM-assisted state selection."""
+
+        return (
+            f"{self.candidate_id} | state_id={self.state_id} "
+            f"| achieved={self.achieved_value:.2f} potential={self.potential_value:.2f} "
+            f"| achieved_contrib={self.achieved_contribution:.2f} potential_contrib={self.potential_contribution:.2f} "
+            f"| replay={self.replay_method} | visits={self.visit_count} selects={self.selection_count} "
+            f"| support={self.support_count} | state={self.summary_text}"
+        )
+
+
+@dataclass(slots=True)
+class ArchiveStateSelectionResult:
+    """Structured result from achieved-plus-potential archive state selection."""
+
+    selected_archived_state: ArchivedState | None
+    chosen_replay_method: str
+    achieved_contribution: float
+    potential_contribution: float
+    rationale: str
+    selection_mode: StateSelectionMode
+    candidate_summaries: list[ArchiveCandidateSummary] = field(default_factory=list)
+    selected_frontier_trajectory_ids: list[str] = field(default_factory=list)
+    selected_critical_state_ids: list[str] = field(default_factory=list)
+    raw_output: str = ""
+    prompt_snapshot: str = ""
+    model_name: str | None = None
+    fallback_reason: str = ""
+    artifact_directory: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def selected_archive_state_id(self) -> str | None:
+        """Return the selected archived state id if available."""
+
+        return self.selected_archived_state.state_id if self.selected_archived_state is not None else None
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the selection result into a JSON-serializable record."""
+
+        return {
+            "selected_archived_state": (
+                self.selected_archived_state.to_record(include_native_snapshot=False)
+                if self.selected_archived_state is not None
+                else None
+            ),
+            "chosen_replay_method": self.chosen_replay_method,
+            "achieved_contribution": self.achieved_contribution,
+            "potential_contribution": self.potential_contribution,
+            "rationale": self.rationale,
+            "selection_mode": self.selection_mode.value,
+            "candidate_summaries": [candidate.to_prompt_line() for candidate in self.candidate_summaries],
+            "selected_frontier_trajectory_ids": list(self.selected_frontier_trajectory_ids),
+            "selected_critical_state_ids": list(self.selected_critical_state_ids),
+            "raw_output": self.raw_output,
+            "prompt_snapshot": self.prompt_snapshot,
+            "model_name": self.model_name,
+            "fallback_reason": self.fallback_reason,
+            "artifact_directory": self.artifact_directory,
+            "metadata": dict(self.metadata),
+        }
 
 
 class BranchTerminationReason(str, Enum):
@@ -3089,6 +3211,7 @@ class LocalBranchOutcome:
     last_meaningful_progress_action_index: int | None = None
     last_meaningful_progress_action: str = ""
     notable_observation_changes: list[str] = field(default_factory=list)
+    trajectory_steps: list[TrajectoryStep] = field(default_factory=list)
     final_state: TextGameState | None = None
     restore_result: ReplayResult | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -3104,10 +3227,15 @@ class LocalExplorationResult:
     temperature: float
     action_candidate_count: int
     branches: list[LocalBranchOutcome]
+    root_state_id: str = ""
     best_branch_index: int | None = None
     branch_commit_allowed: bool = False
     commit_rejection_reason: str = ""
     comparison_notes: str = ""
+    used_local_world_model: LocalWorldModel | None = None
+    mar_inference: MARInferenceResult | None = None
+    updated_local_world_model: LocalWorldModel | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def best_branch(self) -> LocalBranchOutcome | None:
@@ -3463,6 +3591,7 @@ class TrajectoryStep:
     score: int
     moves: int
     world_state_hash: str
+    cumulative_reward: float = 0.0
     inventory_text: str = ""
     valid_actions: list[str] = field(default_factory=list)
     movement_only_action: bool = False
@@ -3479,24 +3608,37 @@ class TrajectoryStep:
     unresolved_opportunity_count: int = 0
     room_text_only_gain: float = 0.0
     affordance_gain: int = 0
+    native_snapshot_reference: str | None = None
     world_state_snapshot: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate_invariants(self) -> None:
+        """Validate basic trajectory-step invariants used by typed artifacts."""
+
+        if not self.episode_id.strip():
+            raise ValueError("TrajectoryStep.episode_id must not be empty.")
+        if self.step_index < 0:
+            raise ValueError("TrajectoryStep.step_index must be >= 0.")
+        if self.moves < 0:
+            raise ValueError("TrajectoryStep.moves must be >= 0.")
 
     def to_record(self) -> dict[str, Any]:
         """Convert the step into a JSONL-friendly dictionary."""
 
+        self.validate_invariants()
         return asdict(self)
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> "TrajectoryStep":
         """Construct a step from a stored JSON record."""
 
-        return cls(
+        step = cls(
             episode_id=str(record["episode_id"]),
             step_index=int(record["step_index"]),
             action=str(record["action"]),
             observation=str(record["observation"]),
             reward=float(record["reward"]),
+            cumulative_reward=float(record.get("cumulative_reward", record["reward"])),
             done=bool(record["done"]),
             score=int(record["score"]),
             moves=int(record["moves"]),
@@ -3517,11 +3659,18 @@ class TrajectoryStep:
             unresolved_opportunity_count=int(record.get("unresolved_opportunity_count", 0)),
             room_text_only_gain=float(record.get("room_text_only_gain", 0.0)),
             affordance_gain=int(record.get("affordance_gain", 0)),
+            native_snapshot_reference=(
+                str(record["native_snapshot_reference"]).strip()
+                if record.get("native_snapshot_reference") not in (None, "")
+                else None
+            ),
             world_state_snapshot=normalize_world_state_snapshot_record(record["world_state_snapshot"])
             if isinstance(record.get("world_state_snapshot"), MappingABC)
             else None,
             metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
         )
+        step.validate_invariants()
+        return step
 
 
 @dataclass(slots=True)
@@ -3564,6 +3713,9 @@ class Trajectory:
 
         if not self.steps:
             return
+
+        for step in self.steps:
+            step.validate_invariants()
 
         episode_ids = {step.episode_id for step in self.steps}
         if len(episode_ids) != 1:
@@ -3615,6 +3767,1130 @@ class Trajectory:
 
 
 @dataclass(slots=True)
+class ReplayMetadata:
+    """Replay and restore metadata shared by archived states and trajectories."""
+
+    restore_strategy: str = "action_replay_fallback"
+    replay_actions: list[str] = field(default_factory=list)
+    world_state_hash: str = ""
+    native_snapshot_reference: str | None = None
+    native_snapshot: tuple[Any, ...] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self, include_native_snapshot: bool = False) -> dict[str, Any]:
+        """Convert replay metadata into a JSON-serializable record."""
+
+        record = {
+            "restore_strategy": self.restore_strategy,
+            "replay_actions": list(self.replay_actions),
+            "world_state_hash": self.world_state_hash,
+            "native_snapshot_reference": self.native_snapshot_reference,
+            "metadata": dict(self.metadata),
+        }
+        if include_native_snapshot and self.native_snapshot is not None:
+            record["native_snapshot"] = list(self.native_snapshot)
+        return record
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "ReplayMetadata":
+        """Construct replay metadata from a serialized record."""
+
+        native_snapshot = record.get("native_snapshot")
+        normalized_snapshot: tuple[Any, ...] | None = None
+        if isinstance(native_snapshot, list):
+            normalized_snapshot = tuple(native_snapshot)
+        elif isinstance(native_snapshot, tuple):
+            normalized_snapshot = tuple(native_snapshot)
+
+        return cls(
+            restore_strategy=_normalize_restore_strategy_name(str(record.get("restore_strategy", "action_replay_fallback"))),
+            replay_actions=_normalize_string_list(record.get("replay_actions")),
+            world_state_hash=str(record.get("world_state_hash", "")),
+            native_snapshot_reference=(
+                str(record["native_snapshot_reference"]).strip()
+                if record.get("native_snapshot_reference") not in (None, "")
+                else None
+            ),
+            native_snapshot=normalized_snapshot,
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class EpisodeTrajectorySummary:
+    """Summary fields derived from an episode trajectory for frontier analysis."""
+
+    unique_world_state_count: int = 0
+    unique_cluster_count: int = 0
+    action_count: int = 0
+    loop_event_count: int = 0
+    max_score: int = 0
+    final_cluster_id: str = ""
+    discovered_object_tokens: list[str] = field(default_factory=list)
+    bottleneck_step_indices: list[int] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the trajectory summary into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "EpisodeTrajectorySummary":
+        """Construct a trajectory summary from a serialized record."""
+
+        return cls(
+            unique_world_state_count=int(record.get("unique_world_state_count", 0)),
+            unique_cluster_count=int(record.get("unique_cluster_count", 0)),
+            action_count=int(record.get("action_count", 0)),
+            loop_event_count=int(record.get("loop_event_count", 0)),
+            max_score=int(record.get("max_score", 0)),
+            final_cluster_id=str(record.get("final_cluster_id", "")),
+            discovered_object_tokens=_normalize_string_list(record.get("discovered_object_tokens")),
+            bottleneck_step_indices=[int(value) for value in (record.get("bottleneck_step_indices") or [])],
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class EpisodeTrajectory:
+    """Typed full-episode trajectory for a more faithful GLoW-style frontier."""
+
+    episode_id: str
+    root_state_id: str
+    selected_from_archive_state_id: str | None = None
+    steps: list[TrajectoryStep] = field(default_factory=list)
+    max_cumulative_reward_achieved: float = 0.0
+    final_score: int = 0
+    final_done: bool = False
+    replay_metadata: ReplayMetadata = field(default_factory=ReplayMetadata)
+    summary_fields: EpisodeTrajectorySummary = field(default_factory=EpisodeTrajectorySummary)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def trajectory_id(self) -> str:
+        """Return the stable trajectory id used by global frontier artifacts."""
+
+        return self.episode_id
+
+    def validate_invariants(self) -> None:
+        """Validate basic ordering and aggregate invariants."""
+
+        if not self.root_state_id.strip():
+            raise ValueError("EpisodeTrajectory.root_state_id must not be empty.")
+        if not self.steps:
+            return
+
+        episode_ids = {step.episode_id for step in self.steps}
+        if episode_ids != {self.episode_id}:
+            raise ValueError(
+                f"EpisodeTrajectory {self.episode_id!r} contains mismatched step episode ids: {sorted(episode_ids)}"
+            )
+
+        step_indices = [step.step_index for step in self.steps]
+        if step_indices != sorted(step_indices):
+            raise ValueError("EpisodeTrajectory steps must be sorted by step_index.")
+        if len(step_indices) != len(set(step_indices)):
+            raise ValueError("EpisodeTrajectory contains duplicate step_index values.")
+
+        running_reward = 0.0
+        max_cumulative_reward = float("-inf")
+        for step in self.steps:
+            running_reward += float(step.reward)
+            if abs(float(step.cumulative_reward) - running_reward) > 1e-6:
+                raise ValueError(
+                    f"TrajectoryStep cumulative_reward mismatch at step {step.step_index}: "
+                    f"expected {running_reward}, got {step.cumulative_reward}"
+                )
+            max_cumulative_reward = max(max_cumulative_reward, running_reward)
+
+        final_step = self.steps[-1]
+        if self.final_score != final_step.score:
+            raise ValueError(
+                f"EpisodeTrajectory.final_score {self.final_score} does not match last step score {final_step.score}."
+            )
+        if self.final_done != final_step.done:
+            raise ValueError(
+                f"EpisodeTrajectory.final_done {self.final_done} does not match last step done {final_step.done}."
+            )
+        if abs(self.max_cumulative_reward_achieved - max_cumulative_reward) > 1e-6:
+            raise ValueError(
+                "EpisodeTrajectory.max_cumulative_reward_achieved does not match the step sequence."
+            )
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the full episode trajectory into a JSON-serializable record."""
+
+        return {
+            "episode_id": self.episode_id,
+            "root_state_id": self.root_state_id,
+            "selected_from_archive_state_id": self.selected_from_archive_state_id,
+            "steps": [step.to_record() for step in self.steps],
+            "max_cumulative_reward_achieved": self.max_cumulative_reward_achieved,
+            "final_score": self.final_score,
+            "final_done": self.final_done,
+            "replay_metadata": self.replay_metadata.to_record(),
+            "summary_fields": self.summary_fields.to_record(),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "EpisodeTrajectory":
+        """Construct an episode trajectory from a serialized record."""
+
+        trajectory = cls(
+            episode_id=str(record["episode_id"]),
+            root_state_id=str(record.get("root_state_id", "")),
+            selected_from_archive_state_id=(
+                str(record["selected_from_archive_state_id"])
+                if record.get("selected_from_archive_state_id") not in (None, "")
+                else None
+            ),
+            steps=[
+                TrajectoryStep.from_record(step_record)
+                for step_record in (record.get("steps") or [])
+                if isinstance(step_record, MappingABC)
+            ],
+            max_cumulative_reward_achieved=float(record.get("max_cumulative_reward_achieved", 0.0)),
+            final_score=int(record.get("final_score", 0)),
+            final_done=bool(record.get("final_done", False)),
+            replay_metadata=ReplayMetadata.from_record(record["replay_metadata"])
+            if isinstance(record.get("replay_metadata"), MappingABC)
+            else ReplayMetadata(),
+            summary_fields=EpisodeTrajectorySummary.from_record(record["summary_fields"])
+            if isinstance(record.get("summary_fields"), MappingABC)
+            else EpisodeTrajectorySummary(),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+        trajectory.validate_invariants()
+        return trajectory
+
+    @classmethod
+    def from_legacy_trajectory(
+        cls,
+        trajectory: Trajectory,
+        *,
+        root_state_id: str | None = None,
+        selected_from_archive_state_id: str | None = None,
+        replay_metadata: ReplayMetadata | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "EpisodeTrajectory":
+        """Adapt the existing JSONL `Trajectory` into the GLoW-style representation."""
+
+        cumulative_reward = 0.0
+        adapted_steps: list[TrajectoryStep] = []
+        discovered_objects: set[str] = set()
+        for step in trajectory.steps:
+            cumulative_reward += float(step.reward)
+            discovered_objects.update(action_target_tokens(step.action))
+            if step.inventory_text:
+                discovered_objects.update(inventory_item_tokens(step.inventory_text))
+            step_record = step.to_record()
+            step_record["cumulative_reward"] = cumulative_reward
+            adapted_steps.append(TrajectoryStep.from_record(step_record))
+
+        if adapted_steps:
+            final_step = adapted_steps[-1]
+            max_cumulative_reward = max(step.cumulative_reward for step in adapted_steps)
+            derived_root_state_id = root_state_id or f"{trajectory.episode_id}:root:{adapted_steps[0].world_state_hash}"
+            derived_replay_metadata = replay_metadata or ReplayMetadata(
+                restore_strategy=(
+                    str(adapted_steps[0].world_state_snapshot.get("restore_strategy", "action_replay_fallback"))
+                    if adapted_steps[0].world_state_snapshot
+                    else "action_replay_fallback"
+                ),
+                replay_actions=[],
+                world_state_hash=adapted_steps[0].world_state_hash,
+                native_snapshot_reference=adapted_steps[0].native_snapshot_reference,
+                metadata={"source_path": str(trajectory.source_path) if trajectory.source_path is not None else ""},
+            )
+            summary_fields = EpisodeTrajectorySummary(
+                unique_world_state_count=len({step.world_state_hash for step in adapted_steps}),
+                unique_cluster_count=len({step.state_cluster_id for step in adapted_steps if step.state_cluster_id}),
+                action_count=len(adapted_steps),
+                loop_event_count=sum(1 for step in adapted_steps if step.loop_detected),
+                max_score=max(step.score for step in adapted_steps),
+                final_cluster_id=final_step.state_cluster_id,
+                discovered_object_tokens=sorted(discovered_objects),
+                bottleneck_step_indices=[
+                    step.step_index for step in adapted_steps if step.done or step.loop_detected
+                ],
+            )
+            episode_trajectory = cls(
+                episode_id=trajectory.episode_id,
+                root_state_id=derived_root_state_id,
+                selected_from_archive_state_id=selected_from_archive_state_id,
+                steps=adapted_steps,
+                max_cumulative_reward_achieved=max_cumulative_reward,
+                final_score=final_step.score,
+                final_done=final_step.done,
+                replay_metadata=derived_replay_metadata,
+                summary_fields=summary_fields,
+                metadata=dict(metadata or trajectory.metadata),
+            )
+            episode_trajectory.validate_invariants()
+            return episode_trajectory
+
+        return cls(
+            episode_id=trajectory.episode_id,
+            root_state_id=root_state_id or f"{trajectory.episode_id}:root:empty",
+            selected_from_archive_state_id=selected_from_archive_state_id,
+            steps=[],
+            replay_metadata=replay_metadata or ReplayMetadata(),
+            metadata=dict(metadata or trajectory.metadata),
+        )
+
+    def to_legacy_trajectory(self) -> Trajectory:
+        """Project the GLoW-style episode trajectory back to the JSONL trajectory type."""
+
+        legacy_trajectory = Trajectory(
+            episode_id=self.episode_id,
+            steps=[TrajectoryStep.from_record(step.to_record()) for step in self.steps],
+            metadata={
+                **dict(self.metadata),
+                "root_state_id": self.root_state_id,
+                "selected_from_archive_state_id": self.selected_from_archive_state_id,
+                "max_cumulative_reward_achieved": self.max_cumulative_reward_achieved,
+            },
+        )
+        legacy_trajectory.validate_integrity()
+        return legacy_trajectory
+
+
+@dataclass(slots=True)
+class FrontierTrajectoryEntry:
+    """One value-ranked trajectory retained in the global frontier."""
+
+    trajectory_id: str
+    value: float
+    novelty_score: float = 0.0
+    diversity_score: float = 0.0
+    state_cluster_ids: list[str] = field(default_factory=list)
+    state_family_keys: list[str] = field(default_factory=list)
+    bottleneck_state_ids: list[str] = field(default_factory=list)
+    bottleneck_step_indices: list[int] = field(default_factory=list)
+    inserted_at: str = ""
+    insertion_order: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the frontier trajectory entry into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "FrontierTrajectoryEntry":
+        """Construct a frontier trajectory entry from a serialized record."""
+
+        return cls(
+            trajectory_id=str(record["trajectory_id"]),
+            value=float(record.get("value", 0.0)),
+            novelty_score=float(record.get("novelty_score", 0.0)),
+            diversity_score=float(record.get("diversity_score", 0.0)),
+            state_cluster_ids=_normalize_string_list(record.get("state_cluster_ids")),
+            state_family_keys=_normalize_string_list(record.get("state_family_keys")),
+            bottleneck_state_ids=_normalize_string_list(record.get("bottleneck_state_ids")),
+            bottleneck_step_indices=[int(value) for value in (record.get("bottleneck_step_indices") or [])],
+            inserted_at=str(record.get("inserted_at", "")),
+            insertion_order=int(record.get("insertion_order", 0)),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class SimilarityMetadata:
+    """Optional embedding/similarity metadata attached to archived states."""
+
+    embedding_model: str = ""
+    embedding_id: str = ""
+    similarity_key: str = ""
+    nearest_state_ids: list[str] = field(default_factory=list)
+    similarity_score: float | None = None
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert similarity metadata into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "SimilarityMetadata":
+        """Construct similarity metadata from a serialized record."""
+
+        return cls(
+            embedding_model=str(record.get("embedding_model", "")),
+            embedding_id=str(record.get("embedding_id", "")),
+            similarity_key=str(record.get("similarity_key", "")),
+            nearest_state_ids=_normalize_string_list(record.get("nearest_state_ids")),
+            similarity_score=float(record["similarity_score"]) if record.get("similarity_score") is not None else None,
+        )
+
+
+@dataclass(slots=True)
+class ArchivedState:
+    """A stable archived state used by GLoW state selection."""
+
+    state_id: str
+    provenance_trajectory_id: str
+    provenance_timestep: int
+    achieved_value: float
+    identity_strategy: str = ""
+    first_seen_episode_id: str = ""
+    first_seen_timestep: int = 0
+    last_seen_episode_id: str = ""
+    last_seen_timestep: int = 0
+    provenance_trajectory_ids: list[str] = field(default_factory=list)
+    visit_count: int = 0
+    selection_count: int = 0
+    restore_success_count: int = 0
+    restore_failure_count: int = 0
+    score_at_state: int = 0
+    projected_potential_value: float | None = None
+    frontier_support_count: int = 0
+    supporting_frontier_trajectory_ids: list[str] = field(default_factory=list)
+    observation_summary: str = ""
+    inventory_summary: str = ""
+    valid_action_summary: str = ""
+    state_cluster_id: str = ""
+    replay_metadata: ReplayMetadata = field(default_factory=ReplayMetadata)
+    similarity_metadata: SimilarityMetadata | None = None
+    native_snapshot_reference: str | None = None
+    native_snapshot: tuple[Any, ...] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate_invariants(self) -> None:
+        """Validate basic archived-state invariants."""
+
+        if not self.state_id.strip():
+            raise ValueError("ArchivedState.state_id must not be empty.")
+        if not self.provenance_trajectory_id.strip():
+            raise ValueError("ArchivedState.provenance_trajectory_id must not be empty.")
+        if self.provenance_timestep < 0:
+            raise ValueError("ArchivedState.provenance_timestep must be >= 0.")
+        if (
+            self.first_seen_timestep < 0
+            or self.last_seen_timestep < 0
+            or self.visit_count < 0
+            or self.selection_count < 0
+            or self.restore_success_count < 0
+            or self.restore_failure_count < 0
+            or self.frontier_support_count < 0
+        ):
+            raise ValueError("ArchivedState counters/timesteps must be >= 0.")
+        if self.projected_potential_value is not None and self.projected_potential_value < self.achieved_value:
+            raise ValueError("ArchivedState.projected_potential_value must be >= achieved_value when present.")
+
+    def to_record(self, include_native_snapshot: bool = False) -> dict[str, Any]:
+        """Convert the archived state into a JSON-serializable record."""
+
+        record = {
+            "state_id": self.state_id,
+            "provenance_trajectory_id": self.provenance_trajectory_id,
+            "provenance_timestep": self.provenance_timestep,
+            "achieved_value": self.achieved_value,
+            "identity_strategy": self.identity_strategy,
+            "first_seen_episode_id": self.first_seen_episode_id,
+            "first_seen_timestep": self.first_seen_timestep,
+            "last_seen_episode_id": self.last_seen_episode_id,
+            "last_seen_timestep": self.last_seen_timestep,
+            "provenance_trajectory_ids": list(self.provenance_trajectory_ids),
+            "visit_count": self.visit_count,
+            "selection_count": self.selection_count,
+            "restore_success_count": self.restore_success_count,
+            "restore_failure_count": self.restore_failure_count,
+            "score_at_state": self.score_at_state,
+            "projected_potential_value": self.projected_potential_value,
+            "frontier_support_count": self.frontier_support_count,
+            "supporting_frontier_trajectory_ids": list(self.supporting_frontier_trajectory_ids),
+            "observation_summary": self.observation_summary,
+            "inventory_summary": self.inventory_summary,
+            "valid_action_summary": self.valid_action_summary,
+            "state_cluster_id": self.state_cluster_id,
+            "replay_metadata": self.replay_metadata.to_record(include_native_snapshot=include_native_snapshot),
+            "similarity_metadata": self.similarity_metadata.to_record() if self.similarity_metadata is not None else None,
+            "native_snapshot_reference": self.native_snapshot_reference,
+            "metadata": dict(self.metadata),
+        }
+        if include_native_snapshot and self.native_snapshot is not None:
+            record["native_snapshot"] = list(self.native_snapshot)
+        return record
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "ArchivedState":
+        """Construct an archived state from a serialized record."""
+
+        native_snapshot = record.get("native_snapshot")
+        normalized_snapshot: tuple[Any, ...] | None = None
+        if isinstance(native_snapshot, list):
+            normalized_snapshot = tuple(native_snapshot)
+        elif isinstance(native_snapshot, tuple):
+            normalized_snapshot = tuple(native_snapshot)
+
+        archived_state = cls(
+            state_id=str(record["state_id"]),
+            provenance_trajectory_id=str(record["provenance_trajectory_id"]),
+            provenance_timestep=int(record.get("provenance_timestep", 0)),
+            achieved_value=float(record.get("achieved_value", 0.0)),
+            identity_strategy=str(record.get("identity_strategy", "")),
+            first_seen_episode_id=str(record.get("first_seen_episode_id", record.get("provenance_trajectory_id", ""))),
+            first_seen_timestep=int(record.get("first_seen_timestep", record.get("provenance_timestep", 0))),
+            last_seen_episode_id=str(record.get("last_seen_episode_id", record.get("provenance_trajectory_id", ""))),
+            last_seen_timestep=int(record.get("last_seen_timestep", record.get("provenance_timestep", 0))),
+            provenance_trajectory_ids=(
+                _normalize_string_list(record.get("provenance_trajectory_ids"))
+                or [str(record["provenance_trajectory_id"])]
+            ),
+            visit_count=int(record.get("visit_count", 0)),
+            selection_count=int(record.get("selection_count", 0)),
+            restore_success_count=int(record.get("restore_success_count", 0)),
+            restore_failure_count=int(record.get("restore_failure_count", 0)),
+            score_at_state=int(record.get("score_at_state", 0)),
+            projected_potential_value=(
+                float(record["projected_potential_value"])
+                if record.get("projected_potential_value") is not None
+                else None
+            ),
+            frontier_support_count=int(record.get("frontier_support_count", 0)),
+            supporting_frontier_trajectory_ids=_normalize_string_list(record.get("supporting_frontier_trajectory_ids")),
+            observation_summary=str(record.get("observation_summary", "")),
+            inventory_summary=str(record.get("inventory_summary", "")),
+            valid_action_summary=str(record.get("valid_action_summary", "")),
+            state_cluster_id=str(record.get("state_cluster_id", "")),
+            replay_metadata=ReplayMetadata.from_record(record["replay_metadata"])
+            if isinstance(record.get("replay_metadata"), MappingABC)
+            else ReplayMetadata(),
+            similarity_metadata=SimilarityMetadata.from_record(record["similarity_metadata"])
+            if isinstance(record.get("similarity_metadata"), MappingABC)
+            else None,
+            native_snapshot_reference=(
+                str(record["native_snapshot_reference"]).strip()
+                if record.get("native_snapshot_reference") not in (None, "")
+                else None
+            ),
+            native_snapshot=normalized_snapshot,
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+        archived_state.validate_invariants()
+        return archived_state
+
+
+@dataclass(slots=True)
+class CriticalStateAnnotation:
+    """A critical state inferred by the global world model."""
+
+    critical_state_id: str
+    achieved_value: float
+    potential_value: float
+    textual_rationale: str
+    source_frontier_trajectory_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    support_count: int = 0
+    supporting_state_ids: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the critical-state annotation into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "CriticalStateAnnotation":
+        """Construct a critical-state annotation from a serialized record."""
+
+        return cls(
+            critical_state_id=str(record["critical_state_id"]),
+            achieved_value=float(record.get("achieved_value", 0.0)),
+            potential_value=float(record.get("potential_value", 0.0)),
+            textual_rationale=str(record.get("textual_rationale", "")),
+            source_frontier_trajectory_ids=_normalize_string_list(record.get("source_frontier_trajectory_ids")),
+            confidence=float(record.get("confidence", 0.0)),
+            support_count=int(record.get("support_count", 0)),
+            supporting_state_ids=_normalize_string_list(record.get("supporting_state_ids")),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class FrontierInsight:
+    """A global-world-model analysis pass over the current trajectory frontier."""
+
+    analysis_id: str
+    frontier_trajectory_ids: list[str] = field(default_factory=list)
+    inferred_bottlenecks: list[str] = field(default_factory=list)
+    partial_solutions: list[str] = field(default_factory=list)
+    missing_prerequisites: list[str] = field(default_factory=list)
+    candidate_critical_states: list[CriticalStateAnnotation] = field(default_factory=list)
+    generated_at: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the frontier insight into a JSON-serializable record."""
+
+        return {
+            "analysis_id": self.analysis_id,
+            "frontier_trajectory_ids": list(self.frontier_trajectory_ids),
+            "inferred_bottlenecks": list(self.inferred_bottlenecks),
+            "partial_solutions": list(self.partial_solutions),
+            "missing_prerequisites": list(self.missing_prerequisites),
+            "candidate_critical_states": [item.to_record() for item in self.candidate_critical_states],
+            "generated_at": self.generated_at,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "FrontierInsight":
+        """Construct a frontier insight from a serialized record."""
+
+        return cls(
+            analysis_id=str(record["analysis_id"]),
+            frontier_trajectory_ids=_normalize_string_list(record.get("frontier_trajectory_ids")),
+            inferred_bottlenecks=_normalize_string_list(record.get("inferred_bottlenecks")),
+            partial_solutions=_normalize_string_list(record.get("partial_solutions")),
+            missing_prerequisites=_normalize_string_list(record.get("missing_prerequisites")),
+            candidate_critical_states=[
+                CriticalStateAnnotation.from_record(item)
+                for item in (record.get("candidate_critical_states") or [])
+                if isinstance(item, MappingABC)
+            ],
+            generated_at=str(record.get("generated_at", "")),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class FrontierAnalysisResult:
+    """Typed result for one frontier-analysis pass."""
+
+    analysis_id: str
+    insight: FrontierInsight
+    prompt_input: str
+    raw_completion: str = ""
+    parse_error: str = ""
+    used_fallback: bool = False
+    artifact_directory: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the analysis result into a JSON-serializable record."""
+
+        return {
+            "analysis_id": self.analysis_id,
+            "insight": self.insight.to_record(),
+            "prompt_input": self.prompt_input,
+            "raw_completion": self.raw_completion,
+            "parse_error": self.parse_error,
+            "used_fallback": self.used_fallback,
+            "artifact_directory": self.artifact_directory,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "FrontierAnalysisResult":
+        """Construct a frontier-analysis result from a serialized record."""
+
+        return cls(
+            analysis_id=str(record["analysis_id"]),
+            insight=FrontierInsight.from_record(record["insight"])
+            if isinstance(record.get("insight"), MappingABC)
+            else FrontierInsight(analysis_id=str(record["analysis_id"])),
+            prompt_input=str(record.get("prompt_input", "")),
+            raw_completion=str(record.get("raw_completion", "")),
+            parse_error=str(record.get("parse_error", "")),
+            used_fallback=bool(record.get("used_fallback", False)),
+            artifact_directory=str(record.get("artifact_directory", "")),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class AdvantagePoint:
+    """A key state-action point with inferred local advantage information."""
+
+    state_id: str
+    action: str
+    inferred_advantage: float = 0.0
+    outcome_delta: str = ""
+    textual_rationale: str = ""
+    support_trajectory_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the advantage point into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "AdvantagePoint":
+        """Construct an advantage point from a serialized record."""
+
+        return cls(
+            state_id=str(record["state_id"]),
+            action=str(record.get("action", "")),
+            inferred_advantage=float(record.get("inferred_advantage", 0.0)),
+            outcome_delta=str(record.get("outcome_delta", "")),
+            textual_rationale=str(record.get("textual_rationale", "")),
+            support_trajectory_ids=_normalize_string_list(record.get("support_trajectory_ids")),
+            confidence=float(record.get("confidence", 0.0)),
+        )
+
+
+@dataclass(slots=True)
+class AdvantageHint:
+    """Local-world-model hint distilled from multiple compared trajectories."""
+
+    root_state_id: str
+    compared_trajectory_ids: list[str] = field(default_factory=list)
+    key_state_action_points: list[AdvantagePoint] = field(default_factory=list)
+    intermediate_advantage_summaries: list[str] = field(default_factory=list)
+    action_preferences: list[str] = field(default_factory=list)
+    action_avoidances: list[str] = field(default_factory=list)
+    textual_reasoning: str = ""
+    confidence: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the advantage hint into a JSON-serializable record."""
+
+        return {
+            "root_state_id": self.root_state_id,
+            "compared_trajectory_ids": list(self.compared_trajectory_ids),
+            "key_state_action_points": [item.to_record() for item in self.key_state_action_points],
+            "intermediate_advantage_summaries": list(self.intermediate_advantage_summaries),
+            "action_preferences": list(self.action_preferences),
+            "action_avoidances": list(self.action_avoidances),
+            "textual_reasoning": self.textual_reasoning,
+            "confidence": self.confidence,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "AdvantageHint":
+        """Construct an advantage hint from a serialized record."""
+
+        return cls(
+            root_state_id=str(record["root_state_id"]),
+            compared_trajectory_ids=_normalize_string_list(record.get("compared_trajectory_ids")),
+            key_state_action_points=[
+                AdvantagePoint.from_record(item)
+                for item in (record.get("key_state_action_points") or [])
+                if isinstance(item, MappingABC)
+            ],
+            intermediate_advantage_summaries=_normalize_string_list(record.get("intermediate_advantage_summaries")),
+            action_preferences=_normalize_string_list(record.get("action_preferences")),
+            action_avoidances=_normalize_string_list(record.get("action_avoidances")),
+            textual_reasoning=str(record.get("textual_reasoning", "")),
+            confidence=float(record.get("confidence", 0.0)),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class SubgoalRecord:
+    """A discovered subgoal stored in the local world model."""
+
+    subgoal_id: str
+    description: str
+    supporting_state_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the subgoal record into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "SubgoalRecord":
+        """Construct a subgoal record from a serialized record."""
+
+        return cls(
+            subgoal_id=str(record["subgoal_id"]),
+            description=str(record.get("description", "")),
+            supporting_state_ids=_normalize_string_list(record.get("supporting_state_ids")),
+            confidence=float(record.get("confidence", 0.0)),
+        )
+
+
+@dataclass(slots=True)
+class AffordanceRecord:
+    """A typed affordance discovered during local exploration."""
+
+    object_text: str
+    affordance: str
+    supporting_action: str = ""
+    confidence: float = 0.0
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the affordance record into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "AffordanceRecord":
+        """Construct an affordance record from a serialized record."""
+
+        return cls(
+            object_text=str(record.get("object_text", "")),
+            affordance=str(record.get("affordance", "")),
+            supporting_action=str(record.get("supporting_action", "")),
+            confidence=float(record.get("confidence", 0.0)),
+        )
+
+
+@dataclass(slots=True)
+class ActionBiasRecord:
+    """A typed action prior or anti-prior in the local world model."""
+
+    action: str
+    weight: float
+    rationale: str = ""
+    support_count: int = 0
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the action bias record into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "ActionBiasRecord":
+        """Construct an action bias record from a serialized record."""
+
+        return cls(
+            action=str(record.get("action", "")),
+            weight=float(record.get("weight", 0.0)),
+            rationale=str(record.get("rationale", "")),
+            support_count=int(record.get("support_count", 0)),
+        )
+
+
+@dataclass(slots=True)
+class LocalWorldModel:
+    """Typed local-world-model artifact accumulated from MAR-style comparisons."""
+
+    root_state_id: str
+    accumulated_advantage_hints: list[AdvantageHint] = field(default_factory=list)
+    discovered_subgoals: list[SubgoalRecord] = field(default_factory=list)
+    inferred_affordances: list[AffordanceRecord] = field(default_factory=list)
+    action_priors: list[ActionBiasRecord] = field(default_factory=list)
+    action_antipriors: list[ActionBiasRecord] = field(default_factory=list)
+    last_updated_timestamp: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate_invariants(self) -> None:
+        """Validate local-world-model root consistency."""
+
+        if not self.root_state_id.strip():
+            raise ValueError("LocalWorldModel.root_state_id must not be empty.")
+        mismatched_roots = {
+            hint.root_state_id
+            for hint in self.accumulated_advantage_hints
+            if hint.root_state_id != self.root_state_id
+        }
+        if mismatched_roots:
+            raise ValueError(
+                "All AdvantageHints in a LocalWorldModel must share the same root_state_id."
+            )
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the local world model into a JSON-serializable record."""
+
+        return {
+            "root_state_id": self.root_state_id,
+            "accumulated_advantage_hints": [item.to_record() for item in self.accumulated_advantage_hints],
+            "discovered_subgoals": [item.to_record() for item in self.discovered_subgoals],
+            "inferred_affordances": [item.to_record() for item in self.inferred_affordances],
+            "action_priors": [item.to_record() for item in self.action_priors],
+            "action_antipriors": [item.to_record() for item in self.action_antipriors],
+            "last_updated_timestamp": self.last_updated_timestamp,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "LocalWorldModel":
+        """Construct a local world model from a serialized record."""
+
+        world_model = cls(
+            root_state_id=str(record["root_state_id"]),
+            accumulated_advantage_hints=[
+                AdvantageHint.from_record(item)
+                for item in (record.get("accumulated_advantage_hints") or [])
+                if isinstance(item, MappingABC)
+            ],
+            discovered_subgoals=[
+                SubgoalRecord.from_record(item)
+                for item in (record.get("discovered_subgoals") or [])
+                if isinstance(item, MappingABC)
+            ],
+            inferred_affordances=[
+                AffordanceRecord.from_record(item)
+                for item in (record.get("inferred_affordances") or [])
+                if isinstance(item, MappingABC)
+            ],
+            action_priors=[
+                ActionBiasRecord.from_record(item)
+                for item in (record.get("action_priors") or [])
+                if isinstance(item, MappingABC)
+            ],
+            action_antipriors=[
+                ActionBiasRecord.from_record(item)
+                for item in (record.get("action_antipriors") or [])
+                if isinstance(item, MappingABC)
+            ],
+            last_updated_timestamp=str(record.get("last_updated_timestamp", "")),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+        world_model.validate_invariants()
+        return world_model
+
+
+@dataclass(slots=True)
+class LocalWorldModelPromptSummary:
+    """Bounded prompt payload distilled from a typed local world model."""
+
+    root_state_id: str
+    summary_text: str = ""
+    recent_advantage_hints: list[str] = field(default_factory=list)
+    discovered_subgoals: list[str] = field(default_factory=list)
+    inferred_affordances: list[str] = field(default_factory=list)
+    action_priors: list[str] = field(default_factory=list)
+    action_antipriors: list[str] = field(default_factory=list)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the prompt summary into a JSON-serializable record."""
+
+        return asdict(self)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "LocalWorldModelPromptSummary":
+        """Construct a prompt summary from a serialized record."""
+
+        return cls(
+            root_state_id=str(record.get("root_state_id", "")),
+            summary_text=str(record.get("summary_text", "")),
+            recent_advantage_hints=_normalize_string_list(record.get("recent_advantage_hints")),
+            discovered_subgoals=_normalize_string_list(record.get("discovered_subgoals")),
+            inferred_affordances=_normalize_string_list(record.get("inferred_affordances")),
+            action_priors=_normalize_string_list(record.get("action_priors")),
+            action_antipriors=_normalize_string_list(record.get("action_antipriors")),
+        )
+
+    def has_guidance(self) -> bool:
+        """Return whether the summary contains any non-empty local guidance."""
+
+        return any(
+            (
+                self.summary_text.strip(),
+                self.recent_advantage_hints,
+                self.discovered_subgoals,
+                self.inferred_affordances,
+                self.action_priors,
+                self.action_antipriors,
+            )
+        )
+
+
+@dataclass(slots=True)
+class MARInferenceResult:
+    """Typed result for one Multi-path Advantage Reflection inference pass."""
+
+    root_state_id: str
+    compared_branch_ids: list[str] = field(default_factory=list)
+    advantage_hint: AdvantageHint | None = None
+    discovered_subgoals: list[SubgoalRecord] = field(default_factory=list)
+    inferred_affordances: list[AffordanceRecord] = field(default_factory=list)
+    prompt_input: str = ""
+    raw_completion: str = ""
+    parse_error: str = ""
+    used_fallback: bool = False
+    artifact_directory: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the MAR inference result into a JSON-serializable record."""
+
+        return {
+            "root_state_id": self.root_state_id,
+            "compared_branch_ids": list(self.compared_branch_ids),
+            "advantage_hint": self.advantage_hint.to_record() if self.advantage_hint is not None else None,
+            "discovered_subgoals": [item.to_record() for item in self.discovered_subgoals],
+            "inferred_affordances": [item.to_record() for item in self.inferred_affordances],
+            "prompt_input": self.prompt_input,
+            "raw_completion": self.raw_completion,
+            "parse_error": self.parse_error,
+            "used_fallback": self.used_fallback,
+            "artifact_directory": self.artifact_directory,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "MARInferenceResult":
+        """Construct a MAR inference result from a serialized record."""
+
+        return cls(
+            root_state_id=str(record.get("root_state_id", "")),
+            compared_branch_ids=_normalize_string_list(record.get("compared_branch_ids")),
+            advantage_hint=AdvantageHint.from_record(record["advantage_hint"])
+            if isinstance(record.get("advantage_hint"), MappingABC)
+            else None,
+            discovered_subgoals=[
+                SubgoalRecord.from_record(item)
+                for item in (record.get("discovered_subgoals") or [])
+                if isinstance(item, MappingABC)
+            ],
+            inferred_affordances=[
+                AffordanceRecord.from_record(item)
+                for item in (record.get("inferred_affordances") or [])
+                if isinstance(item, MappingABC)
+            ],
+            prompt_input=str(record.get("prompt_input", "")),
+            raw_completion=str(record.get("raw_completion", "")),
+            parse_error=str(record.get("parse_error", "")),
+            used_fallback=bool(record.get("used_fallback", False)),
+            artifact_directory=str(record.get("artifact_directory", "")),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class GlowSelectionDecisionMetric:
+    """Structured metrics for one archive-state selection decision."""
+
+    cycle_index: int
+    selected_state_id: str | None
+    root_state_id: str | None
+    replay_method: str = ""
+    achieved_contribution: float = 0.0
+    potential_contribution: float = 0.0
+    rationale: str = ""
+    frontier_size_before: int = 0
+    frontier_size_after: int = 0
+    branch_count: int = 0
+    restore_succeeded: bool = False
+    used_llm_adjudication: bool = False
+    selected_frontier_trajectory_ids: list[str] = field(default_factory=list)
+    selected_critical_state_ids: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the selection metric into a JSON-serializable record."""
+
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class GlowEpisodeMetrics:
+    """Structured per-episode metrics for the GLoW control loop."""
+
+    episode_id: str
+    seed: int
+    environment_interactions: int
+    max_score: int
+    final_score: int
+    frontier_size_over_time: list[int] = field(default_factory=list)
+    frontier_analysis_count: int = 0
+    frontier_analysis_ids: list[str] = field(default_factory=list)
+    mar_update_count: int = 0
+    restore_attempt_count: int = 0
+    restore_success_count: int = 0
+    selected_state_decisions: list[GlowSelectionDecisionMetric] = field(default_factory=list)
+    branch_counts_per_root_state: dict[str, int] = field(default_factory=dict)
+    local_world_model_root_ids: list[str] = field(default_factory=list)
+    frontier_analysis_artifact_directories: list[str] = field(default_factory=list)
+    selection_artifact_directories: list[str] = field(default_factory=list)
+    mar_artifact_directories: list[str] = field(default_factory=list)
+    local_world_model_snapshot_paths: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the episode metrics into a JSON-serializable record."""
+
+        return {
+            "episode_id": self.episode_id,
+            "seed": self.seed,
+            "environment_interactions": self.environment_interactions,
+            "max_score": self.max_score,
+            "final_score": self.final_score,
+            "frontier_size_over_time": list(self.frontier_size_over_time),
+            "frontier_analysis_count": self.frontier_analysis_count,
+            "frontier_analysis_ids": list(self.frontier_analysis_ids),
+            "mar_update_count": self.mar_update_count,
+            "restore_attempt_count": self.restore_attempt_count,
+            "restore_success_count": self.restore_success_count,
+            "selected_state_decisions": [item.to_record() for item in self.selected_state_decisions],
+            "branch_counts_per_root_state": dict(self.branch_counts_per_root_state),
+            "local_world_model_root_ids": list(self.local_world_model_root_ids),
+            "frontier_analysis_artifact_directories": list(self.frontier_analysis_artifact_directories),
+            "selection_artifact_directories": list(self.selection_artifact_directories),
+            "mar_artifact_directories": list(self.mar_artifact_directories),
+            "local_world_model_snapshot_paths": list(self.local_world_model_snapshot_paths),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "GlowEpisodeMetrics":
+        """Construct episode metrics from a serialized record."""
+
+        return cls(
+            episode_id=str(record.get("episode_id", "")),
+            seed=int(record.get("seed", 0)),
+            environment_interactions=int(record.get("environment_interactions", 0)),
+            max_score=int(record.get("max_score", 0)),
+            final_score=int(record.get("final_score", 0)),
+            frontier_size_over_time=[int(value) for value in (record.get("frontier_size_over_time") or [])],
+            frontier_analysis_count=int(record.get("frontier_analysis_count", 0)),
+            frontier_analysis_ids=_normalize_string_list(record.get("frontier_analysis_ids")),
+            mar_update_count=int(record.get("mar_update_count", 0)),
+            restore_attempt_count=int(record.get("restore_attempt_count", 0)),
+            restore_success_count=int(record.get("restore_success_count", 0)),
+            selected_state_decisions=[
+                GlowSelectionDecisionMetric(**dict(item))
+                for item in (record.get("selected_state_decisions") or [])
+                if isinstance(item, MappingABC)
+            ],
+            branch_counts_per_root_state={
+                str(key): int(value)
+                for key, value in dict(record.get("branch_counts_per_root_state", {})).items()
+            },
+            local_world_model_root_ids=_normalize_string_list(record.get("local_world_model_root_ids")),
+            frontier_analysis_artifact_directories=_normalize_string_list(
+                record.get("frontier_analysis_artifact_directories")
+            ),
+            selection_artifact_directories=_normalize_string_list(record.get("selection_artifact_directories")),
+            mar_artifact_directories=_normalize_string_list(record.get("mar_artifact_directories")),
+            local_world_model_snapshot_paths=_normalize_string_list(record.get("local_world_model_snapshot_paths")),
+            metadata=dict(record["metadata"]) if isinstance(record.get("metadata"), MappingABC) else {},
+        )
+
+
+@dataclass(slots=True)
+class GlowRunMetrics:
+    """Structured run-level metrics and aggregate statistics for GLoW experiments."""
+
+    run_id: str
+    config_path: str
+    episode_count: int
+    seed_values: list[int]
+    mean_final_score: float
+    std_final_score: float
+    mean_max_score: float
+    std_max_score: float
+    mean_environment_interactions: float
+    std_environment_interactions: float
+    total_restore_attempt_count: int = 0
+    total_restore_success_count: int = 0
+    total_frontier_analysis_count: int = 0
+    total_mar_update_count: int = 0
+    episode_metric_paths: list[str] = field(default_factory=list)
+    episode_summary_paths: list[str] = field(default_factory=list)
+    trajectory_paths: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    summary_path: str = ""
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert run-level metrics into a JSON-serializable record."""
+
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class EpisodeResult:
     """Summary of a completed episode."""
 
@@ -3625,6 +4901,7 @@ class EpisodeResult:
     final_score: int
     trajectory_path: Path
     summary_path: Path | None = None
+    metrics_path: Path | None = None
     notes: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -3634,33 +4911,5 @@ class EpisodeResult:
         payload = asdict(self)
         payload["trajectory_path"] = str(self.trajectory_path)
         payload["summary_path"] = str(self.summary_path) if self.summary_path is not None else None
+        payload["metrics_path"] = str(self.metrics_path) if self.metrics_path is not None else None
         return payload
-
-
-@dataclass(slots=True)
-class BatchEvaluationSummary:
-    """Aggregate summary for a multi-seed evaluation run."""
-
-    episode_count: int
-    seed_values: list[int]
-    mean_reward: float
-    std_reward: float
-    mean_steps: float
-    std_steps: float
-    mean_final_score: float
-    std_final_score: float
-    trajectory_paths: list[Path] = field(default_factory=list)
-    summary_path: Path | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def to_record(self) -> dict[str, Any]:
-        """Convert the batch summary into a serializable dictionary."""
-
-        payload = asdict(self)
-        payload["trajectory_paths"] = [str(path) for path in self.trajectory_paths]
-        payload["summary_path"] = str(self.summary_path) if self.summary_path is not None else None
-        return payload
-
-
-EpisodeSummary = EpisodeResult
-FrontierState = SavedNode

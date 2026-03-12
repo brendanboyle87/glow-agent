@@ -1,4 +1,4 @@
-"""Configuration models and YAML loading helpers for the scaffold.
+"""Configuration models and YAML loading helpers for the GLoW implementation.
 
 TODO: add schema versioning and provider-specific config validation.
 """
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from zork_agent.types import (
+    RunnerMode,
     StateSelectionMode,
     default_inverse_action_pairs,
     default_verb_family_prior_scores,
@@ -57,6 +59,13 @@ class LLMConfig(StrictModel):
     max_tokens: int = 256
     request_timeout_seconds: float = 60.0
     offline_stub: bool = True
+    analysis_debug_mode: bool = False
+    frontier_analysis_max_tokens: int = 1200
+    frontier_analysis_debug_max_tokens: int = 3000
+    state_selection_max_tokens: int = 1500
+    state_selection_debug_max_tokens: int = 2500
+    mar_max_tokens: int = 768
+    mar_debug_max_tokens: int = 1800
 
     @field_validator("base_url")
     @classmethod
@@ -98,6 +107,36 @@ class LLMConfig(StrictModel):
             raise ValueError("llm.max_tokens must be greater than 0.")
         return value
 
+    @field_validator(
+        "frontier_analysis_max_tokens",
+        "frontier_analysis_debug_max_tokens",
+        "state_selection_max_tokens",
+        "state_selection_debug_max_tokens",
+        "mar_max_tokens",
+        "mar_debug_max_tokens",
+    )
+    @classmethod
+    def validate_analysis_token_budgets(cls, value: int, info) -> int:
+        """Require positive output budgets for structured analysis stages."""
+
+        if value <= 0:
+            raise ValueError(f"llm.{info.field_name} must be greater than 0.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_analysis_debug_budgets(self) -> "LLMConfig":
+        """Keep debug analysis budgets at least as large as the normal analysis budgets."""
+
+        if self.frontier_analysis_debug_max_tokens < self.frontier_analysis_max_tokens:
+            raise ValueError(
+                "llm.frontier_analysis_debug_max_tokens must be >= llm.frontier_analysis_max_tokens."
+            )
+        if self.state_selection_debug_max_tokens < self.state_selection_max_tokens:
+            raise ValueError("llm.state_selection_debug_max_tokens must be >= llm.state_selection_max_tokens.")
+        if self.mar_debug_max_tokens < self.mar_max_tokens:
+            raise ValueError("llm.mar_debug_max_tokens must be >= llm.mar_max_tokens.")
+        return self
+
     @field_validator("request_timeout_seconds")
     @classmethod
     def validate_timeout(cls, value: float) -> float:
@@ -115,6 +154,7 @@ class PromptConfig(StrictModel):
     system_file: str = "system.txt"
     action_proposal_file: str = "action_proposal.txt"
     trajectory_analysis_file: str = "trajectory_analysis.txt"
+    frontier_analysis_file: str = "frontier_analysis.txt"
     local_reflection_file: str = "local_reflection.txt"
     state_selection_file: str = "state_selection.txt"
 
@@ -122,6 +162,7 @@ class PromptConfig(StrictModel):
         "system_file",
         "action_proposal_file",
         "trajectory_analysis_file",
+        "frontier_analysis_file",
         "local_reflection_file",
         "state_selection_file",
     )
@@ -145,6 +186,18 @@ class PolicyConfig(StrictModel):
     archive_top_k: int = 8
     action_candidates: int = 4
     state_selection_mode: StateSelectionMode = StateSelectionMode.HEURISTIC
+    archive_state_selection_mode: StateSelectionMode = StateSelectionMode.ARCHIVE_BALANCED
+    state_selection_prompt_candidate_limit: int = 6
+    state_selection_achieved_value_weight: float = 1.0
+    state_selection_potential_value_weight: float = 1.5
+    state_selection_selection_penalty: float = 0.25
+    state_selection_visit_penalty: float = 0.1
+    state_selection_no_achievement_revisit_penalty: float = 1.25
+    state_selection_nonproductive_revisit_penalty: float = 0.5
+    state_selection_direct_match_bonus: float = 1.0
+    state_selection_supporting_match_bonus: float = 0.75
+    state_selection_source_trajectory_bonus: float = 0.35
+    state_selection_native_snapshot_bonus: float = 0.2
     inverse_action_pairs: dict[str, str] = Field(default_factory=default_inverse_action_pairs)
     immediate_inverse_penalty: float = 0.75
     repeated_pair_penalty: float = 1.0
@@ -197,6 +250,7 @@ class PolicyConfig(StrictModel):
     min_strategic_opportunity_priority: float = 0.5
     landmark_movement_bonus: float = 1.25
     fresh_affordance_followup_bonus: float = 1.5
+    fresh_unlocked_exit_bonus: float = 4.0
     discard_inventory_penalty: float = 2.0
     bulk_inventory_action_penalty: float = 2.5
     branch_progress_score_weight: float = 1.0
@@ -214,6 +268,7 @@ class PolicyConfig(StrictModel):
     room_text_only_weight: float = 0.1
     movement_progress_cap: float = 0.5
     min_affordance_gain_for_movement_commit: int = 1
+    local_guidance_stale_revisit_threshold: int = 2
     branch_commit_min_progress_score: float = 1.0
     branch_commit_movement_ratio_threshold: float = 0.75
     branch_fail_fast_penalty_threshold: float = 3.0
@@ -247,6 +302,7 @@ class PolicyConfig(StrictModel):
         "frontier_max_size",
         "archive_top_k",
         "action_candidates",
+        "state_selection_prompt_candidate_limit",
     )
     @classmethod
     def validate_positive_policy_values(cls, value: int, info) -> int:
@@ -339,6 +395,16 @@ class PolicyConfig(StrictModel):
         "action_new_noun_bonus",
         "action_new_noun_interaction_bonus",
         "action_repeated_no_gain_penalty",
+        "state_selection_achieved_value_weight",
+        "state_selection_potential_value_weight",
+        "state_selection_selection_penalty",
+        "state_selection_visit_penalty",
+        "state_selection_no_achievement_revisit_penalty",
+        "state_selection_nonproductive_revisit_penalty",
+        "state_selection_direct_match_bonus",
+        "state_selection_supporting_match_bonus",
+        "state_selection_source_trajectory_bonus",
+        "state_selection_native_snapshot_bonus",
         "object_family_exhaustion_penalty",
         "post_score_scene_exhaustion_penalty",
         "post_score_inventory_object_penalty",
@@ -349,6 +415,7 @@ class PolicyConfig(StrictModel):
         "strategic_object_bonus",
         "strategic_avoid_penalty",
         "min_strategic_opportunity_priority",
+        "fresh_unlocked_exit_bonus",
         "discard_inventory_penalty",
         "bulk_inventory_action_penalty",
         "branch_progress_score_weight",
@@ -401,6 +468,15 @@ class PolicyConfig(StrictModel):
             raise ValueError("policy.min_affordance_gain_for_movement_commit must be >= 0.")
         return value
 
+    @field_validator("local_guidance_stale_revisit_threshold")
+    @classmethod
+    def validate_local_guidance_stale_revisit_threshold(cls, value: int) -> int:
+        """Require a positive revisit threshold before suppressing stale try-guidance."""
+
+        if value <= 0:
+            raise ValueError("policy.local_guidance_stale_revisit_threshold must be > 0.")
+        return value
+
     @field_validator("object_family_no_progress_threshold")
     @classmethod
     def validate_object_family_no_progress_threshold(cls, value: int) -> int:
@@ -419,6 +495,7 @@ class PathsConfig(StrictModel):
     archive_dir: Path
     log_dir: Path
     summary_dir: Path
+    metrics_dir: Path = Path("artifacts/metrics")
 
     @model_validator(mode="after")
     def validate_unique_directories(self) -> "PathsConfig":
@@ -430,6 +507,7 @@ class PathsConfig(StrictModel):
             "archive_dir": self.archive_dir,
             "log_dir": self.log_dir,
             "summary_dir": self.summary_dir,
+            "metrics_dir": self.metrics_dir,
         }
         duplicates = _find_duplicate_path_names(path_values)
         if duplicates:
@@ -460,12 +538,19 @@ class ExperimentConfig(StrictModel):
     """Episode and evaluation settings."""
 
     game_id: str = "zork1"
+    runner_mode: RunnerMode = RunnerMode.GLOW_FAITHFUL
     seed: int = 7
     batch_size: int = 1
     max_steps: int = 8
     max_replay_attempts: int = 2
     frontier_refresh_cadence: int = 1
     local_exploration_cadence: int = 3
+    glow_frontier_size: int = 8
+    glow_local_branches_per_root: int = 4
+    glow_frontier_analysis_frequency: int = 1
+    enable_global_frontier_analysis: bool = True
+    enable_mar: bool = True
+    enable_potential_value_selection: bool = True
     local_exploration_post_gain_cooldown_steps: int = 0
     branch_commit_steps: int = 4
     fail_fast_no_durable_gain_steps: int = 10
@@ -480,6 +565,9 @@ class ExperimentConfig(StrictModel):
         "max_replay_attempts",
         "frontier_refresh_cadence",
         "local_exploration_cadence",
+        "glow_frontier_size",
+        "glow_local_branches_per_root",
+        "glow_frontier_analysis_frequency",
         "local_exploration_post_gain_cooldown_steps",
         "branch_commit_steps",
         "fail_fast_no_durable_gain_steps",
@@ -531,6 +619,24 @@ class ProjectConfig(StrictModel):
 
         return self.paths.log_dir / self.logging.run_log_filename
 
+    def scoped_to_run(self, run_id: str) -> "ProjectConfig":
+        """Return a copy of this config whose artifact paths live under one run root."""
+
+        normalized_run_id = _normalize_run_output_name(run_id)
+        if not normalized_run_id:
+            raise ValueError("run_id must not be empty.")
+        run_root = self.paths.artifacts_dir / normalized_run_id
+        data = self.model_dump(mode="python")
+        data["paths"] = {
+            "artifacts_dir": run_root,
+            "trajectory_dir": run_root / "trajectories",
+            "archive_dir": run_root / "archive",
+            "log_dir": run_root / "logs",
+            "summary_dir": run_root / "summaries",
+            "metrics_dir": run_root / "metrics",
+        }
+        return ProjectConfig.model_validate(data)
+
     def ensure_output_directories(self) -> None:
         """Create the configured artifact directories if needed."""
 
@@ -541,6 +647,7 @@ class ProjectConfig(StrictModel):
             self.paths.archive_dir,
             self.paths.log_dir,
             self.paths.summary_dir,
+            self.paths.metrics_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -558,6 +665,7 @@ class ProjectConfig(StrictModel):
                 self.prompts.system_file,
                 self.prompts.action_proposal_file,
                 self.prompts.trajectory_analysis_file,
+                self.prompts.frontier_analysis_file,
                 self.prompts.local_reflection_file,
                 self.prompts.state_selection_file,
             )
@@ -655,6 +763,13 @@ def _set_nested_value(payload: dict[str, Any], path_keys: tuple[str, ...], value
     cursor[path_keys[-1]] = value
 
 
+def _normalize_run_output_name(value: str) -> str:
+    """Normalize a run id into one filesystem-safe path component."""
+
+    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-.")
+    return normalized
+
+
 def _resolve_relative_paths(config: ProjectConfig, base_dir: Path) -> ProjectConfig:
     """Resolve path-valued config fields relative to the config file."""
 
@@ -670,6 +785,7 @@ def _resolve_relative_paths(config: ProjectConfig, base_dir: Path) -> ProjectCon
     data["prompts"]["directory"] = resolve(data["prompts"]["directory"])
     for key in ("artifacts_dir", "trajectory_dir", "archive_dir", "log_dir", "summary_dir"):
         data["paths"][key] = resolve(data["paths"][key])
+    data["paths"]["metrics_dir"] = resolve(data["paths"]["metrics_dir"])
 
     return ProjectConfig.model_validate(data)
 

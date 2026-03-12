@@ -24,6 +24,8 @@ from zork_agent.types import (
     ActionGenerationResult,
     StrategicMode,
     ActionProposal,
+    LocalWorldModel,
+    LocalWorldModelPromptSummary,
     LoopHeuristicResult,
     TextGameState,
     action_target_tokens,
@@ -95,6 +97,8 @@ class ActionGenerator:
         supported_try_actions: list[str] | None = None,
         supported_avoid_actions: list[str] | None = None,
         supported_reflection_objects: list[str] | None = None,
+        root_state_id: str = "",
+        local_world_model: LocalWorldModel | None = None,
         strategic_mode: StrategicMode | None = None,
         strategic_reason: str = "",
         strategic_try_actions: list[str] | None = None,
@@ -118,6 +122,8 @@ class ActionGenerator:
             supported_try_actions=supported_try_actions,
             supported_avoid_actions=supported_avoid_actions,
             supported_reflection_objects=supported_reflection_objects,
+            root_state_id=root_state_id,
+            local_world_model=local_world_model,
             strategic_mode=strategic_mode,
             strategic_reason=strategic_reason,
             strategic_try_actions=strategic_try_actions,
@@ -144,6 +150,8 @@ class ActionGenerator:
         supported_try_actions: list[str] | None = None,
         supported_avoid_actions: list[str] | None = None,
         supported_reflection_objects: list[str] | None = None,
+        root_state_id: str = "",
+        local_world_model: LocalWorldModel | None = None,
         strategic_mode: StrategicMode | None = None,
         strategic_reason: str = "",
         strategic_try_actions: list[str] | None = None,
@@ -157,13 +165,96 @@ class ActionGenerator:
         candidate_count = candidate_count or self.config.policy.action_candidates
         recent_actions = list(recent_actions or [])
         recent_loop_results = list(recent_loop_results or [])
-        supported_try_actions = self._normalize_action_list(supported_try_actions or [])
-        supported_avoid_actions = self._normalize_action_list(supported_avoid_actions or [])
-        supported_reflection_objects = self._normalize_token_list(supported_reflection_objects or [])
+        external_supported_try_actions = self._normalize_action_list(supported_try_actions or [])
+        external_supported_avoid_actions = self._normalize_action_list(supported_avoid_actions or [])
+        external_supported_reflection_objects = sorted(self._normalize_token_list(supported_reflection_objects or []))
+        local_world_model_summary, local_model_try_actions, local_model_avoid_actions, local_model_objects = (
+            self._local_world_model_context(
+                root_state_id=root_state_id,
+                local_world_model=local_world_model,
+            )
+        )
+        supported_try_actions = self._normalize_action_list(
+            [*external_supported_try_actions, *local_model_try_actions]
+        )
+        supported_avoid_actions = self._normalize_action_list(
+            [*external_supported_avoid_actions, *local_model_avoid_actions]
+        )
+        supported_reflection_objects = self._normalize_token_list(
+            [*external_supported_reflection_objects, *local_model_objects]
+        )
         strategic_try_actions = self._normalize_action_list(strategic_try_actions or [])
         strategic_avoid_actions = self._normalize_action_list(strategic_avoid_actions or [])
         strategic_objects = self._normalize_token_list(strategic_objects or [])
         strategic_mode = strategic_mode or StrategicMode.EXPLORE
+        local_guidance_available = bool(
+            local_world_model_summary.has_guidance()
+            or local_model_try_actions
+            or local_model_avoid_actions
+            or local_model_objects
+        )
+        guidance_metadata = {
+            "root_state_id": root_state_id,
+            "local_world_model_present": local_world_model is not None,
+            "local_world_model_no_achievement_revisit_streak": (
+                int(local_world_model.metadata.get("no_achievement_revisit_streak", 0))
+                if local_world_model is not None
+                else 0
+            ),
+            "local_world_model_nonproductive_revisit_streak": (
+                int(local_world_model.metadata.get("nonproductive_revisit_streak", 0))
+                if local_world_model is not None
+                else 0
+            ),
+            "local_world_model_summary_has_guidance": local_world_model_summary.has_guidance(),
+            "local_world_model_hint_count": (
+                len(local_world_model.accumulated_advantage_hints)
+                if local_world_model is not None
+                else 0
+            ),
+            "local_world_model_prior_count": (
+                len(local_world_model.action_priors)
+                if local_world_model is not None
+                else 0
+            ),
+            "local_world_model_antiprior_count": (
+                len(local_world_model.action_antipriors)
+                if local_world_model is not None
+                else 0
+            ),
+            "local_world_model_affordance_count": (
+                len(local_world_model.inferred_affordances)
+                if local_world_model is not None
+                else 0
+            ),
+            "local_model_try_actions": list(local_model_try_actions),
+            "local_model_avoid_actions": list(local_model_avoid_actions),
+            "local_model_objects": list(local_model_objects),
+            "local_model_try_action_count": len(local_model_try_actions),
+            "local_model_avoid_action_count": len(local_model_avoid_actions),
+            "local_model_object_count": len(local_model_objects),
+            "external_supported_try_actions": list(external_supported_try_actions),
+            "external_supported_avoid_actions": list(external_supported_avoid_actions),
+            "external_supported_reflection_objects": list(external_supported_reflection_objects),
+            "external_supported_try_action_count": len(external_supported_try_actions),
+            "external_supported_avoid_action_count": len(external_supported_avoid_actions),
+            "external_supported_object_count": len(external_supported_reflection_objects),
+            "merged_supported_try_actions": list(supported_try_actions),
+            "merged_supported_avoid_actions": list(supported_avoid_actions),
+            "merged_supported_reflection_objects": sorted(supported_reflection_objects),
+            "merged_supported_try_action_count": len(supported_try_actions),
+            "merged_supported_avoid_action_count": len(supported_avoid_actions),
+            "merged_supported_object_count": len(supported_reflection_objects),
+            "local_guidance_available": local_guidance_available,
+            "local_guidance_attached_to_policy_input": local_guidance_available,
+            "local_guidance_attached_to_prompt": bool(self.llm_client is not None and local_guidance_available),
+            "local_guidance_consumed_by_reranker": local_guidance_available,
+            "local_world_model_try_guidance_suppressed": bool(
+                local_world_model is not None
+                and int(local_world_model.metadata.get("no_achievement_revisit_streak", 0))
+                >= self.config.policy.local_guidance_stale_revisit_threshold
+            ),
+        }
 
         if valid_actions:
             result = self._generate_constrained(
@@ -181,6 +272,8 @@ class ActionGenerator:
                 supported_try_actions=supported_try_actions,
                 supported_avoid_actions=supported_avoid_actions,
                 supported_reflection_objects=supported_reflection_objects,
+                root_state_id=root_state_id,
+                local_world_model_summary=local_world_model_summary,
                 strategic_mode=strategic_mode,
                 strategic_reason=strategic_reason,
                 strategic_try_actions=strategic_try_actions,
@@ -202,6 +295,8 @@ class ActionGenerator:
                 supported_try_actions=supported_try_actions,
                 supported_avoid_actions=supported_avoid_actions,
                 supported_reflection_objects=supported_reflection_objects,
+                root_state_id=root_state_id,
+                local_world_model_summary=local_world_model_summary,
                 strategic_mode=strategic_mode,
                 strategic_reason=strategic_reason,
                 strategic_try_actions=strategic_try_actions,
@@ -209,6 +304,7 @@ class ActionGenerator:
                 strategic_objects=strategic_objects,
             )
 
+        result.metadata.update(guidance_metadata)
         self.last_result = result
         return result
 
@@ -229,6 +325,8 @@ class ActionGenerator:
         supported_try_actions: list[str],
         supported_avoid_actions: list[str],
         supported_reflection_objects: list[str],
+        root_state_id: str,
+        local_world_model_summary: LocalWorldModelPromptSummary,
         strategic_mode: StrategicMode,
         strategic_reason: str,
         strategic_try_actions: list[str],
@@ -257,6 +355,8 @@ class ActionGenerator:
                 supported_try_actions=supported_try_actions,
                 supported_avoid_actions=supported_avoid_actions,
                 supported_reflection_objects=supported_reflection_objects,
+                root_state_id=root_state_id,
+                local_world_model_summary=local_world_model_summary,
                 strategic_mode=strategic_mode,
                 strategic_reason=strategic_reason,
                 strategic_try_actions=strategic_try_actions,
@@ -361,6 +461,8 @@ class ActionGenerator:
         supported_try_actions: list[str],
         supported_avoid_actions: list[str],
         supported_reflection_objects: list[str],
+        root_state_id: str,
+        local_world_model_summary: LocalWorldModelPromptSummary,
         strategic_mode: StrategicMode,
         strategic_reason: str,
         strategic_try_actions: list[str],
@@ -396,6 +498,8 @@ class ActionGenerator:
                     )[:6],
                     supported_try_actions=supported_try_actions,
                     supported_avoid_actions=supported_avoid_actions,
+                    root_state_id=root_state_id,
+                    local_world_model_summary=local_world_model_summary,
                     strategic_mode=strategic_mode.value,
                     strategic_reason=strategic_reason,
                     strategic_try_actions=strategic_try_actions,
@@ -411,6 +515,7 @@ class ActionGenerator:
                     temperature=self.config.llm.temperature if temperature is None else temperature,
                     max_tokens=self.config.llm.max_tokens,
                     timeout_seconds=self.config.llm.request_timeout_seconds,
+                    metadata={"task": "action_generation_open"},
                 )
                 raw_output = response.text
                 model_name = response.model
@@ -486,6 +591,8 @@ class ActionGenerator:
         supported_try_actions: list[str],
         supported_avoid_actions: list[str],
         supported_reflection_objects: list[str],
+        root_state_id: str,
+        local_world_model_summary: LocalWorldModelPromptSummary,
         strategic_mode: StrategicMode,
         strategic_reason: str,
         strategic_try_actions: list[str],
@@ -519,6 +626,8 @@ class ActionGenerator:
             salient_objects=salient_objects[:8],
             supported_try_actions=supported_try_actions,
             supported_avoid_actions=supported_avoid_actions,
+            root_state_id=root_state_id,
+            local_world_model_summary=local_world_model_summary,
             strategic_mode=strategic_mode.value,
             strategic_reason=strategic_reason,
             strategic_try_actions=strategic_try_actions,
@@ -535,6 +644,7 @@ class ActionGenerator:
                 temperature=self.config.llm.temperature if temperature is None else temperature,
                 max_tokens=self.config.llm.max_tokens,
                 timeout_seconds=self.config.llm.request_timeout_seconds,
+                metadata={"task": "action_generation_constrained"},
             )
         except Exception as exc:
             _LOGGER.warning("Action generation fell back after LLM request failure: %s", exc)
@@ -1086,6 +1196,19 @@ class ActionGenerator:
                 candidate.action,
                 visible_nouns=visible_nouns,
             ),
+            is_freshly_unlocked_action=bool(
+                state_action_history is not None
+                and normalized_action in state_action_history.fresh_valid_actions
+            ),
+            is_freshly_unlocked_exit=bool(
+                state_action_history is not None
+                and normalized_action in state_action_history.fresh_exit_actions
+            ),
+            follows_recent_affordance_unlock=bool(
+                state_action_history is not None
+                and normalized_action in state_action_history.fresh_exit_actions
+                and state_action_history.recent_affordance_targets
+            ),
             touches_exhausted_family=bool(
                 state_action_history is not None
                 and state_action_history.exhausted_families(self.config.policy.object_family_no_progress_threshold)
@@ -1346,6 +1469,18 @@ class ActionGenerator:
             canonical_prior_contribution += self.config.policy.fresh_affordance_followup_bonus
             plausibility_score += self.config.policy.fresh_affordance_followup_bonus
             reasons.append("fresh_affordance_followup")
+
+        if features.is_freshly_unlocked_exit:
+            unlocked_exit_bonus = self.config.policy.fresh_unlocked_exit_bonus
+            if features.follows_recent_affordance_unlock:
+                unlocked_exit_bonus += self.config.policy.fresh_affordance_followup_bonus
+            positive += unlocked_exit_bonus
+            plausibility_score += unlocked_exit_bonus
+            reasons.append(
+                "fresh_affordance_unlocked_exit"
+                if features.follows_recent_affordance_unlock
+                else "fresh_unlocked_exit"
+            )
 
         if trustworthy_soft_support and (
             features.matches_supported_try_action or features.touches_supported_reflection_object
@@ -1828,6 +1963,8 @@ class ActionGenerator:
         """Return whether movement has prior durable evidence of usefulness."""
 
         return (
+            features.is_freshly_unlocked_exit
+            or
             features.produced_score_gain_before
             or (
                 features.produced_inventory_gain_before
@@ -2401,6 +2538,54 @@ class ActionGenerator:
         for action in supported_try_actions:
             tokens.update(action_target_tokens(action, self.config.policy.inverse_action_pairs))
         return tokens
+
+    def _local_world_model_context(
+        self,
+        *,
+        root_state_id: str,
+        local_world_model: LocalWorldModel | None,
+    ) -> tuple[LocalWorldModelPromptSummary, list[str], list[str], list[str]]:
+        """Build bounded prompt context and action guidance from a local world model."""
+
+        summary = self.prompt_manager.summarize_local_world_model(
+            local_world_model,
+            root_state_id=root_state_id,
+        )
+        if local_world_model is None:
+            return summary, [], [], []
+        no_achievement_revisit_streak = int(local_world_model.metadata.get("no_achievement_revisit_streak", 0))
+        suppress_try_guidance = (
+            no_achievement_revisit_streak >= self.config.policy.local_guidance_stale_revisit_threshold
+        )
+        try_actions = [
+            item.action.strip()
+            for item in local_world_model.action_priors
+            if item.action.strip()
+        ]
+        avoid_actions = [
+            item.action.strip()
+            for item in local_world_model.action_antipriors
+            if item.action.strip()
+        ]
+        salient_objects = [
+            item.object_text.strip()
+            for item in local_world_model.inferred_affordances
+            if item.object_text.strip()
+        ]
+        for hint in local_world_model.accumulated_advantage_hints[-2:]:
+            try_actions.extend(item for item in hint.action_preferences if item.strip())
+            avoid_actions.extend(item for item in hint.action_avoidances if item.strip())
+        if suppress_try_guidance:
+            summary.summary_text = ""
+            summary.recent_advantage_hints = []
+            summary.action_priors = []
+            try_actions = []
+        return (
+            summary,
+            self._normalize_action_list(try_actions),
+            self._normalize_action_list(avoid_actions),
+            sorted(self._normalize_token_list(salient_objects)),
+        )
 
     def _normalize_action_list(self, actions: Iterable[str]) -> list[str]:
         """Normalize and deduplicate a list of parser actions."""

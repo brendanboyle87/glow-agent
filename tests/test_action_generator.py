@@ -23,10 +23,15 @@ from zork_agent.policy.action_generator import ActionGenerator
 from zork_agent.types import (
     ActionClusterHistory,
     ActionGenerationMode,
+    ActionBiasRecord,
+    AdvantageHint,
+    AffordanceRecord,
     LLMChatRequest,
     LLMResponse,
+    LocalWorldModel,
     LoopHeuristicResult,
     StrategicMode,
+    SubgoalRecord,
 )
 
 
@@ -36,11 +41,13 @@ class FakeLLMClient(BaseLLMClient):
     def __init__(self, text: str):
         super().__init__(default_model="fake-model")
         self.text = text
+        self.last_request: LLMChatRequest | None = None
 
     def list_models(self) -> list[str]:
         return ["fake-model"]
 
     def complete_chat(self, request: LLMChatRequest) -> LLMResponse:
+        self.last_request = request
         return LLMResponse(
             text=self.text,
             model=request.model or "fake-model",
@@ -59,7 +66,7 @@ def _build_config(tmp_path: Path) -> ProjectConfig:
     prompt_dir.mkdir(parents=True, exist_ok=True)
     (prompt_dir / "system.txt").write_text("System for {game_id}", encoding="utf-8")
     (prompt_dir / "action.txt").write_text(
-        "Observation: {observation}\nMode: {generation_mode}\n{valid_actions_block}\nRecent: {recent_trajectory_context}\nTop {action_candidates}",
+        "Observation: {observation}\nRoot: {root_state_id}\nLocal: {local_world_model_block}\nMode: {generation_mode}\n{valid_actions_block}\nRecent: {recent_trajectory_context}\nTop {action_candidates}",
         encoding="utf-8",
     )
     (prompt_dir / "trajectory.txt").write_text("Trajectory: {trajectory_excerpt}", encoding="utf-8")
@@ -87,6 +94,26 @@ def _build_config(tmp_path: Path) -> ProjectConfig:
         ),
         logging=LoggingConfig(),
         experiment=ExperimentConfig(game_id="zork1"),
+    )
+
+
+def _local_world_model(root_state_id: str = "root-mailbox") -> LocalWorldModel:
+    """Create a small local world model fixture for prompt-construction tests."""
+
+    return LocalWorldModel(
+        root_state_id=root_state_id,
+        accumulated_advantage_hints=[
+            AdvantageHint(
+                root_state_id=root_state_id,
+                action_preferences=["take leaflet"],
+                action_avoidances=["close mailbox"],
+                textual_reasoning="Taking the leaflet produced durable local progress.",
+            )
+        ],
+        discovered_subgoals=[SubgoalRecord(subgoal_id="sg-1", description="Get the leaflet out of the mailbox.")],
+        inferred_affordances=[AffordanceRecord(object_text="mailbox", affordance="open")],
+        action_priors=[ActionBiasRecord(action="take leaflet", weight=1.0)],
+        action_antipriors=[ActionBiasRecord(action="close mailbox", weight=-1.0)],
     )
 
 
@@ -259,6 +286,89 @@ def test_action_generator_does_not_penalize_inverse_candidate_after_real_gain(tm
     assert drop_egg.loop_penalty == 0.0
 
 
+def test_action_generator_includes_local_world_model_context_in_prompt(tmp_path: Path) -> None:
+    """Constrained prompt construction should include a bounded local-world-model summary."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    llm_client = FakeLLMClient("1. take leaflet\n2. close mailbox")
+    generator = ActionGenerator(config, prompt_manager, llm_client)
+
+    result = generator.generate(
+        observation="Opening the small mailbox reveals a leaflet.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["take leaflet", "close mailbox", "north"],
+        root_state_id="root-mailbox",
+        local_world_model=_local_world_model("root-mailbox"),
+    )
+
+    assert result.candidates[0].action == "take leaflet"
+    assert llm_client.last_request is not None
+    prompt_text = llm_client.last_request.messages[1]["content"]
+    assert "Root: root-mailbox" in prompt_text
+    assert "Local try actions: take leaflet" in prompt_text
+    assert "Local avoid actions: close mailbox" in prompt_text
+    assert "Discovered affordances: mailbox -> open" in prompt_text
+    assert result.metadata["local_guidance_available"] is True
+    assert result.metadata["local_guidance_attached_to_policy_input"] is True
+    assert result.metadata["local_guidance_attached_to_prompt"] is True
+    assert result.metadata["local_model_try_actions"] == ["take leaflet"]
+    assert result.metadata["local_model_avoid_actions"] == ["close mailbox"]
+    assert llm_client.stage_call_counts()["action_generation_constrained"] == 1
+    assert llm_client.stage_success_counts()["action_generation_constrained"] == 1
+
+
+def test_action_generator_handles_absent_local_world_model_in_prompt(tmp_path: Path) -> None:
+    """Action generation should stay well-formed when no local world model exists yet."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    llm_client = FakeLLMClient("1. open mailbox\n2. north")
+    generator = ActionGenerator(config, prompt_manager, llm_client)
+
+    result = generator.generate(
+        observation="West of House.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["open mailbox", "north"],
+        root_state_id="root-empty",
+        local_world_model=None,
+    )
+
+    assert result.candidates[0].action == "open mailbox"
+    assert llm_client.last_request is not None
+    prompt_text = llm_client.last_request.messages[1]["content"]
+    assert "Root: root-empty" in prompt_text
+
+
+def test_action_generator_suppresses_stale_try_guidance_after_repeated_no_achievement_revisits(
+    tmp_path: Path,
+) -> None:
+    """Repeated no-achievement revisits should stop surfacing stale MAR try-actions."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    llm_client = FakeLLMClient("1. north\n2. take leaflet")
+    generator = ActionGenerator(config, prompt_manager, llm_client)
+    local_world_model = _local_world_model("root-mailbox")
+    local_world_model.metadata["no_achievement_revisit_streak"] = 2
+    local_world_model.metadata["nonproductive_revisit_streak"] = 1
+
+    result = generator.generate(
+        observation="Opening the small mailbox reveals a leaflet.",
+        inventory_text="You are empty-handed.",
+        valid_actions=["take leaflet", "close mailbox", "north"],
+        root_state_id="root-mailbox",
+        local_world_model=local_world_model,
+    )
+
+    assert llm_client.last_request is not None
+    prompt_text = llm_client.last_request.messages[1]["content"]
+    assert "Local try actions: (none)" in prompt_text
+    assert result.metadata["local_world_model_try_guidance_suppressed"] is True
+    assert result.metadata["local_model_try_actions"] == []
+    assert "Local avoid actions: close mailbox" in prompt_text
+
+
 def test_action_generator_prefers_structural_access_in_explore_mode(tmp_path: Path) -> None:
     """Explore mode should boost grounded structural actions over generic movement."""
 
@@ -325,6 +435,71 @@ def test_action_generator_prefers_object_followup_in_exploit_mode(tmp_path: Path
     assert result.candidates[0].action in {"take egg", "examine egg"}
     west = next(candidate for candidate in result.candidates if candidate.action == "west")
     assert west.selection_score < result.candidates[0].selection_score
+
+
+def test_action_generator_prefers_freshly_unlocked_exit_after_structural_access(tmp_path: Path) -> None:
+    """A movement action newly unlocked by a structural affordance should outrank local churn."""
+
+    config = _build_config(tmp_path)
+    prompt_manager = PromptManager(config.prompts)
+    generator = ActionGenerator(
+        config,
+        prompt_manager,
+        FakeLLMClient(
+            "1. take canary | visible object\n"
+            "2. close window | tidy up\n"
+            "3. west | likely route"
+        ),
+    )
+    history = ActionClusterHistory(cluster_label="window-cluster")
+    history.observe_state_nouns(
+        observation="Behind House. A small window is slightly ajar.",
+        inventory_text="You are carrying a jewel-encrusted egg.",
+        valid_actions=["open window", "south", "north", "east"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.record_attempt(
+        action="open window",
+        score_changed=False,
+        inventory_changed=False,
+        observation_changed=True,
+        valid_actions_changed=True,
+        valid_actions_improved=True,
+        target_tokens={"window"},
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+    history.observe_state_nouns(
+        observation=(
+            "With great effort, you open the window far enough to allow entry. "
+            "A golden canary is beside you."
+        ),
+        inventory_text="You are carrying a jewel-encrusted egg.",
+        valid_actions=["west", "close window", "take canary", "south", "north", "east"],
+        inverse_pairs=config.policy.inverse_action_pairs,
+    )
+
+    result = generator.generate(
+        observation=(
+            "With great effort, you open the window far enough to allow entry. "
+            "A golden canary is beside you."
+        ),
+        inventory_text="You are carrying a jewel-encrusted egg.",
+        valid_actions=["west", "close window", "take canary", "south", "north", "east"],
+        score=5,
+        moves=8,
+        candidate_count=4,
+        state_action_history=history,
+        strategic_mode=StrategicMode.EXPLORE,
+    )
+
+    assert result.candidates[0].action == "west"
+    west = result.candidates[0]
+    assert west.features is not None
+    assert west.features.is_freshly_unlocked_exit is True
+    assert west.features.follows_recent_affordance_unlock is True
+    assert "fresh_affordance_unlocked_exit" in west.ranking_reason
+    take_canary = next(candidate for candidate in result.candidates if candidate.action == "take canary")
+    assert take_canary.selection_score < west.selection_score
 
 
 def test_action_generator_prefers_take_leaflet_over_repeated_close_mailbox_with_directions_present(
