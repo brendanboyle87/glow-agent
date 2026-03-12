@@ -1452,7 +1452,12 @@ class EpisodeRunner:
                     )
                 )
 
-                if any(trajectory.final_done for trajectory in branch_trajectories):
+                committed_terminal_branch = (
+                    local_result.branch_commit_allowed
+                    and best_branch is not None
+                    and best_branch.terminated
+                )
+                if committed_terminal_branch:
                     self.logger.info(
                         "GLoW runner terminated early for %s after a completed branch trajectory.",
                         generated_episode_id,

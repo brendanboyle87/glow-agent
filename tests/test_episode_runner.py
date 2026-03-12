@@ -937,6 +937,141 @@ def test_glow_runner_executes_global_local_loop_and_persists_best_trajectory(tmp
     assert metrics_payload["metadata"]["threshold_blocked_exploratory_best_branch_count"] == 0
 
 
+def test_glow_runner_ignores_uncommitted_terminal_branch_for_episode_stop(tmp_path: Path) -> None:
+    """A losing terminal exploratory branch should not abort the whole GLoW episode."""
+
+    config = _build_config(tmp_path)
+    config.ensure_output_directories()
+    config.experiment.runner_mode = RunnerMode.GLOW_FAITHFUL
+    config.experiment.max_steps = 4
+    config.experiment.glow_local_branches_per_root = 2
+    config.experiment.glow_frontier_analysis_frequency = 1
+    runner = EpisodeRunner(config=config, llm_client=_FakeLLMClient())
+    runner.env = _FakeGlowEnv()  # type: ignore[assignment]
+    runner.local_explorer.env = runner.env
+
+    explore_call_count = 0
+
+    def fake_select_archive_state(*, archive_states, frontier_insight, trajectory_frontier, mode=None, selection_id=None):
+        return ArchiveStateSelectionResult(
+            selected_archived_state=archive_states[0],
+            chosen_replay_method="native_snapshot",
+            achieved_contribution=0.0,
+            potential_contribution=0.0,
+            rationale="Select the current root.",
+            selection_mode=config.policy.archive_state_selection_mode,
+        )
+
+    def fake_frontier_analysis(trajectory_frontier, *, archive_states=None, top_k=None, analysis_id=None):
+        return FrontierAnalysisResult(
+            analysis_id=analysis_id or "analysis-terminal-branch",
+            insight=FrontierInsight(
+                analysis_id=analysis_id or "analysis-terminal-branch",
+                frontier_trajectory_ids=[entry.trajectory_id for entry in trajectory_frontier.top_k_entries(2)],
+            ),
+            prompt_input="frontier prompt",
+        )
+
+    def fake_explore_from_state(restored_state, **kwargs):
+        nonlocal explore_call_count
+        explore_call_count += 1
+        return LocalExplorationResult(
+            base_state=restored_state,
+            branch_count=2,
+            branch_horizon=1,
+            temperature=0.2,
+            action_candidate_count=3,
+            root_state_id="root-state-1",
+            best_branch_index=1,
+            branch_commit_allowed=True,
+            comparison_notes="One exploratory death branch, one commit-worthy branch.",
+            branches=[
+                LocalBranchOutcome(
+                    branch_index=0,
+                    actions_taken=["jump"],
+                    total_reward=-1.0,
+                    score_change=0,
+                    final_score=0,
+                    final_observation="You have died.",
+                    terminated=True,
+                    termination_reason=BranchTerminationReason.TERMINATED,
+                    branch_progress_score=0.0,
+                    branch_commit_allowed=False,
+                    commit_rejection_reason="terminal exploratory branch",
+                    trajectory_steps=[
+                        TrajectoryStep(
+                            episode_id="branch-0",
+                            step_index=0,
+                            action="jump",
+                            observation="You have died.",
+                            reward=-1.0,
+                            cumulative_reward=-1.0,
+                            done=True,
+                            score=0,
+                            moves=1,
+                            world_state_hash="death-state",
+                            inventory_text="You are empty-handed.",
+                            valid_actions=[],
+                        )
+                    ],
+                ),
+                LocalBranchOutcome(
+                    branch_index=1,
+                    actions_taken=["north"],
+                    total_reward=1.0,
+                    score_change=1,
+                    final_score=1,
+                    final_observation="North of House.",
+                    terminated=False,
+                    termination_reason=BranchTerminationReason.HORIZON_REACHED,
+                    branch_progress_score=2.0,
+                    branch_commit_allowed=True,
+                    trajectory_steps=[
+                        TrajectoryStep(
+                            episode_id="branch-1",
+                            step_index=0,
+                            action="north",
+                            observation="North of House.",
+                            reward=1.0,
+                            cumulative_reward=1.0,
+                            done=False,
+                            score=1,
+                            moves=1,
+                            world_state_hash="north-house",
+                            inventory_text="You are empty-handed.",
+                            valid_actions=["east", "west"],
+                        )
+                    ],
+                ),
+            ],
+        )
+
+    runner.state_selector.select_archive_state = fake_select_archive_state  # type: ignore[method-assign]
+    runner.frontier_analyzer.analyze_frontier = fake_frontier_analysis  # type: ignore[method-assign]
+    runner.local_explorer.explore_from_state = fake_explore_from_state  # type: ignore[method-assign]
+    runner._restore_archived_state = lambda archived_state: ReplayResult(  # type: ignore[method-assign]
+        success=True,
+        restore_mode=RestoreMode.NATIVE_SNAPSHOT,
+        divergence_reason=ReplayDivergenceReason.NONE,
+        final_observation="West of House.",
+        final_score=0,
+        replayed_action_count=0,
+        target_step_index=archived_state.provenance_timestep,
+        final_state=runner.env.reset(),
+        restored_node_id=archived_state.state_id,
+        message="mocked restore",
+    )
+
+    result = runner.run_episode(episode_id="glow-runner-terminal-branch-ignore")
+
+    assert explore_call_count == 2
+    assert result.metadata["glow_cycle_count"] == 2
+    assert result.final_score == 1
+
+    metrics_payload = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    assert metrics_payload["frontier_analysis_count"] == 2
+
+
 def test_glow_runner_loads_prior_archive_snapshot_for_cross_run_selection(tmp_path: Path) -> None:
     """A fresh GLoW runner should preload the latest archive snapshot before selection."""
 
